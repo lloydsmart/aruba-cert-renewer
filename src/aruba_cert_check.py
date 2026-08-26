@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
+import argparse
 import getpass
+import logging
 import os
 import re
 import sys
@@ -14,12 +16,125 @@ from netmiko.exceptions import (
     NetmikoTimeoutException,
 )
 
-CONFIG_FILE = Path(__file__).parent.parent / "config.toml"
+DEFAULT_CONFIG_FILE = Path(__file__).resolve().parent.parent / "config.toml"
+
+EXIT_OK = 0
+EXIT_WARNING = 1
+EXIT_ERROR = 2
 
 
-def load_config():
-    with CONFIG_FILE.open("rb") as file:
-        return tomllib.load(file)
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Check HTTPS certificate expiry on ArubaOS-Switch devices."
+    )
+
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=DEFAULT_CONFIG_FILE,
+        help=f"Configuration file (default: {DEFAULT_CONFIG_FILE})",
+    )
+
+    parser.add_argument(
+        "--switch",
+        dest="switch_name",
+        metavar="NAME",
+        help="Check only the named switch",
+    )
+
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable Netmiko debug logging",
+    )
+
+    return parser.parse_args()
+
+
+def configure_logging(debug):
+    if not debug:
+        return
+
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    logging.getLogger("netmiko").setLevel(logging.DEBUG)
+
+    # Paramiko's DEBUG output is extremely verbose and is usually not useful
+    # when troubleshooting Netmiko command handling.
+    logging.getLogger("paramiko").setLevel(logging.WARNING)
+
+
+def load_config(config_file):
+    try:
+        with config_file.open("rb") as file:
+            return tomllib.load(file)
+
+    except FileNotFoundError:
+        raise ValueError(f"Configuration file not found: {config_file}") from None
+
+    except tomllib.TOMLDecodeError as error:
+        raise ValueError(
+            f"Invalid TOML in configuration file {config_file}: {error}"
+        ) from error
+
+
+def validate_config(config):
+    settings = config.get("settings", {})
+    warning_days = settings.get("warning_days", 30)
+
+    if not isinstance(warning_days, int) or isinstance(warning_days, bool):
+        raise ValueError("settings.warning_days must be an integer")
+
+    if warning_days < 0:
+        raise ValueError("settings.warning_days cannot be negative")
+
+    switches = config.get("switches")
+
+    if not isinstance(switches, list) or not switches:
+        raise ValueError("At least one [[switches]] entry must be configured")
+
+    required_fields = ("name", "host", "fqdn")
+    seen_names = set()
+
+    for index, switch in enumerate(switches, start=1):
+        if not isinstance(switch, dict):
+            raise ValueError(f"Switch entry {index} must be a TOML table")
+
+        for field in required_fields:
+            value = switch.get(field)
+
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(
+                    f"Switch entry {index} must contain a non-empty '{field}'"
+                )
+
+        normalized_name = switch["name"].casefold()
+
+        if normalized_name in seen_names:
+            raise ValueError(f"Duplicate switch name: {switch['name']}")
+
+        seen_names.add(normalized_name)
+
+    return warning_days, switches
+
+
+def select_switches(switches, switch_name):
+    if switch_name is None:
+        return switches
+
+    matches = [
+        switch
+        for switch in switches
+        if switch["name"].casefold() == switch_name.casefold()
+    ]
+
+    if not matches:
+        raise ValueError(f"Switch not found in configuration: {switch_name}")
+
+    return matches
 
 
 def get_credentials():
@@ -44,7 +159,7 @@ def parse_aos_version(output):
     return "Unknown"
 
 
-def parse_web_certificate(output):
+def parse_web_certificates(output):
     pattern = re.compile(
         r"^\s*"
         r"(?P<name>\S+)"
@@ -58,21 +173,23 @@ def parse_web_certificate(output):
         re.MULTILINE,
     )
 
-    match = pattern.search(output)
+    certificates = []
 
-    if not match:
-        return None
+    for match in pattern.finditer(output):
+        expiration = datetime.strptime(
+            match.group("expiration"),
+            "%Y/%m/%d",
+        ).date()
 
-    expiration = datetime.strptime(
-        match.group("expiration"),
-        "%Y/%m/%d",
-    ).date()
+        certificates.append(
+            {
+                "name": match.group("name"),
+                "expiration": expiration,
+                "profile": match.group("profile"),
+            }
+        )
 
-    return {
-        "name": match.group("name"),
-        "expiration": expiration,
-        "profile": match.group("profile"),
-    }
+    return certificates
 
 
 def check_switch(switch, username, password, warning_days):
@@ -116,13 +233,21 @@ def check_switch(switch, username, password, warning_days):
 
     print(f"AOS-S version:    {parse_aos_version(version_output)}")
 
-    certificate = parse_web_certificate(cert_output)
+    certificates = parse_web_certificates(cert_output)
 
-    if certificate is None:
+    if not certificates:
         print("Status:           ERROR")
         print("Reason:           Could not find a Web certificate")
         return "error"
 
+    if len(certificates) != 1:
+        print("Status:           ERROR")
+        print(
+            f"Reason:           Found {len(certificates)} Web certificates; expected 1"
+        )
+        return "error"
+
+    certificate = certificates[0]
     days_remaining = (certificate["expiration"] - date.today()).days
 
     print(f"Certificate:      {certificate['name']}")
@@ -132,25 +257,49 @@ def check_switch(switch, username, password, warning_days):
 
     if days_remaining < 0:
         print("Status:           EXPIRED")
-        return "warning"
+        return "expired"
 
     if days_remaining <= warning_days:
         print("Status:           RENEWAL DUE")
-        return "warning"
+        return "renewal_due"
 
     print("Status:           OK")
     return "ok"
 
 
+def print_summary(results):
+    print()
+    print("Summary")
+    print("-------")
+    print(f"Switches checked: {len(results)}")
+    print(f"OK:               {results.count('ok')}")
+    print(f"Renewal due:      {results.count('renewal_due')}")
+    print(f"Expired:          {results.count('expired')}")
+    print(f"Errors:           {results.count('error')}")
+
+
+def get_exit_code(results):
+    if "error" in results:
+        return EXIT_ERROR
+
+    if "renewal_due" in results or "expired" in results:
+        return EXIT_WARNING
+
+    return EXIT_OK
+
+
 def main():
-    config = load_config()
+    args = parse_args()
+    configure_logging(args.debug)
 
-    warning_days = config.get("settings", {}).get("warning_days", 30)
-    switches = config.get("switches", [])
+    try:
+        config = load_config(args.config)
+        warning_days, switches = validate_config(config)
+        switches = select_switches(switches, args.switch_name)
 
-    if not switches:
-        print("No switches configured.")
-        return 2
+    except ValueError as error:
+        print(f"Error: {error}", file=sys.stderr)
+        return EXIT_ERROR
 
     username, password = get_credentials()
 
@@ -158,21 +307,9 @@ def main():
         check_switch(switch, username, password, warning_days) for switch in switches
     ]
 
-    print()
-    print("Summary")
-    print("-------")
-    print(f"Switches checked: {len(results)}")
-    print(f"OK:               {results.count('ok')}")
-    print(f"Renewal due:      {results.count('warning')}")
-    print(f"Errors:           {results.count('error')}")
+    print_summary(results)
 
-    if "error" in results:
-        return 2
-
-    if "warning" in results:
-        return 1
-
-    return 0
+    return get_exit_code(results)
 
 
 if __name__ == "__main__":
