@@ -1,6 +1,15 @@
 [settings]
 warning_days = 30
 
+[csr]
+organization = "Example Organization"
+organizational_unit = "Infrastructure"
+locality = "Example City"
+state = "Example State"
+country = "GB"
+key_type = "rsa"
+key_size = 2048
+
 [[switches]]
 name = "EXAMPLE-SWITCH"
 host = "192.0.2.10"

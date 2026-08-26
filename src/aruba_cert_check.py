@@ -10,6 +10,9 @@ import tomllib
 from datetime import date, datetime
 from pathlib import Path
 
+from cryptography import x509
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import NameOID
 from netmiko import ConnectHandler
 from netmiko.exceptions import (
     NetmikoAuthenticationException,
@@ -190,6 +193,199 @@ def parse_web_certificates(output):
         )
 
     return certificates
+
+
+def get_csr_settings(config):
+    csr_settings = config.get("csr")
+
+    if not isinstance(csr_settings, dict):
+        raise ValueError("A [csr] configuration section is required")
+
+    required_fields = (
+        "organization",
+        "organizational_unit",
+        "locality",
+        "state",
+        "country",
+        "key_type",
+        "key_size",
+    )
+
+    for field in required_fields:
+        if field not in csr_settings:
+            raise ValueError(f"csr.{field} must be configured")
+
+    text_fields = (
+        "organization",
+        "organizational_unit",
+        "locality",
+        "state",
+    )
+
+    for field in text_fields:
+        value = csr_settings[field]
+
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"csr.{field} must be a non-empty string")
+
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 .,'()&/-]*", value):
+            raise ValueError(f"csr.{field} contains unsupported characters")
+
+    country = csr_settings["country"]
+
+    if not isinstance(country, str) or not re.fullmatch(r"[A-Z]{2}", country):
+        raise ValueError("csr.country must be a two-letter uppercase country code")
+
+    if csr_settings["key_type"] != "rsa":
+        raise ValueError("csr.key_type must currently be 'rsa'")
+
+    if csr_settings["key_size"] != 2048:
+        raise ValueError("csr.key_size must currently be 2048")
+
+    return csr_settings
+
+
+def validate_cli_identifier(value, field_name):
+    if not isinstance(value, str) or not re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9_.-]*",
+        value,
+    ):
+        raise ValueError(f"{field_name} contains unsupported characters")
+
+    return value
+
+
+def quote_cli_subject_value(value):
+    if any(character in value for character in ('"', "\r", "\n")):
+        raise ValueError("CSR subject value contains unsupported characters")
+
+    if " " in value:
+        return f'"{value}"'
+
+    return value
+
+
+def build_csr_command(switch, certificate_name, ta_profile, csr_settings):
+    certificate_name = validate_cli_identifier(
+        certificate_name,
+        "certificate name",
+    )
+    ta_profile = validate_cli_identifier(
+        ta_profile,
+        "TA profile",
+    )
+    common_name = validate_cli_identifier(
+        switch["fqdn"],
+        "switch FQDN",
+    )
+
+    organization = quote_cli_subject_value(csr_settings["organization"])
+    organizational_unit = quote_cli_subject_value(csr_settings["organizational_unit"])
+    locality = quote_cli_subject_value(csr_settings["locality"])
+    state = quote_cli_subject_value(csr_settings["state"])
+    country = csr_settings["country"]
+
+    return " ".join(
+        [
+            "crypto pki create-csr",
+            f"certificate-name {certificate_name}",
+            f"ta-profile {ta_profile}",
+            "usage web",
+            f"key-type {csr_settings['key_type']}",
+            f"key-size {csr_settings['key_size']}",
+            "subject",
+            f"common-name {common_name}",
+            f"org {organization}",
+            f"org-unit {organizational_unit}",
+            f"locality {locality}",
+            f"state {state}",
+            f"country {country}",
+        ]
+    )
+
+
+def extract_csr_pem(output):
+    match = re.search(
+        r"-----BEGIN CERTIFICATE REQUEST-----"
+        r".*?"
+        r"-----END CERTIFICATE REQUEST-----",
+        output,
+        re.DOTALL,
+    )
+
+    if not match:
+        raise ValueError("Could not find a PEM certificate signing request")
+
+    return match.group(0).strip() + "\n"
+
+
+def get_subject_value(subject, oid, field_name):
+    attributes = subject.get_attributes_for_oid(oid)
+
+    if len(attributes) != 1:
+        raise ValueError(f"CSR must contain exactly one {field_name}")
+
+    return attributes[0].value
+
+
+def validate_csr_pem(csr_pem, switch, csr_settings):
+    try:
+        csr = x509.load_pem_x509_csr(csr_pem.encode("ascii"))
+
+    except (ValueError, UnicodeEncodeError) as error:
+        raise ValueError("Returned CSR is not valid PEM") from error
+
+    if not csr.is_signature_valid:
+        raise ValueError("CSR signature is invalid")
+
+    expected_subject = {
+        NameOID.COMMON_NAME: ("common name", switch["fqdn"]),
+        NameOID.ORGANIZATION_NAME: (
+            "organization",
+            csr_settings["organization"],
+        ),
+        NameOID.ORGANIZATIONAL_UNIT_NAME: (
+            "organizational unit",
+            csr_settings["organizational_unit"],
+        ),
+        NameOID.LOCALITY_NAME: (
+            "locality",
+            csr_settings["locality"],
+        ),
+        NameOID.STATE_OR_PROVINCE_NAME: (
+            "state",
+            csr_settings["state"],
+        ),
+        NameOID.COUNTRY_NAME: (
+            "country",
+            csr_settings["country"],
+        ),
+    }
+
+    for oid, (field_name, expected_value) in expected_subject.items():
+        actual_value = get_subject_value(
+            csr.subject,
+            oid,
+            field_name,
+        )
+
+        if actual_value != expected_value:
+            raise ValueError(
+                f"CSR {field_name} is {actual_value!r}; expected {expected_value!r}"
+            )
+
+    public_key = csr.public_key()
+
+    if not isinstance(public_key, rsa.RSAPublicKey):
+        raise ValueError("CSR does not contain an RSA public key")
+
+    if public_key.key_size != csr_settings["key_size"]:
+        raise ValueError(
+            f"CSR RSA key size is {public_key.key_size}; "
+            f"expected {csr_settings['key_size']}"
+        )
+
+    return csr
 
 
 def check_switch(switch, username, password, warning_days):

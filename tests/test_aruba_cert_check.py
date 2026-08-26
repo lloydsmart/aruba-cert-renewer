@@ -1,6 +1,10 @@
 from datetime import date, timedelta
 
 import pytest
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import NameOID
 
 import aruba_cert_check as checker
 
@@ -275,3 +279,156 @@ fqdn = "switch.example.com"
     )
 
     assert checker.main() == checker.EXIT_ERROR
+
+
+def make_csr_settings():
+    return {
+        "organization": "Example Organization",
+        "organizational_unit": "Infrastructure",
+        "locality": "Example City",
+        "state": "Example State",
+        "country": "GB",
+        "key_type": "rsa",
+        "key_size": 2048,
+    }
+
+
+def make_test_csr(common_name="switch.example.com"):
+    key = rsa.generate_private_key(
+        public_exponent=65537,
+        key_size=2048,
+    )
+
+    subject = x509.Name(
+        [
+            x509.NameAttribute(NameOID.COMMON_NAME, common_name),
+            x509.NameAttribute(
+                NameOID.ORGANIZATION_NAME,
+                "Example Organization",
+            ),
+            x509.NameAttribute(
+                NameOID.ORGANIZATIONAL_UNIT_NAME,
+                "Infrastructure",
+            ),
+            x509.NameAttribute(
+                NameOID.LOCALITY_NAME,
+                "Example City",
+            ),
+            x509.NameAttribute(
+                NameOID.STATE_OR_PROVINCE_NAME,
+                "Example State",
+            ),
+            x509.NameAttribute(
+                NameOID.COUNTRY_NAME,
+                "GB",
+            ),
+        ]
+    )
+
+    csr = (
+        x509.CertificateSigningRequestBuilder()
+        .subject_name(subject)
+        .sign(
+            key,
+            hashes.SHA256(),
+        )
+    )
+
+    return csr.public_bytes(serialization.Encoding.PEM).decode("ascii")
+
+
+def test_get_csr_settings():
+    config = make_config()
+    config["csr"] = make_csr_settings()
+
+    assert checker.get_csr_settings(config) == make_csr_settings()
+
+
+def test_build_csr_command():
+    switch = make_config()["switches"][0]
+
+    command = checker.build_csr_command(
+        switch,
+        "webcert2027",
+        "webprofile2026",
+        make_csr_settings(),
+    )
+
+    assert command == (
+        "crypto pki create-csr "
+        "certificate-name webcert2027 "
+        "ta-profile webprofile2026 "
+        "usage web "
+        "key-type rsa "
+        "key-size 2048 "
+        "subject "
+        "common-name switch.example.com "
+        'org "Example Organization" '
+        "org-unit Infrastructure "
+        'locality "Example City" '
+        'state "Example State" '
+        "country GB"
+    )
+
+
+@pytest.mark.parametrize(
+    "certificate_name",
+    [
+        "webcert;reload",
+        "webcert\nreload",
+        'webcert"bad',
+        "",
+    ],
+)
+def test_build_csr_command_rejects_unsafe_certificate_name(certificate_name):
+    switch = make_config()["switches"][0]
+
+    with pytest.raises(ValueError):
+        checker.build_csr_command(
+            switch,
+            certificate_name,
+            "webprofile2026",
+            make_csr_settings(),
+        )
+
+
+def test_extract_csr_pem():
+    csr_pem = make_test_csr()
+
+    output = f"""
+Generating certificate request...
+
+{csr_pem}
+HOUSE-SWITCH(config)#
+"""
+
+    assert checker.extract_csr_pem(output) == csr_pem
+
+
+def test_extract_csr_pem_rejects_missing_csr():
+    with pytest.raises(ValueError, match="Could not find"):
+        checker.extract_csr_pem("No CSR here")
+
+
+def test_validate_csr_pem():
+    switch = make_config()["switches"][0]
+
+    csr = checker.validate_csr_pem(
+        make_test_csr(),
+        switch,
+        make_csr_settings(),
+    )
+
+    assert csr.is_signature_valid
+    assert csr.public_key().key_size == 2048
+
+
+def test_validate_csr_pem_rejects_wrong_common_name():
+    switch = make_config()["switches"][0]
+
+    with pytest.raises(ValueError, match="common name"):
+        checker.validate_csr_pem(
+            make_test_csr(common_name="wrong.example.com"),
+            switch,
+            make_csr_settings(),
+        )
