@@ -16,3 +16,8 @@ select = [
 
 [tool.ruff.format]
 line-ending = "lf"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-ra"
