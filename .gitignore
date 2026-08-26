@@ -5,3 +5,8 @@ __pycache__/
 config.toml
 .vscode/
 *.csr.pem
+*.crt.pem
+*.cert.pem
+*.certificate.pem
+*.key
+*.key.pem

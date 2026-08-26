@@ -1,53 +1,63 @@
 # Aruba Certificate Renewer
 
-Automates monitoring and renewal of HTTPS certificates on ArubaOS-Switch devices such as the Aruba 2930M.
-
-The project is intended to use:
-
-* **Netmiko** for SSH access to ArubaOS-Switch devices
-* **OPNsense** as the internal certificate authority
-* **Python** for certificate inspection, renewal logic, and validation
-* **Docker** for deployment
-* **Cron** or a similar scheduler for unattended execution
+Automates monitoring and staged renewal of HTTPS certificates on
+ArubaOS-Switch devices such as the Aruba 2930M.
 
 ## Current Status
 
-The project is currently in its initial development stage.
-
 Implemented:
 
-* SSH connectivity to ArubaOS-Switch using Netmiko
-* Detection of the active Web certificate
-* Certificate expiry parsing
-* Configurable renewal warning threshold
-* Read-only certificate health reporting
-* Explicit, single-switch CSR generation and cryptographic validation
+- SSH connectivity to ArubaOS-Switch using Netmiko
+- Active Web certificate discovery and expiry reporting
+- Explicit CSR generation on one selected switch
+- Read-only retrieval of an existing pending CSR
+- Cryptographic CSR validation, including legacy WC.16.11 RSA/SHA-1
+  proof-of-possession signatures
+- Signing an existing CSR with an internal OPNsense CA
+- Strict validation and safe output of the issued public certificate
 
-Planned:
+The `--sign-csr` stage does **not** install or activate the resulting certificate
+on the switch. Installation, HTTPS presentation checks, configuration saving,
+container deployment, and unattended renewal remain planned work.
 
-* Submit CSRs to the OPNsense CA
-* Validate returned certificates
-* Install signed certificates over the existing SSH session
-* Verify the certificate actually presented by HTTPS
-* Automatically save the switch configuration after successful renewal
-* Containerised unattended execution
-* Logging and failure notifications
+## Architecture
+
+There is one user-facing orchestration command:
+`src/aruba_cert_renewer.py`.
+
+- ArubaOS-Switch communication uses SSH through Netmiko. The switch generates
+  and retains the certificate private key.
+- OPNsense communication uses its HTTPS JSON Trust API through the standard
+  Python library. TLS server-certificate verification is always enabled.
+- `src/opnsense_client.py` contains only the narrowly scoped OPNsense HTTP/JSON
+  interaction.
+
+The OPNsense client is restricted to these routes:
+
+- `GET /api/trust/cert/ca_list`
+- `POST /api/trust/cert/add`
+- `POST /api/trust/cert/generate_file/<uuid>/crt`
+
+> [!CAUTION]
+> `/api/trust/cert/search` must never be used. Current OPNsense versions can
+> expose stored private-key material through that endpoint. This project also
+> never requests the `prv` or `pkcs12` download types.
 
 ## Requirements
 
-For local development:
+- Python 3.12 or later
+- cryptography 50.0.1
+- Netmiko 4.7.0
 
-* Python 3.12 or later
-* cryptography 50.0.1
-* Netmiko 4.7.0
-
-Install the dependencies into a virtual environment:
+Install the development dependencies in a virtual environment:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements-dev.txt
 ```
+
+No additional HTTP runtime dependency is needed.
 
 ## Configuration
 
@@ -72,139 +82,164 @@ country = "GB"
 key_type = "rsa"
 key_size = 2048
 
+[opnsense]
+base_url = "https://tank.example.com:8443"
+ca = "internal-ca"
+lifetime_days = 397
+digest = "sha256"
+
 [[switches]]
 name = "EXAMPLE-SWITCH"
 host = "192.0.2.10"
 fqdn = "switch.example.com"
 ```
 
-`config.toml` is excluded from Git and should contain the real switch inventory.
+`opnsense.ca` is the CA's human-readable description, not its refid. The tool
+resolves it through `ca_list` and requires exactly one match. For signing,
+`switches.host` must be the switch management IPv4 address; it and
+`switches.fqdn` are explicitly requested as IP and DNS SANs.
 
-## Usage
-
-Activate the virtual environment:
-
-```bash
-source .venv/bin/activate
-```
-
-Run the certificate checker:
-
-```bash
-python src/aruba_cert_check.py
-```
-
-Select one switch for a read-only check with `--switch NAME`. Use `--config FILE` to select another configuration file
-and `--debug` to enable detailed connection logging.
-
-### Generate a CSR
-
-CSR generation is an explicit, manual action. It requires one named switch and a new, unused certificate name:
-
-```bash
-python src/aruba_cert_check.py \
-  --generate-csr \
-  --switch EXAMPLE-SWITCH \
-  --certificate-name webcert2027 \
-  --csr-output switch.csr.pem
-```
-
-The command discovers the TA profile from the currently installed Web certificate, creates the private key and pending
-CSR on the switch, retrieves the CSR, and validates its signature, subject, key type, and key size. If `--csr-output` is
-omitted, the validated PEM CSR is printed to standard output.
-
-This capability generates a CSR only. It does not submit the CSR to OPNsense, sign it, install a certificate, replace
-the current Web certificate, or save the switch configuration. It also does not remove a pending CSR after a later
-retrieval or validation failure, so that state remains available for investigation.
-
-The switch retains the private key associated with a pending CSR. Do not reboot the switch while a CSR that you intend
-to sign and install is pending.
-
-AOS-S WC.16.11.0015 has been observed generating RSA/SHA-1 PKCS#10 CSR self-signatures. The tool explicitly verifies
-that signature using RSA PKCS#1 v1.5 rather than relying on a convenience validation property that does not handle this
-legacy CSR reliably. SHA-1 is accepted only for the CSR self-signature that proves possession of the switch-held private
-key. It will not be accepted for an issued HTTPS certificate; certificates returned by the CA will require SHA-256 or
-stronger.
-
-### Retrieve a pending CSR
-
-Use the read-only retrieval operation to resume after a CSR has already been created:
-
-```bash
-python src/aruba_cert_check.py \
-  --retrieve-csr \
-  --switch EXAMPLE-SWITCH \
-  --certificate-name webcert2027 \
-  --csr-output switch.csr.pem
-```
-
-The tool confirms that the requested summary entry is a pending Web CSR, retrieves it, and performs the same signature,
-subject, and public-key validation used after generation. Retrieval never enters configuration mode and does not create,
-replace, install, delete, or save anything on the switch. Omit `--csr-output` to print the validated PEM to standard
-output. Both CSR operations refuse to overwrite an existing output file.
-
-If credentials are not supplied through the environment, the script prompts for them:
-
-```text
-SSH username:
-SSH password:
-```
-
-Example output:
-
-```text
-EXAMPLE-SWITCH
---------------
-Address:          192.0.2.10
-FQDN:             switch.example.com
-AOS-S version:    WC.16.11.0015
-Certificate:      webcert2026
-TA profile:       webprofile2026
-Expires:          2027-09-27
-Days remaining:   397
-Status:           OK
-
-Summary
--------
-Switches checked: 1
-OK:               1
-Renewal due:      0
-Expired:          0
-Errors:           0
-```
+`config.toml` is excluded from Git and should contain the real inventory. It
+must never contain OPNsense API credentials.
 
 ## Credentials
 
-The script currently supports credentials supplied either interactively or through:
+Aruba SSH credentials can be supplied interactively or through:
 
 ```text
 ARUBA_SSH_USERNAME
 ARUBA_SSH_PASSWORD
 ```
 
-Credentials should not be committed to the repository.
+OPNsense credentials are accepted **only** through:
 
-A more suitable unattended authentication mechanism will be implemented before automated renewal is enabled.
+```text
+OPNSENSE_API_KEY
+OPNSENSE_API_SECRET
+```
+
+The OPNsense API key and secret are sent using HTTP Basic authentication over
+verified HTTPS. They are not accepted in TOML or as command-line arguments and
+must not be logged or committed.
+
+## OPNsense Least-Privilege ACL
+
+Install the bundled
+[`ACL.xml`](examples/opnsense/ArubaCertRenewer/ACL/ACL.xml) on OPNsense at:
+
+```text
+/usr/local/opnsense/mvc/app/models/LloydSmart/ArubaCertRenewer/ACL/ACL.xml
+```
+
+After adding or changing the file, rebuild the ACL cache on OPNsense:
+
+```sh
+rm -f /var/lib/php/tmp/opnsense_acl_cache.json
+```
+
+Then refresh **System -> Access -> Privileges** and assign only
+**API: Aruba Certificate Renewer** to the dedicated API user.
+
+Do not grant the automation **System: Certificate Manager** or **All pages**
+unless the same user independently needs those privileges for unrelated work.
+In particular, **System: Certificate Manager** grants `api/trust/cert/*`, which
+includes APIs capable of returning or exporting private keys.
+
+## Usage
+
+Activate the virtual environment, then run the certificate monitor:
+
+```bash
+source .venv/bin/activate
+python src/aruba_cert_renewer.py
+```
+
+Use `--switch NAME` for one switch, `--config FILE` for another configuration
+file, and `--debug` for detailed Netmiko connection logging.
+
+### Generate a CSR
+
+CSR generation is an explicit switch modification. It requires one named switch
+and a new, unused certificate name:
+
+```bash
+python src/aruba_cert_renewer.py \
+  --generate-csr \
+  --switch EXAMPLE-SWITCH \
+  --certificate-name webcert2027 \
+  --csr-output switch.csr.pem
+```
+
+The command discovers the active certificate's TA profile, creates a private key
+and pending CSR on the switch, retrieves the CSR, and validates its signature,
+subject, key type, and key size. Omit `--csr-output` to print the validated CSR.
+
+The switch retains the private key associated with a pending CSR. Do not reboot
+the switch while a CSR that you intend to sign and install is pending.
+
+AOS-S WC.16.11.0015 has been observed generating RSA/SHA-1 PKCS#10 CSR
+self-signatures. SHA-1 is accepted only to verify this switch proof of possession.
+It is rejected for an issued HTTPS certificate.
+
+### Retrieve a Pending CSR
+
+Use the read-only retrieval operation after a CSR already exists:
+
+```bash
+python src/aruba_cert_renewer.py \
+  --retrieve-csr \
+  --switch EXAMPLE-SWITCH \
+  --certificate-name webcert2027 \
+  --csr-output switch.csr.pem
+```
+
+The tool confirms that the named entry is a pending Web CSR and performs the same
+validation used after generation. It never enters configuration mode or creates,
+replaces, installs, deletes, or saves switch state.
+
+### Sign an Existing Pending CSR
+
+Set the OPNsense environment credentials, then run:
+
+```bash
+python src/aruba_cert_renewer.py \
+  --switch HOUSE-SWITCH \
+  --sign-csr \
+  --certificate-name webcert2027 \
+  --certificate-output house-switch-2027.crt.pem
+```
+
+This operation:
+
+1. Confirms that the named Aruba certificate is an existing pending Web CSR.
+2. Retrieves and validates it without generating or replacing anything.
+3. Resolves the configured OPNsense CA description.
+4. Requests a server certificate with explicit FQDN and management-IP SANs.
+5. Retrieves only the public certificate.
+6. Validates the key, subject, CN, SANs, Basic Constraints, serverAuth EKU,
+   validity period, signature strength, and RSA key size.
+7. Exclusively creates `--certificate-output` only after validation succeeds.
+
+The command refuses to overwrite an existing output file. It does not install,
+activate, or save the certificate on the Aruba switch in this development stage.
 
 ## Exit Codes
 
-The checker uses the following exit codes:
-
 | Code | Meaning                                                              |
 | ---: | -------------------------------------------------------------------- |
-|  `0` | All certificates are healthy                                         |
+|  `0` | The requested operation succeeded or all certificates are healthy    |
 |  `1` | One or more certificates are expired or within the renewal threshold |
-|  `2` | One or more switches could not be checked reliably                   |
+|  `2` | The requested operation failed or a switch could not be checked      |
 
 ## Safety
 
-Certificate monitoring and pending-CSR retrieval are read-only. CSR generation is the only switch write-capable
-operation and is gated behind `--generate-csr`, an explicit switch, and an explicit new certificate name. It creates
-only the pending CSR/private-key association and does not issue `write memory`, certificate installation, replacement,
-or deletion commands.
-
-Automated renewal will only be added after this manual CSR workflow has been proven reliable.
+Monitoring and pending-CSR retrieval are read-only. CSR generation is the only
+operation that creates switch state. Signing creates a public certificate object
+in OPNsense but never retrieves a private key; the corresponding Aruba private
+key remains on the switch. No current operation installs a certificate or issues
+switch save, replacement, clear, or delete commands.
 
 ## License
 
-This project is licensed under the GNU General Public License v3.0. See [LICENSE](LICENSE).
+This project is licensed under the GNU General Public License v3.0. See
+[LICENSE](LICENSE).

@@ -10,6 +10,12 @@ country = "GB"
 key_type = "rsa"
 key_size = 2048
 
+[opnsense]
+base_url = "https://tank.example.com:8443"
+ca = "internal-ca"
+lifetime_days = 397
+digest = "sha256"
+
 [[switches]]
 name = "EXAMPLE-SWITCH"
 host = "192.0.2.10"
