@@ -14,7 +14,6 @@ from netmiko.exceptions import (
     NetmikoTimeoutException,
 )
 
-
 CONFIG_FILE = Path(__file__).parent.parent / "config.toml"
 
 
@@ -156,8 +155,7 @@ def main():
     username, password = get_credentials()
 
     results = [
-        check_switch(switch, username, password, warning_days)
-        for switch in switches
+        check_switch(switch, username, password, warning_days) for switch in switches
     ]
 
     print()

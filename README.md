@@ -45,7 +45,7 @@ Install the dependencies into a virtual environment:
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements-dev.txt
 ```
 
 ## Configuration
@@ -143,3 +143,7 @@ The current implementation is deliberately read-only.
 It issues only inspection commands against the switches and does not enter configuration mode or modify device configuration.
 
 Automated renewal will only be added after the certificate discovery and validation workflow has been proven reliable.
+
+## License
+
+This project is licensed under the GNU General Public License v3.0. See [LICENSE](LICENSE).
