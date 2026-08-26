@@ -120,6 +120,29 @@ retrieval or validation failure, so that state remains available for investigati
 The switch retains the private key associated with a pending CSR. Do not reboot the switch while a CSR that you intend
 to sign and install is pending.
 
+AOS-S WC.16.11.0015 has been observed generating RSA/SHA-1 PKCS#10 CSR self-signatures. The tool explicitly verifies
+that signature using RSA PKCS#1 v1.5 rather than relying on a convenience validation property that does not handle this
+legacy CSR reliably. SHA-1 is accepted only for the CSR self-signature that proves possession of the switch-held private
+key. It will not be accepted for an issued HTTPS certificate; certificates returned by the CA will require SHA-256 or
+stronger.
+
+### Retrieve a pending CSR
+
+Use the read-only retrieval operation to resume after a CSR has already been created:
+
+```bash
+python src/aruba_cert_check.py \
+  --retrieve-csr \
+  --switch EXAMPLE-SWITCH \
+  --certificate-name webcert2027 \
+  --csr-output switch.csr.pem
+```
+
+The tool confirms that the requested summary entry is a pending Web CSR, retrieves it, and performs the same signature,
+subject, and public-key validation used after generation. Retrieval never enters configuration mode and does not create,
+replace, install, delete, or save anything on the switch. Omit `--csr-output` to print the validated PEM to standard
+output. Both CSR operations refuse to overwrite an existing output file.
+
 If credentials are not supplied through the environment, the script prompts for them:
 
 ```text
@@ -175,9 +198,10 @@ The checker uses the following exit codes:
 
 ## Safety
 
-Certificate monitoring is read-only. CSR generation is the only write-capable operation and is gated behind
-`--generate-csr`, an explicit switch, and an explicit new certificate name. It creates only the pending CSR/private-key
-association and does not issue `write memory`, certificate installation, replacement, or deletion commands.
+Certificate monitoring and pending-CSR retrieval are read-only. CSR generation is the only switch write-capable
+operation and is gated behind `--generate-csr`, an explicit switch, and an explicit new certificate name. It creates
+only the pending CSR/private-key association and does not issue `write memory`, certificate installation, replacement,
+or deletion commands.
 
 Automated renewal will only be added after this manual CSR workflow has been proven reliable.
 

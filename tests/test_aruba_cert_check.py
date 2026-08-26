@@ -1,18 +1,21 @@
 import base64
 from datetime import date, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, rsa
-from cryptography.x509.oid import NameOID
+from cryptography.x509.oid import NameOID, SignatureAlgorithmOID
 from netmiko.exceptions import (
     NetmikoAuthenticationException,
     NetmikoTimeoutException,
 )
 
 import aruba_cert_check as checker
+
+FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
 
 def make_config():
@@ -382,9 +385,11 @@ fqdn = "switch.example.com"
     [
         ["aruba_cert_check.py", "--generate-csr", "--certificate-name", "newcert"],
         ["aruba_cert_check.py", "--generate-csr", "--switch", "EXAMPLE-SWITCH"],
+        ["aruba_cert_check.py", "--retrieve-csr", "--certificate-name", "newcert"],
+        ["aruba_cert_check.py", "--retrieve-csr", "--switch", "EXAMPLE-SWITCH"],
     ],
 )
-def test_generate_csr_required_arguments_fail_before_credentials(monkeypatch, argv):
+def test_csr_operations_require_arguments_before_credentials(monkeypatch, argv):
     monkeypatch.setattr(checker.sys, "argv", argv)
 
     def unexpected_credentials_request():
@@ -405,14 +410,53 @@ def test_generate_csr_required_arguments_fail_before_credentials(monkeypatch, ar
 def test_csr_only_options_require_generate_csr(field, value):
     args = SimpleNamespace(
         generate_csr=False,
+        retrieve_csr=False,
         switch_name=None,
         certificate_name=None,
         csr_output=None,
     )
     setattr(args, field, value)
 
-    with pytest.raises(ValueError, match="requires --generate-csr"):
+    with pytest.raises(ValueError, match="requires --generate-csr or --retrieve-csr"):
         checker.validate_cli_args(args)
+
+
+def test_generate_and_retrieve_csr_are_mutually_exclusive():
+    args = SimpleNamespace(
+        generate_csr=True,
+        retrieve_csr=True,
+        switch_name="EXAMPLE-SWITCH",
+        certificate_name="webcert2027",
+        csr_output=None,
+    )
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        checker.validate_cli_args(args)
+
+
+def test_mutually_exclusive_csr_operations_fail_before_credentials(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        checker.sys,
+        "argv",
+        [
+            "aruba_cert_check.py",
+            "--generate-csr",
+            "--retrieve-csr",
+            "--switch",
+            "EXAMPLE-SWITCH",
+            "--certificate-name",
+            "webcert2027",
+        ],
+    )
+    monkeypatch.setattr(
+        checker,
+        "get_credentials",
+        lambda: calls.append("credentials"),
+    )
+
+    assert checker.main() == checker.EXIT_ERROR
+    assert calls == []
 
 
 def test_generate_csr_main_writes_validated_pem(monkeypatch, tmp_path):
@@ -460,8 +504,59 @@ fqdn = "switch.example.com"
     assert output_file.read_text(encoding="ascii") == csr_pem
 
 
-def test_existing_csr_output_fails_before_credentials_and_generation(
-    monkeypatch, tmp_path
+def test_retrieve_csr_main_writes_validated_pem(monkeypatch, tmp_path):
+    config_file = tmp_path / "config.toml"
+    output_file = tmp_path / "request.pem"
+    config_file.write_text(
+        """
+[csr]
+organization = "Example Organization"
+organizational_unit = "Infrastructure"
+locality = "Example City"
+state = "Example State"
+country = "GB"
+key_type = "rsa"
+key_size = 2048
+
+[[switches]]
+name = "EXAMPLE-SWITCH"
+host = "192.0.2.10"
+fqdn = "switch.example.com"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        checker.sys,
+        "argv",
+        [
+            "aruba_cert_check.py",
+            "--config",
+            str(config_file),
+            "--retrieve-csr",
+            "--switch",
+            "EXAMPLE-SWITCH",
+            "--certificate-name",
+            "webcert2027",
+            "--csr-output",
+            str(output_file),
+        ],
+    )
+    csr_pem = make_test_csr()
+    monkeypatch.setattr(checker, "get_credentials", lambda: ("username", "password"))
+    monkeypatch.setattr(checker, "retrieve_csr", lambda *args, **kwargs: csr_pem)
+
+    def unexpected_generation(*args, **kwargs):
+        pytest.fail("generate_csr must not be called during retrieval")
+
+    monkeypatch.setattr(checker, "generate_csr", unexpected_generation)
+
+    assert checker.main() == checker.EXIT_OK
+    assert output_file.read_text(encoding="ascii") == csr_pem
+
+
+@pytest.mark.parametrize("operation", ["--generate-csr", "--retrieve-csr"])
+def test_existing_csr_output_fails_before_credentials_or_ssh(
+    monkeypatch, tmp_path, operation
 ):
     output_file = tmp_path / "request.pem"
     output_file.write_text("existing CSR", encoding="ascii")
@@ -473,7 +568,7 @@ def test_existing_csr_output_fails_before_credentials_and_generation(
             "aruba_cert_check.py",
             "--config",
             str(tmp_path / "not-needed.toml"),
-            "--generate-csr",
+            operation,
             "--switch",
             "EXAMPLE-SWITCH",
             "--certificate-name",
@@ -491,6 +586,11 @@ def test_existing_csr_output_fails_before_credentials_and_generation(
         checker,
         "generate_csr",
         lambda *args, **kwargs: calls.append("generate_csr"),
+    )
+    monkeypatch.setattr(
+        checker,
+        "retrieve_csr",
+        lambda *args, **kwargs: calls.append("retrieve_csr"),
     )
 
     assert checker.main() == checker.EXIT_ERROR
@@ -562,7 +662,11 @@ def make_test_csr(
     country="GB",
     key_size=2048,
     key_type="rsa",
+    signature_hash=None,
 ):
+    if signature_hash is None:
+        signature_hash = hashes.SHA256()
+
     if key_type == "rsa":
         key = rsa.generate_private_key(
             public_exponent=65537,
@@ -603,7 +707,7 @@ def make_test_csr(
         .subject_name(subject)
         .sign(
             key,
-            hashes.SHA256(),
+            signature_hash,
         )
     )
 
@@ -978,6 +1082,123 @@ def test_generate_csr_warns_if_timeout_follows_creation_attempt(monkeypatch):
         )
 
 
+def test_retrieve_csr_finds_and_validates_requested_pending_web_csr(monkeypatch):
+    summary = "\n".join(
+        [
+            "webcert2026 Web 2027/09/27 webprofile2026",
+            "webcert2027 Web CSR webprofile2026",
+        ]
+    )
+    connection = FakeCSRConnection(make_test_csr(), summary_output=summary)
+    monkeypatch.setattr(checker, "ConnectHandler", lambda **kwargs: connection)
+
+    csr_pem = checker.retrieve_csr(
+        make_config()["switches"][0],
+        "username",
+        "password",
+        "webcert2027",
+        make_csr_settings(),
+    )
+
+    assert csr_pem == connection.csr_pem
+    assert connection.commands == [
+        "show crypto pki local-certificate summary",
+        "show crypto pki local-certificate webcert2027",
+    ]
+    assert connection.retrieval_kwargs["read_timeout"] == 30
+    assert not connection.entered_config_mode
+    assert not connection.exited_config_mode
+    assert connection.timing_kwargs is None
+
+
+def test_retrieve_csr_sends_only_read_only_show_commands(monkeypatch):
+    summary = "webcert2027 Web CSR webprofile2026\n"
+    connection = FakeCSRConnection(make_test_csr(), summary_output=summary)
+    monkeypatch.setattr(checker, "ConnectHandler", lambda **kwargs: connection)
+
+    checker.retrieve_csr(
+        make_config()["switches"][0],
+        "username",
+        "password",
+        "webcert2027",
+        make_csr_settings(),
+    )
+
+    commands = "\n".join(connection.commands).casefold()
+    assert all(command.startswith("show ") for command in connection.commands)
+    assert "write memory" not in commands
+    assert "install" not in commands
+    assert "delete" not in commands
+    assert "clear" not in commands
+    assert "create-csr" not in commands
+
+
+def test_retrieve_csr_rejects_installed_web_certificate(monkeypatch):
+    summary = "webcert2027 Web 2028/09/27 webprofile2026\n"
+    connection = FakeCSRConnection(make_test_csr(), summary_output=summary)
+    monkeypatch.setattr(checker, "ConnectHandler", lambda **kwargs: connection)
+
+    with pytest.raises(ValueError, match="installed; expected a pending CSR"):
+        checker.retrieve_csr(
+            make_config()["switches"][0],
+            "username",
+            "password",
+            "webcert2027",
+            make_csr_settings(),
+        )
+
+    assert connection.commands == ["show crypto pki local-certificate summary"]
+    assert not connection.entered_config_mode
+
+
+def test_retrieve_csr_rejects_non_web_pending_certificate(monkeypatch):
+    summary = "webcert2027 Client CSR webprofile2026\n"
+    connection = FakeCSRConnection(make_test_csr(), summary_output=summary)
+    monkeypatch.setattr(checker, "ConnectHandler", lambda **kwargs: connection)
+
+    with pytest.raises(ValueError, match="usage Client; expected Web"):
+        checker.retrieve_csr(
+            make_config()["switches"][0],
+            "username",
+            "password",
+            "webcert2027",
+            make_csr_settings(),
+        )
+
+    assert connection.commands == ["show crypto pki local-certificate summary"]
+
+
+def test_retrieve_csr_rejects_wrong_certificate_name(monkeypatch):
+    summary = "othercert Web CSR webprofile2026\n"
+    connection = FakeCSRConnection(make_test_csr(), summary_output=summary)
+    monkeypatch.setattr(checker, "ConnectHandler", lambda **kwargs: connection)
+
+    with pytest.raises(ValueError, match="not found"):
+        checker.retrieve_csr(
+            make_config()["switches"][0],
+            "username",
+            "password",
+            "webcert2027",
+            make_csr_settings(),
+        )
+
+    assert connection.commands == ["show crypto pki local-certificate summary"]
+
+
+def test_write_or_print_csr_uses_exclusive_file_creation(tmp_path):
+    output_file = tmp_path / "request.pem"
+    csr_pem = make_test_csr()
+
+    checker.write_or_print_csr(csr_pem, output_file)
+
+    assert output_file.read_text(encoding="ascii") == csr_pem
+
+    with pytest.raises(FileExistsError):
+        checker.write_or_print_csr("replacement", output_file)
+
+    assert output_file.read_text(encoding="ascii") == csr_pem
+
+
 def test_extract_csr_pem():
     csr_pem = make_test_csr()
 
@@ -1005,8 +1226,32 @@ def test_validate_csr_pem():
         make_csr_settings(),
     )
 
-    assert csr.is_signature_valid
+    assert csr.signature_algorithm_oid == SignatureAlgorithmOID.RSA_WITH_SHA256
     assert csr.public_key().key_size == 2048
+
+
+def test_explicit_verification_accepts_rsa_sha1_when_property_reports_false():
+    csr_pem = (FIXTURES_DIR / "rsa_sha1_csr.pem").read_text(encoding="ascii")
+    parsed_csr = x509.load_pem_x509_csr(csr_pem.encode("ascii"))
+
+    assert not parsed_csr.is_signature_valid
+
+    csr = checker.validate_csr_pem(
+        csr_pem,
+        make_config()["switches"][0],
+        make_csr_settings(),
+    )
+
+    assert csr.signature_algorithm_oid == SignatureAlgorithmOID.RSA_WITH_SHA1
+
+
+def test_validate_csr_pem_rejects_unsupported_rsa_signature_algorithm():
+    with pytest.raises(ValueError, match="Unsupported CSR signature algorithm"):
+        checker.validate_csr_pem(
+            make_test_csr(signature_hash=hashes.SHA384()),
+            make_config()["switches"][0],
+            make_csr_settings(),
+        )
 
 
 def test_validate_csr_pem_rejects_wrong_common_name():

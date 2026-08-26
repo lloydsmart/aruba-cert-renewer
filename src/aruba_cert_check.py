@@ -11,8 +11,10 @@ from datetime import date, datetime
 from pathlib import Path
 
 from cryptography import x509
-from cryptography.hazmat.primitives.asymmetric import rsa
-from cryptography.x509.oid import NameOID
+from cryptography.exceptions import InvalidSignature, UnsupportedAlgorithm
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
+from cryptography.x509.oid import NameOID, SignatureAlgorithmOID
 from netmiko import ConnectHandler
 from netmiko.exceptions import (
     NetmikoAuthenticationException,
@@ -58,33 +60,45 @@ def parse_args():
     )
 
     parser.add_argument(
+        "--retrieve-csr",
+        action="store_true",
+        help="Retrieve and validate an existing pending CSR without modifying it",
+    )
+
+    parser.add_argument(
         "--certificate-name",
         metavar="NAME",
-        help="New certificate name to use when generating a CSR",
+        help="Certificate name to generate or retrieve",
     )
 
     parser.add_argument(
         "--csr-output",
         type=Path,
         metavar="FILE",
-        help="Write the generated PEM CSR to this file instead of stdout",
+        help="Write the validated PEM CSR to this file instead of stdout",
     )
 
     return parser.parse_args()
 
 
 def validate_cli_args(args):
-    if args.generate_csr and not args.switch_name:
-        raise ValueError("--generate-csr requires --switch")
+    if args.generate_csr and args.retrieve_csr:
+        raise ValueError("--generate-csr and --retrieve-csr are mutually exclusive")
 
-    if args.generate_csr and not args.certificate_name:
-        raise ValueError("--generate-csr requires --certificate-name")
+    csr_operation = args.generate_csr or args.retrieve_csr
+    operation_name = "--generate-csr" if args.generate_csr else "--retrieve-csr"
 
-    if not args.generate_csr and args.certificate_name:
-        raise ValueError("--certificate-name requires --generate-csr")
+    if csr_operation and not args.switch_name:
+        raise ValueError(f"{operation_name} requires --switch")
 
-    if not args.generate_csr and args.csr_output:
-        raise ValueError("--csr-output requires --generate-csr")
+    if csr_operation and not args.certificate_name:
+        raise ValueError(f"{operation_name} requires --certificate-name")
+
+    if not csr_operation and args.certificate_name:
+        raise ValueError("--certificate-name requires --generate-csr or --retrieve-csr")
+
+    if not csr_operation and args.csr_output:
+        raise ValueError("--csr-output requires --generate-csr or --retrieve-csr")
 
     if args.certificate_name:
         validate_cli_identifier(args.certificate_name, "certificate name")
@@ -278,6 +292,37 @@ def certificate_name_exists(summary_output, certificate_name):
     )
 
 
+def get_certificate_summary_entry(summary_output, certificate_name):
+    certificate_name = validate_cli_identifier(
+        certificate_name,
+        "certificate name",
+    )
+    pattern = re.compile(
+        rf"^\s*(?P<name>{re.escape(certificate_name)})"
+        r"\s+(?P<usage>\S+)"
+        r"\s+(?P<expiration>\d{4}/\d{2}/\d{2}|CSR)"
+        r"\s+(?P<profile>\S+)\s*$",
+        re.MULTILINE | re.IGNORECASE,
+    )
+    matches = list(pattern.finditer(summary_output))
+
+    if not matches:
+        raise ValueError(
+            f"Certificate name not found on the switch: {certificate_name}"
+        )
+
+    if len(matches) != 1:
+        raise ValueError(f"Certificate name is ambiguous: {certificate_name}")
+
+    match = matches[0]
+    return {
+        "name": match.group("name"),
+        "usage": match.group("usage"),
+        "expiration": match.group("expiration"),
+        "profile": match.group("profile"),
+    }
+
+
 def get_csr_settings(config):
     csr_settings = config.get("csr")
 
@@ -431,6 +476,39 @@ def get_subject_value(subject, oid, field_name):
     return attributes[0].value
 
 
+def verify_csr_signature(csr, public_key):
+    supported_algorithms = {
+        # AOS-S WC.16.11.0015 emits RSA/SHA-1 PKCS#10 self-signatures. SHA-1 is
+        # accepted only here as proof of possession; it is not acceptable for
+        # an issued HTTPS certificate.
+        SignatureAlgorithmOID.RSA_WITH_SHA1: hashes.SHA1(),
+        SignatureAlgorithmOID.RSA_WITH_SHA256: hashes.SHA256(),
+    }
+    signature_hash = supported_algorithms.get(csr.signature_algorithm_oid)
+
+    if signature_hash is None:
+        raise ValueError(
+            "Unsupported CSR signature algorithm: "
+            f"{csr.signature_algorithm_oid.dotted_string}"
+        )
+
+    try:
+        public_key.verify(
+            csr.signature,
+            csr.tbs_certrequest_bytes,
+            padding.PKCS1v15(),
+            signature_hash,
+        )
+
+    except InvalidSignature as error:
+        raise ValueError("CSR signature is invalid") from error
+
+    except UnsupportedAlgorithm as error:
+        raise ValueError(
+            f"CSR signature algorithm is unavailable: {signature_hash.name}"
+        ) from error
+
+
 def validate_csr_pem(csr_pem, switch, csr_settings):
     csr_settings = validate_csr_settings(csr_settings)
 
@@ -440,8 +518,18 @@ def validate_csr_pem(csr_pem, switch, csr_settings):
     except (ValueError, UnicodeEncodeError) as error:
         raise ValueError("Returned CSR is not valid PEM") from error
 
-    if not csr.is_signature_valid:
-        raise ValueError("CSR signature is invalid")
+    public_key = csr.public_key()
+
+    if not isinstance(public_key, rsa.RSAPublicKey):
+        raise ValueError("CSR does not contain an RSA public key")
+
+    if public_key.key_size != csr_settings["key_size"]:
+        raise ValueError(
+            f"CSR RSA key size is {public_key.key_size}; "
+            f"expected {csr_settings['key_size']}"
+        )
+
+    verify_csr_signature(csr, public_key)
 
     expected_subject = {
         NameOID.COMMON_NAME: ("common name", switch["fqdn"]),
@@ -479,17 +567,6 @@ def validate_csr_pem(csr_pem, switch, csr_settings):
                 f"CSR {field_name} is {actual_value!r}; expected {expected_value!r}"
             )
 
-    public_key = csr.public_key()
-
-    if not isinstance(public_key, rsa.RSAPublicKey):
-        raise ValueError("CSR does not contain an RSA public key")
-
-    if public_key.key_size != csr_settings["key_size"]:
-        raise ValueError(
-            f"CSR RSA key size is {public_key.key_size}; "
-            f"expected {csr_settings['key_size']}"
-        )
-
     return csr
 
 
@@ -507,6 +584,16 @@ def get_device_parameters(switch, username, password):
 
 class CSRGenerationError(ValueError):
     """An error after CSR creation was attempted on the switch."""
+
+
+def retrieve_and_validate_csr(connection, switch, certificate_name, csr_settings):
+    csr_output = connection.send_command(
+        f"show crypto pki local-certificate {certificate_name}",
+        read_timeout=30,
+    )
+    csr_pem = extract_csr_pem(csr_output)
+    validate_csr_pem(csr_pem, switch, csr_settings)
+    return csr_pem
 
 
 def generate_csr(
@@ -566,10 +653,19 @@ def generate_csr(
             finally:
                 connection.exit_config_mode()
 
-            csr_output = connection.send_command(
-                f"show crypto pki local-certificate {certificate_name}",
-                read_timeout=30,
-            )
+            try:
+                return retrieve_and_validate_csr(
+                    connection,
+                    switch,
+                    certificate_name,
+                    csr_settings,
+                )
+
+            except ValueError as error:
+                raise CSRGenerationError(
+                    f"CSR retrieval or validation failed: {error}. "
+                    "The pending CSR was not removed"
+                ) from error
 
     except NetmikoAuthenticationException as error:
         raise ValueError("SSH authentication failed") from error
@@ -583,17 +679,55 @@ def generate_csr(
 
         raise ValueError("SSH connection timed out") from error
 
+
+def retrieve_csr(
+    switch,
+    username,
+    password,
+    certificate_name,
+    csr_settings,
+):
+    certificate_name = validate_cli_identifier(
+        certificate_name,
+        "certificate name",
+    )
+    csr_settings = validate_csr_settings(csr_settings)
+    device = get_device_parameters(switch, username, password)
+
     try:
-        csr_pem = extract_csr_pem(csr_output)
-        validate_csr_pem(csr_pem, switch, csr_settings)
+        with ConnectHandler(**device) as connection:
+            summary_output = connection.send_command(
+                "show crypto pki local-certificate summary"
+            )
+            entry = get_certificate_summary_entry(
+                summary_output,
+                certificate_name,
+            )
 
-    except ValueError as error:
-        raise CSRGenerationError(
-            f"CSR retrieval or validation failed: {error}. "
-            "The pending CSR was not removed"
-        ) from error
+            if entry["usage"].casefold() != "web":
+                raise ValueError(
+                    f"Certificate {certificate_name} has usage {entry['usage']}; "
+                    "expected Web"
+                )
 
-    return csr_pem
+            if entry["expiration"].casefold() != "csr":
+                raise ValueError(
+                    f"Certificate {certificate_name} is installed; expected a "
+                    "pending CSR"
+                )
+
+            return retrieve_and_validate_csr(
+                connection,
+                switch,
+                certificate_name,
+                csr_settings,
+            )
+
+    except NetmikoAuthenticationException as error:
+        raise ValueError("SSH authentication failed") from error
+
+    except NetmikoTimeoutException as error:
+        raise ValueError("SSH connection timed out") from error
 
 
 def check_switch(switch, username, password, warning_days):
@@ -677,6 +811,16 @@ def get_exit_code(results):
     return EXIT_OK
 
 
+def write_or_print_csr(csr_pem, output_path):
+    if output_path:
+        with output_path.open("x", encoding="ascii") as output_file:
+            output_file.write(csr_pem)
+
+        print(f"CSR written to {output_path}")
+    else:
+        print(csr_pem, end="")
+
+
 def main():
     args = parse_args()
     configure_logging(args.debug)
@@ -687,7 +831,7 @@ def main():
         warning_days, switches = validate_config(config)
         switches = select_switches(switches, args.switch_name)
 
-        if args.generate_csr:
+        if args.generate_csr or args.retrieve_csr:
             csr_settings = get_csr_settings(config)
             validate_fqdn(switches[0]["fqdn"])
 
@@ -697,35 +841,44 @@ def main():
 
     username, password = get_credentials()
 
-    if args.generate_csr:
+    if args.generate_csr or args.retrieve_csr:
         switch = switches[0]
 
         try:
-            csr_pem = generate_csr(
-                switch,
-                username,
-                password,
-                args.certificate_name,
-                csr_settings,
-            )
+            if args.generate_csr:
+                csr_pem = generate_csr(
+                    switch,
+                    username,
+                    password,
+                    args.certificate_name,
+                    csr_settings,
+                )
+                print(f"CSR generated and validated for {switch['name']}.")
+            else:
+                csr_pem = retrieve_csr(
+                    switch,
+                    username,
+                    password,
+                    args.certificate_name,
+                    csr_settings,
+                )
+                print(f"Pending CSR retrieved and validated for {switch['name']}.")
 
-            print(f"CSR generated and validated for {switch['name']}.")
+            try:
+                write_or_print_csr(csr_pem, args.csr_output)
 
-            if args.csr_output:
-                try:
-                    with args.csr_output.open("x", encoding="ascii") as output_file:
-                        output_file.write(csr_pem)
-
-                except OSError as error:
+            except OSError as error:
+                if args.generate_csr:
                     raise CSRGenerationError(
                         f"CSR was generated and validated but could not be written "
                         f"to {args.csr_output}: {error}. The pending CSR remains on "
                         "the switch and can be retrieved again"
                     ) from error
 
-                print(f"CSR written to {args.csr_output}")
-            else:
-                print(csr_pem, end="")
+                raise ValueError(
+                    f"CSR was retrieved and validated but could not be written "
+                    f"to {args.csr_output}: {error}"
+                ) from error
 
             return EXIT_OK
 
