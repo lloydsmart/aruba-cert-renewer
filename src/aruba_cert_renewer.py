@@ -2,24 +2,32 @@
 
 import argparse
 import getpass
+import ipaddress
 import logging
 import os
 import re
 import sys
 import tomllib
-from datetime import date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 from cryptography import x509
 from cryptography.exceptions import InvalidSignature, UnsupportedAlgorithm
-from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
-from cryptography.x509.oid import NameOID, SignatureAlgorithmOID
+from cryptography.x509.oid import (
+    ExtendedKeyUsageOID,
+    ExtensionOID,
+    NameOID,
+    SignatureAlgorithmOID,
+)
 from netmiko import ConnectHandler
 from netmiko.exceptions import (
     NetmikoAuthenticationException,
     NetmikoTimeoutException,
 )
+
+from opnsense_client import OPNsenseClient, validate_base_url
 
 DEFAULT_CONFIG_FILE = Path(__file__).resolve().parent.parent / "config.toml"
 
@@ -66,9 +74,15 @@ def parse_args():
     )
 
     parser.add_argument(
+        "--sign-csr",
+        action="store_true",
+        help="Sign and validate an existing pending CSR using OPNsense",
+    )
+
+    parser.add_argument(
         "--certificate-name",
         metavar="NAME",
-        help="Certificate name to generate or retrieve",
+        help="Certificate name to generate, retrieve, or sign",
     )
 
     parser.add_argument(
@@ -78,15 +92,30 @@ def parse_args():
         help="Write the validated PEM CSR to this file instead of stdout",
     )
 
+    parser.add_argument(
+        "--certificate-output",
+        type=Path,
+        metavar="FILE",
+        help="Write the validated signed PEM certificate to this file",
+    )
+
     return parser.parse_args()
 
 
 def validate_cli_args(args):
-    if args.generate_csr and args.retrieve_csr:
-        raise ValueError("--generate-csr and --retrieve-csr are mutually exclusive")
+    operations = [args.generate_csr, args.retrieve_csr, args.sign_csr]
+    if sum(operations) > 1:
+        raise ValueError(
+            "--generate-csr, --retrieve-csr, and --sign-csr are mutually exclusive"
+        )
 
-    csr_operation = args.generate_csr or args.retrieve_csr
-    operation_name = "--generate-csr" if args.generate_csr else "--retrieve-csr"
+    csr_operation = any(operations)
+    if args.generate_csr:
+        operation_name = "--generate-csr"
+    elif args.retrieve_csr:
+        operation_name = "--retrieve-csr"
+    else:
+        operation_name = "--sign-csr"
 
     if csr_operation and not args.switch_name:
         raise ValueError(f"{operation_name} requires --switch")
@@ -95,16 +124,29 @@ def validate_cli_args(args):
         raise ValueError(f"{operation_name} requires --certificate-name")
 
     if not csr_operation and args.certificate_name:
-        raise ValueError("--certificate-name requires --generate-csr or --retrieve-csr")
+        raise ValueError(
+            "--certificate-name requires --generate-csr, --retrieve-csr, or --sign-csr"
+        )
 
-    if not csr_operation and args.csr_output:
+    if (not csr_operation or args.sign_csr) and args.csr_output:
         raise ValueError("--csr-output requires --generate-csr or --retrieve-csr")
+
+    if not args.sign_csr and args.certificate_output:
+        raise ValueError("--certificate-output requires --sign-csr")
+
+    if args.sign_csr and not args.certificate_output:
+        raise ValueError("--sign-csr requires --certificate-output")
 
     if args.certificate_name:
         validate_cli_identifier(args.certificate_name, "certificate name")
 
     if args.csr_output and args.csr_output.exists():
         raise ValueError(f"CSR output file already exists: {args.csr_output}")
+
+    if args.certificate_output and args.certificate_output.exists():
+        raise ValueError(
+            f"Certificate output file already exists: {args.certificate_output}"
+        )
 
 
 def configure_logging(debug):
@@ -330,6 +372,54 @@ def get_csr_settings(config):
         raise ValueError("A [csr] configuration section is required")
 
     return validate_csr_settings(csr_settings)
+
+
+def get_opnsense_settings(config):
+    settings = config.get("opnsense")
+
+    if not isinstance(settings, dict):
+        raise ValueError("An [opnsense] configuration section is required")
+
+    if "api_key" in settings or "api_secret" in settings:
+        raise ValueError(
+            "OPNsense API credentials must be supplied only through environment "
+            "variables"
+        )
+
+    required_fields = ("base_url", "ca", "lifetime_days", "digest")
+    for field in required_fields:
+        if field not in settings:
+            raise ValueError(f"opnsense.{field} must be configured")
+
+    base_url = validate_base_url(settings["base_url"])
+    ca_description = settings["ca"]
+    lifetime_days = settings["lifetime_days"]
+    digest = settings["digest"]
+
+    if (
+        not isinstance(ca_description, str)
+        or not ca_description.strip()
+        or len(ca_description) > 255
+        or any(ord(character) < 32 for character in ca_description)
+    ):
+        raise ValueError("opnsense.ca must be a non-empty safe description")
+
+    if (
+        not isinstance(lifetime_days, int)
+        or isinstance(lifetime_days, bool)
+        or not 1 <= lifetime_days <= 3650
+    ):
+        raise ValueError("opnsense.lifetime_days must be between 1 and 3650")
+
+    if digest not in {"sha256", "sha384", "sha512"}:
+        raise ValueError("opnsense.digest must be sha256, sha384, or sha512")
+
+    return {
+        "base_url": base_url,
+        "ca": ca_description.strip(),
+        "lifetime_days": lifetime_days,
+        "digest": digest,
+    }
 
 
 def validate_csr_settings(csr_settings):
@@ -568,6 +658,192 @@ def validate_csr_pem(csr_pem, switch, csr_settings):
             )
 
     return csr
+
+
+def validate_switch_signing_identity(switch):
+    fqdn = validate_fqdn(switch["fqdn"])
+
+    try:
+        management_ip = ipaddress.IPv4Address(switch["host"])
+    except ipaddress.AddressValueError as error:
+        raise ValueError(
+            "switch host must be a management IPv4 address for --sign-csr"
+        ) from error
+
+    return fqdn, management_ip
+
+
+def _require_extension(certificate, extension_oid, name):
+    try:
+        return certificate.extensions.get_extension_for_oid(extension_oid).value
+    except x509.ExtensionNotFound as error:
+        raise ValueError(f"Issued certificate is missing {name}") from error
+
+
+def _public_key_bytes(public_key):
+    return public_key.public_bytes(
+        serialization.Encoding.DER,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+
+
+def validate_issued_certificate(
+    certificate_pem,
+    csr,
+    switch,
+    lifetime_days,
+    *,
+    now=None,
+    clock_skew=timedelta(minutes=5),
+):
+    try:
+        certificates = x509.load_pem_x509_certificates(certificate_pem.encode("ascii"))
+    except (ValueError, UnicodeEncodeError) as error:
+        raise ValueError("Issued certificate is not valid PEM X.509") from error
+
+    if len(certificates) != 1:
+        raise ValueError(
+            "Issued certificate response must contain exactly one certificate"
+        )
+
+    certificate = certificates[0]
+    certificate_key = certificate.public_key()
+    csr_key = csr.public_key()
+
+    if not isinstance(certificate_key, rsa.RSAPublicKey):
+        raise ValueError("Issued certificate does not contain an RSA public key")
+
+    if certificate_key.key_size != 2048:
+        raise ValueError(
+            f"Issued certificate RSA key size is {certificate_key.key_size}; "
+            "expected 2048"
+        )
+
+    if _public_key_bytes(certificate_key) != _public_key_bytes(csr_key):
+        raise ValueError("Issued certificate public key does not match the CSR")
+
+    common_names = certificate.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
+    if len(common_names) != 1 or common_names[0].value != switch["fqdn"]:
+        raise ValueError(
+            f"Issued certificate CN must equal switch FQDN {switch['fqdn']!r}"
+        )
+
+    if certificate.subject != csr.subject:
+        raise ValueError("Issued certificate subject does not match the CSR")
+
+    subject_alt_name = _require_extension(
+        certificate,
+        ExtensionOID.SUBJECT_ALTERNATIVE_NAME,
+        "Subject Alternative Name",
+    )
+    dns_names = subject_alt_name.get_values_for_type(x509.DNSName)
+    if switch["fqdn"].casefold() not in {name.casefold() for name in dns_names}:
+        raise ValueError("Issued certificate is missing the switch DNS SAN")
+
+    expected_ip = ipaddress.IPv4Address(switch["host"])
+    ip_addresses = subject_alt_name.get_values_for_type(x509.IPAddress)
+    if expected_ip not in ip_addresses:
+        raise ValueError("Issued certificate is missing the switch IP SAN")
+
+    basic_constraints = _require_extension(
+        certificate,
+        ExtensionOID.BASIC_CONSTRAINTS,
+        "Basic Constraints",
+    )
+    if basic_constraints.ca:
+        raise ValueError("Issued certificate Basic Constraints must set CA to FALSE")
+
+    extended_key_usage = _require_extension(
+        certificate,
+        ExtensionOID.EXTENDED_KEY_USAGE,
+        "Extended Key Usage",
+    )
+    if ExtendedKeyUsageOID.SERVER_AUTH not in extended_key_usage:
+        raise ValueError(
+            "Issued certificate Extended Key Usage must contain serverAuth"
+        )
+
+    not_before = certificate.not_valid_before_utc
+    not_after = certificate.not_valid_after_utc
+    if not_after <= not_before:
+        raise ValueError("Issued certificate validity period is invalid")
+
+    if now is None:
+        now = datetime.now(UTC)
+    elif now.tzinfo is None:
+        raise ValueError("Certificate validation time must be timezone-aware")
+
+    if not_before > now + clock_skew:
+        raise ValueError("Issued certificate is not yet valid")
+
+    if not_after <= now:
+        raise ValueError("Issued certificate has expired")
+
+    actual_lifetime = not_after - not_before
+    expected_lifetime = timedelta(days=lifetime_days)
+    lifetime_tolerance = timedelta(days=1)
+    if not (
+        expected_lifetime - lifetime_tolerance
+        <= actual_lifetime
+        <= expected_lifetime + lifetime_tolerance
+    ):
+        raise ValueError(
+            "Issued certificate validity period is inconsistent with "
+            "opnsense.lifetime_days"
+        )
+
+    try:
+        signature_hash = certificate.signature_hash_algorithm
+    except UnsupportedAlgorithm as error:
+        raise ValueError(
+            "Issued certificate signature hash algorithm is unsupported"
+        ) from error
+
+    if signature_hash is None or signature_hash.digest_size < 32:
+        raise ValueError(
+            "Issued certificate signature hash must be SHA-256 or stronger"
+        )
+
+    return certificate
+
+
+def sign_pending_csr(
+    switch,
+    username,
+    password,
+    certificate_name,
+    csr_settings,
+    opnsense_settings,
+):
+    fqdn, management_ip = validate_switch_signing_identity(switch)
+    csr_pem = retrieve_csr(
+        switch,
+        username,
+        password,
+        certificate_name,
+        csr_settings,
+    )
+    csr = validate_csr_pem(csr_pem, switch, csr_settings)
+
+    client = OPNsenseClient(opnsense_settings["base_url"])
+    caref = client.resolve_ca(opnsense_settings["ca"])
+    certificate_uuid = client.sign_csr(
+        csr_pem,
+        caref=caref,
+        digest=opnsense_settings["digest"],
+        lifetime_days=opnsense_settings["lifetime_days"],
+        dns_name=fqdn,
+        ip_address=str(management_ip),
+        description=f"Aruba Web certificate {certificate_name} for {fqdn}",
+    )
+    certificate_pem = client.get_certificate(certificate_uuid)
+    validate_issued_certificate(
+        certificate_pem,
+        csr,
+        switch,
+        opnsense_settings["lifetime_days"],
+    )
+    return certificate_pem
 
 
 def get_device_parameters(switch, username, password):
@@ -821,6 +1097,13 @@ def write_or_print_csr(csr_pem, output_path):
         print(csr_pem, end="")
 
 
+def write_certificate(certificate_pem, output_path):
+    with output_path.open("x", encoding="ascii") as output_file:
+        output_file.write(certificate_pem)
+
+    print(f"Certificate written to {output_path}")
+
+
 def main():
     args = parse_args()
     configure_logging(args.debug)
@@ -831,15 +1114,43 @@ def main():
         warning_days, switches = validate_config(config)
         switches = select_switches(switches, args.switch_name)
 
-        if args.generate_csr or args.retrieve_csr:
+        if args.generate_csr or args.retrieve_csr or args.sign_csr:
             csr_settings = get_csr_settings(config)
             validate_fqdn(switches[0]["fqdn"])
+
+        if args.sign_csr:
+            opnsense_settings = get_opnsense_settings(config)
+            validate_switch_signing_identity(switches[0])
 
     except ValueError as error:
         print(f"Error: {error}", file=sys.stderr)
         return EXIT_ERROR
 
     username, password = get_credentials()
+
+    if args.sign_csr:
+        switch = switches[0]
+
+        try:
+            certificate_pem = sign_pending_csr(
+                switch,
+                username,
+                password,
+                args.certificate_name,
+                csr_settings,
+                opnsense_settings,
+            )
+            write_certificate(certificate_pem, args.certificate_output)
+            print(
+                f"Pending CSR signed and issued certificate validated for "
+                f"{switch['name']}."
+            )
+            print("The certificate has not been installed on the switch.")
+            return EXIT_OK
+
+        except (ValueError, OSError) as error:
+            print(f"Error: {error}", file=sys.stderr)
+            return EXIT_ERROR
 
     if args.generate_csr or args.retrieve_csr:
         switch = switches[0]
