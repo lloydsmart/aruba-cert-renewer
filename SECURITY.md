@@ -80,3 +80,26 @@ The automation is limited to CA description lookup, CSR signing, and public-cert
 Aruba certificate private keys are generated and stored on the switch. They must not be exported to or retrieved from
 OPNsense. A pending CSR represents the valuable association with its switch-held private key and must not be cleared,
 replaced, regenerated, or deleted by the signing workflow.
+
+## Aruba Installation and Live Verification
+
+Certificate installation accepts only one bounded ASCII PEM certificate that has
+been validated against the currently pending Aruba CSR. The installer must never
+confirm an unexpected interactive prompt or issue save, reboot, delete, clear,
+or CSR-generation commands.
+
+After installation, a new TLS connection to the switch must verify all three of
+these properties before the operation succeeds:
+
+* The served certificate chains to the configured CA.
+* Normal hostname verification succeeds for the configured switch FQDN.
+* The served certificate is byte-for-byte the expected certificate in DER form.
+
+The configured CA file contains public certificate material only. It must be
+loaded by Python's normal SSL trust machinery. TLS hostname checking and
+certificate verification must never be disabled, including during bounded
+post-install retries.
+
+An installation or verification error after the Aruba installation command may
+mean that the new certificate is already active. The tool must report that state
+clearly and must not attempt automatic rollback or other recovery changes.

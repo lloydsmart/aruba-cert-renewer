@@ -1,5 +1,6 @@
 import base64
 import ipaddress
+import re
 import warnings
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -1872,3 +1873,772 @@ def test_existing_certificate_output_is_not_overwritten(monkeypatch, tmp_path):
 
     assert checker.main() == checker.EXIT_ERROR
     assert output_file.read_text(encoding="ascii") == "existing certificate"
+
+
+def make_install_args(**overrides):
+    values = {
+        "generate_csr": False,
+        "retrieve_csr": False,
+        "sign_csr": False,
+        "install_certificate": True,
+        "switch_name": "EXAMPLE-SWITCH",
+        "certificate_name": "webcert2027",
+        "csr_output": None,
+        "certificate_output": None,
+        "certificate_input": Path("certificate.pem"),
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"switch_name": None}, "requires --switch"),
+        ({"certificate_name": None}, "requires --certificate-name"),
+        ({"certificate_input": None}, "requires --certificate-input"),
+    ],
+)
+def test_install_certificate_requires_explicit_arguments(overrides, message):
+    with pytest.raises(ValueError, match=message):
+        checker.validate_cli_args(make_install_args(**overrides))
+
+
+@pytest.mark.parametrize(
+    "other_operation", ["generate_csr", "retrieve_csr", "sign_csr"]
+)
+def test_install_certificate_is_mutually_exclusive(other_operation):
+    args = make_install_args()
+    setattr(args, other_operation, True)
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        checker.validate_cli_args(args)
+
+
+def test_certificate_input_is_install_only():
+    args = make_install_args(
+        install_certificate=False,
+        switch_name=None,
+        certificate_name=None,
+    )
+
+    with pytest.raises(ValueError, match="requires --install-certificate"):
+        checker.validate_cli_args(args)
+
+
+def test_read_certificate_input_preserves_complete_pem(tmp_path):
+    _, _, certificate_pem = make_test_identity_and_certificate()
+    certificate_file = tmp_path / "certificate.pem"
+    certificate_file.write_text(certificate_pem, encoding="ascii")
+
+    assert checker.read_certificate_input(certificate_file) == certificate_pem
+
+
+@pytest.mark.parametrize(
+    "contents",
+    [
+        b"not a certificate",
+        b"\xff-----BEGIN CERTIFICATE-----\n",
+        (b"-----BEGIN PRIVATE KEY-----\nTEST\n-----END PRIVATE KEY-----\n"),
+    ],
+)
+def test_read_certificate_input_rejects_malformed_or_non_certificate_input(
+    tmp_path, contents
+):
+    certificate_file = tmp_path / "certificate.pem"
+    certificate_file.write_bytes(contents)
+
+    with pytest.raises(ValueError):
+        checker.read_certificate_input(certificate_file)
+
+
+def test_read_certificate_input_rejects_a_certificate_bundle(tmp_path):
+    _, _, certificate_pem = make_test_identity_and_certificate()
+    certificate_file = tmp_path / "certificate.pem"
+    certificate_file.write_text(certificate_pem + certificate_pem, encoding="ascii")
+
+    with pytest.raises(ValueError, match="exactly one"):
+        checker.read_certificate_input(certificate_file)
+
+
+def test_read_certificate_input_is_bounded(tmp_path):
+    certificate_file = tmp_path / "certificate.pem"
+    certificate_file.write_bytes(b"A" * (checker.MAX_CERTIFICATE_INPUT_BYTES + 1))
+
+    with pytest.raises(ValueError, match="exceeds"):
+        checker.read_certificate_input(certificate_file)
+
+
+def test_get_verification_ca_file_resolves_relative_to_config(monkeypatch, tmp_path):
+    config_file = tmp_path / "config.toml"
+    ca_file = tmp_path / "ca" / "internal-ca.pem"
+    ca_file.parent.mkdir()
+    ca_file.write_text("public CA placeholder", encoding="ascii")
+    calls = []
+
+    monkeypatch.setattr(
+        checker.ssl,
+        "create_default_context",
+        lambda *, cafile: calls.append(cafile) or object(),
+    )
+
+    result = checker.get_verification_ca_file(
+        {"verification": {"ca_file": "ca/internal-ca.pem"}},
+        config_file,
+    )
+
+    assert result == ca_file
+    assert calls == [str(ca_file)]
+
+
+def test_get_verification_ca_file_rejects_missing_file(tmp_path):
+    with pytest.raises(ValueError, match="not found"):
+        checker.get_verification_ca_file(
+            {"verification": {"ca_file": "missing.pem"}},
+            tmp_path / "config.toml",
+        )
+
+
+def test_invalid_install_config_fails_before_credentials(monkeypatch, tmp_path):
+    config_file = tmp_path / "config.toml"
+    certificate_file = tmp_path / "certificate.pem"
+    _, _, certificate_pem = make_test_identity_and_certificate()
+    certificate_file.write_text(certificate_pem, encoding="ascii")
+    config_file.write_text(signing_config_text(), encoding="utf-8")
+    monkeypatch.setattr(
+        checker.sys,
+        "argv",
+        [
+            "aruba_cert_renewer.py",
+            "--config",
+            str(config_file),
+            "--install-certificate",
+            "--switch",
+            "EXAMPLE-SWITCH",
+            "--certificate-name",
+            "webcert2027",
+            "--certificate-input",
+            str(certificate_file),
+        ],
+    )
+    monkeypatch.setattr(
+        checker,
+        "get_credentials",
+        lambda: pytest.fail("Credentials should not be requested"),
+    )
+
+    assert checker.main() == checker.EXIT_ERROR
+
+
+def test_malformed_certificate_input_fails_before_credentials(monkeypatch, tmp_path):
+    config_file = tmp_path / "config.toml"
+    certificate_file = tmp_path / "certificate.pem"
+    certificate_file.write_text("not a certificate", encoding="ascii")
+    config_file.write_text(
+        signing_config_text() + '\n\n[verification]\nca_file = "public-ca.pem"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        checker.sys,
+        "argv",
+        [
+            "aruba_cert_renewer.py",
+            "--config",
+            str(config_file),
+            "--install-certificate",
+            "--switch",
+            "EXAMPLE-SWITCH",
+            "--certificate-name",
+            "webcert2027",
+            "--certificate-input",
+            str(certificate_file),
+        ],
+    )
+    monkeypatch.setattr(
+        checker,
+        "get_verification_ca_file",
+        lambda *args: tmp_path / "public-ca.pem",
+    )
+    monkeypatch.setattr(
+        checker,
+        "get_credentials",
+        lambda: pytest.fail("Credentials should not be requested"),
+    )
+
+    assert checker.main() == checker.EXIT_ERROR
+
+
+class FakeInstallConnection:
+    def __init__(
+        self,
+        csr_pem,
+        *,
+        paste_prompt=checker.CERTIFICATE_PASTE_PROMPT,
+        replacement_prompt=checker.CERTIFICATE_REPLACEMENT_PROMPT,
+        post_summary="webcert2027 Web 2027/02/02 webprofile2026\n",
+        details_output=(
+            "Certificate Detail:\n"
+            "Version: 3 (0x2)\n"
+            "Serial Number: 01:23:45:67\n"
+            "Signature Algorithm: sha256WithRSAEncryption\n"
+        ),
+        context_exit_error=None,
+    ):
+        self.csr_pem = csr_pem
+        self.paste_prompt = paste_prompt
+        self.replacement_prompt = replacement_prompt
+        self.post_summary = post_summary
+        self.details_output = details_output
+        self.context_exit_error = context_exit_error
+        self.commands = []
+        self.summary_calls = 0
+        self.entered_config_mode = False
+        self.exited_config_mode = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if self.context_exit_error is not None:
+            raise self.context_exit_error
+        return False
+
+    def send_command(self, command, **kwargs):
+        self.commands.append(command)
+        if command == "show crypto pki local-certificate summary":
+            self.summary_calls += 1
+            if self.summary_calls <= 2:
+                return "webcert2027 Web CSR webprofile2026\n"
+            return self.post_summary
+        if command == "show crypto pki local-certificate webcert2027":
+            if self.summary_calls == 1:
+                return f"Certificate request:\n{self.csr_pem}"
+            return self.details_output
+        raise AssertionError(f"Unexpected command: {command}")
+
+    def config_mode(self):
+        self.entered_config_mode = True
+
+    def exit_config_mode(self):
+        self.exited_config_mode = True
+
+    def send_command_timing(self, command, **kwargs):
+        self.commands.append(command)
+        if command == "crypto pki install-signed-certificate":
+            return self.paste_prompt
+        if command == "y":
+            return "Certificate installed"
+        return self.replacement_prompt
+
+
+def test_install_pending_certificate_accepts_real_detail_shape_and_uses_guarded_interaction(
+    monkeypatch,
+):
+    csr_pem, _, certificate_pem = make_test_identity_and_certificate(
+        not_before=datetime.now(UTC) - timedelta(minutes=1)
+    )
+    connection = FakeInstallConnection(csr_pem)
+    monkeypatch.setattr(checker, "ConnectHandler", lambda **kwargs: connection)
+
+    checker.install_pending_certificate(
+        make_config()["switches"][0],
+        "username",
+        "password",
+        "webcert2027",
+        certificate_pem,
+        make_csr_settings(),
+        397,
+    )
+
+    assert connection.entered_config_mode
+    assert connection.exited_config_mode
+    assert "Certificate Detail:" in connection.details_output
+    assert "webcert2027" not in connection.details_output
+    assert connection.commands == [
+        "show crypto pki local-certificate summary",
+        "show crypto pki local-certificate webcert2027",
+        "show crypto pki local-certificate summary",
+        "crypto pki install-signed-certificate",
+        certificate_pem,
+        "y",
+        "show crypto pki local-certificate summary",
+        "show crypto pki local-certificate webcert2027",
+    ]
+    forbidden_patterns = (
+        r"\bwrite\s+memory\b",
+        r"\bsave\b",
+        r"\breboot\b",
+        r"\breload\b",
+        r"\bclear\b",
+        r"\bdelete\b",
+        r"\bcreate-csr\b",
+    )
+    commands_without_pem = [
+        command for command in connection.commands if command != certificate_pem
+    ]
+    for command in commands_without_pem:
+        assert all(
+            re.search(pattern, command, re.IGNORECASE) is None
+            for pattern in forbidden_patterns
+        )
+
+
+@pytest.mark.parametrize(
+    "expected_prompt",
+    [checker.CERTIFICATE_PASTE_PROMPT, checker.CERTIFICATE_REPLACEMENT_PROMPT],
+)
+def test_expected_prompt_accepts_command_echo_and_trailing_whitespace(expected_prompt):
+    response = f"command echo\r\nInformational text\r\n{expected_prompt}\r\n\r\n"
+
+    assert checker._ends_with_expected_prompt(response, expected_prompt)
+
+
+@pytest.mark.parametrize(
+    "paste_prompt",
+    [
+        f"Error: rejected input\n{checker.CERTIFICATE_PASTE_PROMPT}",
+        f"{checker.CERTIFICATE_PASTE_PROMPT}\nUnexpected follow-up text",
+    ],
+)
+def test_bad_paste_prompt_never_sends_certificate(monkeypatch, paste_prompt):
+    csr_pem, _, certificate_pem = make_test_identity_and_certificate(
+        not_before=datetime.now(UTC) - timedelta(minutes=1)
+    )
+    connection = FakeInstallConnection(csr_pem, paste_prompt=paste_prompt)
+    monkeypatch.setattr(checker, "ConnectHandler", lambda **kwargs: connection)
+
+    with pytest.raises(
+        checker.CertificateInstallationAttemptError,
+        match="certificate-paste prompt",
+    ):
+        checker.install_pending_certificate(
+            make_config()["switches"][0],
+            "username",
+            "password",
+            "webcert2027",
+            certificate_pem,
+            make_csr_settings(),
+            397,
+        )
+
+    assert connection.exited_config_mode
+    assert certificate_pem not in connection.commands
+    assert "y" not in connection.commands
+
+
+@pytest.mark.parametrize(
+    "replacement_prompt",
+    [
+        f"Error: rejected certificate\n{checker.CERTIFICATE_REPLACEMENT_PROMPT}",
+        f"{checker.CERTIFICATE_REPLACEMENT_PROMPT}\nUnexpected follow-up text",
+    ],
+)
+def test_bad_replacement_prompt_never_sends_confirmation(
+    monkeypatch, replacement_prompt
+):
+    csr_pem, _, certificate_pem = make_test_identity_and_certificate(
+        not_before=datetime.now(UTC) - timedelta(minutes=1)
+    )
+    connection = FakeInstallConnection(
+        csr_pem,
+        replacement_prompt=replacement_prompt,
+    )
+    monkeypatch.setattr(checker, "ConnectHandler", lambda **kwargs: connection)
+
+    with pytest.raises(
+        checker.CertificateInstallationAttemptError,
+        match="confirmation was not sent",
+    ):
+        checker.install_pending_certificate(
+            make_config()["switches"][0],
+            "username",
+            "password",
+            "webcert2027",
+            certificate_pem,
+            make_csr_settings(),
+            397,
+        )
+
+    assert connection.exited_config_mode
+    assert certificate_pem in connection.commands
+    assert "y" not in connection.commands
+
+
+@pytest.mark.parametrize(
+    "certificate_kwargs",
+    [
+        {"certificate_key_matches": False},
+        {"common_name": "wrong.example.com"},
+        {"dns_names": ()},
+    ],
+)
+def test_certificate_validation_failure_sends_no_configuration_command(
+    monkeypatch, certificate_kwargs
+):
+    csr_pem, _, certificate_pem = make_test_identity_and_certificate(
+        not_before=datetime.now(UTC) - timedelta(minutes=1),
+        **certificate_kwargs,
+    )
+    connection = FakeInstallConnection(csr_pem)
+    monkeypatch.setattr(checker, "ConnectHandler", lambda **kwargs: connection)
+
+    with pytest.raises(ValueError):
+        checker.install_pending_certificate(
+            make_config()["switches"][0],
+            "username",
+            "password",
+            "webcert2027",
+            certificate_pem,
+            make_csr_settings(),
+            397,
+        )
+
+    assert not connection.entered_config_mode
+    assert all(command.startswith("show ") for command in connection.commands)
+
+
+def test_installed_certificate_name_is_rejected_before_config_mode(monkeypatch):
+    csr_pem, _, certificate_pem = make_test_identity_and_certificate(
+        not_before=datetime.now(UTC) - timedelta(minutes=1)
+    )
+    connection = FakeInstallConnection(csr_pem)
+    connection.summary_calls = 2
+    monkeypatch.setattr(checker, "ConnectHandler", lambda **kwargs: connection)
+
+    with pytest.raises(ValueError, match="installed; expected a pending CSR"):
+        checker.install_pending_certificate(
+            make_config()["switches"][0],
+            "username",
+            "password",
+            "webcert2027",
+            certificate_pem,
+            make_csr_settings(),
+            397,
+        )
+
+    assert not connection.entered_config_mode
+
+
+@pytest.mark.parametrize(
+    ("post_summary", "message"),
+    [
+        ("webcert2027 Web CSR webprofile2026\n", "still shown"),
+        ("webcert2027 Client 2027/02/02 webprofile2026\n", "usage Client"),
+        ("webcert2027 Web 2027/02/02 changedprofile\n", "profile changed"),
+    ],
+)
+def test_post_install_summary_must_show_installed_web_certificate(
+    monkeypatch, post_summary, message
+):
+    csr_pem, _, certificate_pem = make_test_identity_and_certificate(
+        not_before=datetime.now(UTC) - timedelta(minutes=1)
+    )
+    connection = FakeInstallConnection(csr_pem, post_summary=post_summary)
+    monkeypatch.setattr(checker, "ConnectHandler", lambda **kwargs: connection)
+
+    with pytest.raises(checker.CertificateInstallationAttemptError, match=message):
+        checker.install_pending_certificate(
+            make_config()["switches"][0],
+            "username",
+            "password",
+            "webcert2027",
+            certificate_pem,
+            make_csr_settings(),
+            397,
+        )
+
+
+@pytest.mark.parametrize(
+    "details_output",
+    [
+        "Error: certificate unavailable\nCertificate Detail:\n",
+        "Version: 3 (0x2)\nSerial Number: 01:23:45:67\n",
+    ],
+)
+def test_post_install_detail_rejects_cli_errors_or_missing_success_marker(
+    monkeypatch, details_output
+):
+    csr_pem, _, certificate_pem = make_test_identity_and_certificate(
+        not_before=datetime.now(UTC) - timedelta(minutes=1)
+    )
+    connection = FakeInstallConnection(csr_pem, details_output=details_output)
+    monkeypatch.setattr(checker, "ConnectHandler", lambda **kwargs: connection)
+
+    with pytest.raises(
+        checker.CertificateInstallationAttemptError,
+        match="detailed switch output",
+    ):
+        checker.install_pending_certificate(
+            make_config()["switches"][0],
+            "username",
+            "password",
+            "webcert2027",
+            certificate_pem,
+            make_csr_settings(),
+            397,
+        )
+
+
+@pytest.mark.parametrize(
+    "context_exit_error",
+    [OSError("SSH close failed"), ValueError("SSH close failed")],
+    ids=["oserror", "valueerror"],
+)
+def test_context_exit_error_after_install_is_post_install_failure(
+    monkeypatch, context_exit_error
+):
+    csr_pem, _, certificate_pem = make_test_identity_and_certificate(
+        not_before=datetime.now(UTC) - timedelta(minutes=1)
+    )
+    connection = FakeInstallConnection(
+        csr_pem,
+        context_exit_error=context_exit_error,
+    )
+    monkeypatch.setattr(checker, "ConnectHandler", lambda **kwargs: connection)
+
+    with pytest.raises(checker.CertificateInstallationAttemptError) as raised:
+        checker.install_pending_certificate(
+            make_config()["switches"][0],
+            "username",
+            "password",
+            "webcert2027",
+            certificate_pem,
+            make_csr_settings(),
+            397,
+        )
+
+    assert "may already have changed the switch" in str(raised.value)
+    assert "y" in connection.commands
+    assert connection.summary_calls == 3
+
+
+def test_context_exit_oserror_cannot_reach_main_pre_install_path(
+    monkeypatch, tmp_path, capsys
+):
+    config_file = tmp_path / "config.toml"
+    certificate_file = tmp_path / "certificate.pem"
+    csr_pem, _, certificate_pem = make_test_identity_and_certificate(
+        not_before=datetime.now(UTC) - timedelta(minutes=1)
+    )
+    certificate_file.write_text(certificate_pem, encoding="ascii")
+    config_file.write_text(
+        signing_config_text() + '\n\n[verification]\nca_file = "public-ca.pem"\n',
+        encoding="utf-8",
+    )
+    connection = FakeInstallConnection(
+        csr_pem,
+        context_exit_error=OSError("SSH close failed"),
+    )
+    monkeypatch.setattr(checker, "ConnectHandler", lambda **kwargs: connection)
+    monkeypatch.setattr(
+        checker,
+        "get_verification_ca_file",
+        lambda *args: tmp_path / "public-ca.pem",
+    )
+    monkeypatch.setattr(checker, "get_credentials", lambda: ("username", "password"))
+    monkeypatch.setattr(
+        checker.sys,
+        "argv",
+        [
+            "aruba_cert_renewer.py",
+            "--config",
+            str(config_file),
+            "--install-certificate",
+            "--switch",
+            "EXAMPLE-SWITCH",
+            "--certificate-name",
+            "webcert2027",
+            "--certificate-input",
+            str(certificate_file),
+        ],
+    )
+
+    assert checker.main() == checker.EXIT_ERROR
+    error_output = capsys.readouterr().err
+    assert "Post-install failure" in error_output
+    assert "may already have changed the switch" in error_output
+    assert "Pre-install failure" not in error_output
+
+
+@pytest.mark.parametrize(
+    "pre_install_error",
+    [OSError("SSH open failed"), ValueError("SSH open failed")],
+    ids=["oserror", "valueerror"],
+)
+def test_pre_install_valueerror_and_oserror_remain_safe(monkeypatch, pre_install_error):
+    def fail_connection(**kwargs):
+        raise pre_install_error
+
+    monkeypatch.setattr(checker, "ConnectHandler", fail_connection)
+
+    with pytest.raises(type(pre_install_error)) as raised:
+        checker.install_pending_certificate(
+            make_config()["switches"][0],
+            "username",
+            "password",
+            "webcert2027",
+            "not reached",
+            make_csr_settings(),
+            397,
+        )
+
+    assert not isinstance(raised.value, checker.CertificateInstallationAttemptError)
+
+
+class FakeTLSSocket:
+    def __init__(self, peer_der=None):
+        self.peer_der = peer_der
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        return False
+
+    def getpeercert(self, *, binary_form):
+        assert binary_form is True
+        return self.peer_der
+
+
+class FakeVerifyingSSLContext:
+    check_hostname = True
+    verify_mode = checker.ssl.CERT_REQUIRED
+
+    def __init__(self, tls_results):
+        self.tls_results = iter(tls_results)
+        self.wrap_calls = []
+
+    def wrap_socket(self, tcp_socket, *, server_hostname):
+        self.wrap_calls.append((tcp_socket, server_hostname))
+        result = next(self.tls_results)
+        if isinstance(result, Exception):
+            raise result
+        return FakeTLSSocket(result)
+
+
+def test_verify_live_https_uses_verified_hostname_and_exact_der(monkeypatch):
+    _, _, certificate_pem = make_test_identity_and_certificate()
+    certificate = x509.load_pem_x509_certificate(certificate_pem.encode("ascii"))
+    expected_der = certificate.public_bytes(serialization.Encoding.DER)
+    context = FakeVerifyingSSLContext([expected_der])
+    tcp_socket = FakeTLSSocket()
+    context_calls = []
+    connection_calls = []
+    monkeypatch.setattr(
+        checker.ssl,
+        "create_default_context",
+        lambda *, cafile: context_calls.append(cafile) or context,
+    )
+    monkeypatch.setattr(
+        checker.socket,
+        "create_connection",
+        lambda address, *, timeout: (
+            connection_calls.append((address, timeout)) or tcp_socket
+        ),
+    )
+
+    checker.verify_live_https_certificate(
+        make_config()["switches"][0],
+        Path("public-ca.pem"),
+        certificate,
+    )
+
+    assert context_calls == ["public-ca.pem"]
+    assert connection_calls == [(("192.0.2.10", 443), 5)]
+    assert context.wrap_calls == [(tcp_socket, "switch.example.com")]
+    assert context.check_hostname is True
+    assert context.verify_mode == checker.ssl.CERT_REQUIRED
+
+
+def test_verify_live_https_retries_until_expected_certificate_appears(monkeypatch):
+    _, _, certificate_pem = make_test_identity_and_certificate()
+    certificate = x509.load_pem_x509_certificate(certificate_pem.encode("ascii"))
+    expected_der = certificate.public_bytes(serialization.Encoding.DER)
+    context = FakeVerifyingSSLContext([b"previous certificate", expected_der])
+    connection_calls = []
+    sleep_calls = []
+    monotonic_values = iter([0, 1])
+    monkeypatch.setattr(
+        checker.ssl, "create_default_context", lambda *, cafile: context
+    )
+    monkeypatch.setattr(
+        checker.socket,
+        "create_connection",
+        lambda address, *, timeout: (
+            connection_calls.append((address, timeout)) or FakeTLSSocket()
+        ),
+    )
+    monkeypatch.setattr(checker.time, "monotonic", lambda: next(monotonic_values))
+    monkeypatch.setattr(checker.time, "sleep", sleep_calls.append)
+
+    checker.verify_live_https_certificate(
+        make_config()["switches"][0],
+        Path("public-ca.pem"),
+        certificate,
+        verification_window=30,
+        retry_delay=2,
+    )
+
+    assert len(connection_calls) == 2
+    assert sleep_calls == [2]
+
+
+@pytest.mark.parametrize(
+    "tls_result",
+    [
+        b"another valid certificate",
+        checker.ssl.SSLCertVerificationError(1, "hostname or CA verification failed"),
+    ],
+)
+def test_verify_live_https_rejects_wrong_or_unverified_certificate(
+    monkeypatch, tls_result
+):
+    _, _, certificate_pem = make_test_identity_and_certificate()
+    certificate = x509.load_pem_x509_certificate(certificate_pem.encode("ascii"))
+    context = FakeVerifyingSSLContext([tls_result])
+    monotonic_values = iter([0, 0])
+    monkeypatch.setattr(
+        checker.ssl, "create_default_context", lambda *, cafile: context
+    )
+    monkeypatch.setattr(
+        checker.socket,
+        "create_connection",
+        lambda address, *, timeout: FakeTLSSocket(),
+    )
+    monkeypatch.setattr(checker.time, "monotonic", lambda: next(monotonic_values))
+
+    with pytest.raises(ValueError, match="not verified"):
+        checker.verify_live_https_certificate(
+            make_config()["switches"][0],
+            Path("public-ca.pem"),
+            certificate,
+            verification_window=0,
+        )
+
+
+def test_verify_live_https_retries_transient_connection_failure(monkeypatch):
+    _, _, certificate_pem = make_test_identity_and_certificate()
+    certificate = x509.load_pem_x509_certificate(certificate_pem.encode("ascii"))
+    expected_der = certificate.public_bytes(serialization.Encoding.DER)
+    context = FakeVerifyingSSLContext([expected_der])
+    results = iter([ConnectionRefusedError("restarting"), FakeTLSSocket()])
+    monotonic_values = iter([0, 1])
+    monkeypatch.setattr(
+        checker.ssl, "create_default_context", lambda *, cafile: context
+    )
+
+    def create_connection(address, *, timeout):
+        result = next(results)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    monkeypatch.setattr(checker.socket, "create_connection", create_connection)
+    monkeypatch.setattr(checker.time, "monotonic", lambda: next(monotonic_values))
+    monkeypatch.setattr(checker.time, "sleep", lambda seconds: None)
+
+    checker.verify_live_https_certificate(
+        make_config()["switches"][0],
+        Path("public-ca.pem"),
+        certificate,
+    )

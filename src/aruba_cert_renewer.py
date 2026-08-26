@@ -6,7 +6,11 @@ import ipaddress
 import logging
 import os
 import re
+import socket
+import ssl
+import stat
 import sys
+import time
 import tomllib
 import warnings
 from datetime import UTC, date, datetime, timedelta
@@ -37,10 +41,23 @@ EXIT_OK = 0
 EXIT_WARNING = 1
 EXIT_ERROR = 2
 
+MAX_CERTIFICATE_INPUT_BYTES = 64 * 1024
+HTTPS_VERIFICATION_WINDOW_SECONDS = 30
+HTTPS_RETRY_DELAY_SECONDS = 2
+HTTPS_SOCKET_TIMEOUT_SECONDS = 5
+
+CERTIFICATE_PASTE_PROMPT = "Paste the certificate here and enter:"
+CERTIFICATE_REPLACEMENT_PROMPT = (
+    "This certificate will replace an existing local certificate. Continue (y/n)?"
+)
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Check HTTPS certificate expiry on ArubaOS-Switch devices."
+        description=(
+            "Monitor and perform staged HTTPS certificate renewal on "
+            "ArubaOS-Switch devices."
+        )
     )
 
     parser.add_argument(
@@ -82,9 +99,18 @@ def parse_args():
     )
 
     parser.add_argument(
+        "--install-certificate",
+        action="store_true",
+        help=(
+            "Install a validated certificate onto an existing pending CSR and "
+            "verify live HTTPS"
+        ),
+    )
+
+    parser.add_argument(
         "--certificate-name",
         metavar="NAME",
-        help="Certificate name to generate, retrieve, or sign",
+        help="Certificate name to generate, retrieve, sign, or install",
     )
 
     parser.add_argument(
@@ -101,36 +127,56 @@ def parse_args():
         help="Write the validated signed PEM certificate to this file",
     )
 
+    parser.add_argument(
+        "--certificate-input",
+        type=Path,
+        metavar="FILE",
+        help="Read the signed PEM certificate to install from this file",
+    )
+
     return parser.parse_args()
 
 
 def validate_cli_args(args):
-    operations = [args.generate_csr, args.retrieve_csr, args.sign_csr]
+    install_certificate = getattr(args, "install_certificate", False)
+    certificate_input = getattr(args, "certificate_input", None)
+    operations = [
+        args.generate_csr,
+        args.retrieve_csr,
+        args.sign_csr,
+        install_certificate,
+    ]
     if sum(operations) > 1:
         raise ValueError(
-            "--generate-csr, --retrieve-csr, and --sign-csr are mutually exclusive"
+            "--generate-csr, --retrieve-csr, --sign-csr, and "
+            "--install-certificate are mutually exclusive"
         )
 
-    csr_operation = any(operations)
+    certificate_operation = any(operations)
     if args.generate_csr:
         operation_name = "--generate-csr"
     elif args.retrieve_csr:
         operation_name = "--retrieve-csr"
-    else:
+    elif args.sign_csr:
         operation_name = "--sign-csr"
+    else:
+        operation_name = "--install-certificate"
 
-    if csr_operation and not args.switch_name:
+    if certificate_operation and not args.switch_name:
         raise ValueError(f"{operation_name} requires --switch")
 
-    if csr_operation and not args.certificate_name:
+    if certificate_operation and not args.certificate_name:
         raise ValueError(f"{operation_name} requires --certificate-name")
 
-    if not csr_operation and args.certificate_name:
+    if not certificate_operation and args.certificate_name:
         raise ValueError(
-            "--certificate-name requires --generate-csr, --retrieve-csr, or --sign-csr"
+            "--certificate-name requires --generate-csr, --retrieve-csr, "
+            "--sign-csr, or --install-certificate"
         )
 
-    if (not csr_operation or args.sign_csr) and args.csr_output:
+    if (not certificate_operation or args.sign_csr or install_certificate) and (
+        args.csr_output
+    ):
         raise ValueError("--csr-output requires --generate-csr or --retrieve-csr")
 
     if not args.sign_csr and args.certificate_output:
@@ -138,6 +184,12 @@ def validate_cli_args(args):
 
     if args.sign_csr and not args.certificate_output:
         raise ValueError("--sign-csr requires --certificate-output")
+
+    if install_certificate and not certificate_input:
+        raise ValueError("--install-certificate requires --certificate-input")
+
+    if not install_certificate and certificate_input:
+        raise ValueError("--certificate-input requires --install-certificate")
 
     if args.certificate_name:
         validate_cli_identifier(args.certificate_name, "certificate name")
@@ -424,6 +476,54 @@ def get_opnsense_settings(config):
     }
 
 
+def get_verification_ca_file(config, config_file):
+    settings = config.get("verification")
+
+    if not isinstance(settings, dict):
+        raise ValueError(
+            "A [verification] configuration section is required for "
+            "--install-certificate"
+        )
+
+    configured_path = settings.get("ca_file")
+    if not isinstance(configured_path, str) or not configured_path.strip():
+        raise ValueError("verification.ca_file must be configured")
+
+    if "\x00" in configured_path:
+        raise ValueError("verification.ca_file contains unsupported characters")
+
+    ca_file = Path(configured_path)
+    if not ca_file.is_absolute():
+        ca_file = config_file.resolve().parent / ca_file
+
+    try:
+        with ca_file.open("rb") as file:
+            if not stat.S_ISREG(os.fstat(file.fileno()).st_mode):
+                raise ValueError(
+                    f"verification.ca_file is not a regular file: {ca_file}"
+                )
+
+    except FileNotFoundError:
+        raise ValueError(f"verification.ca_file not found: {ca_file}") from None
+    except IsADirectoryError:
+        raise ValueError(
+            f"verification.ca_file is not a regular file: {ca_file}"
+        ) from None
+    except OSError as error:
+        raise ValueError(
+            f"verification.ca_file cannot be read: {ca_file}: {error}"
+        ) from error
+
+    try:
+        ssl.create_default_context(cafile=str(ca_file))
+    except (OSError, ssl.SSLError) as error:
+        raise ValueError(
+            f"verification.ca_file cannot be loaded as a CA file: {ca_file}: {error}"
+        ) from error
+
+    return ca_file
+
+
 def validate_csr_settings(csr_settings):
     if not isinstance(csr_settings, dict):
         raise ValueError("CSR settings must be a table")
@@ -669,7 +769,8 @@ def validate_switch_signing_identity(switch):
         management_ip = ipaddress.IPv4Address(switch["host"])
     except ipaddress.AddressValueError as error:
         raise ValueError(
-            "switch host must be a management IPv4 address for --sign-csr"
+            "switch host must be a management IPv4 address for certificate "
+            "signing or installation"
         ) from error
 
     return fqdn, management_ip
@@ -824,6 +925,63 @@ def validate_issued_certificate(
     return certificate
 
 
+def read_certificate_input(certificate_input):
+    try:
+        with certificate_input.open("rb") as input_file:
+            if not stat.S_ISREG(os.fstat(input_file.fileno()).st_mode):
+                raise ValueError(
+                    f"Certificate input is not a regular file: {certificate_input}"
+                )
+
+            certificate_bytes = input_file.read(MAX_CERTIFICATE_INPUT_BYTES + 1)
+
+    except FileNotFoundError:
+        raise ValueError(
+            f"Certificate input file not found: {certificate_input}"
+        ) from None
+    except IsADirectoryError:
+        raise ValueError(
+            f"Certificate input is not a regular file: {certificate_input}"
+        ) from None
+    except OSError as error:
+        raise ValueError(
+            f"Certificate input could not be read: {certificate_input}: {error}"
+        ) from error
+
+    if len(certificate_bytes) > MAX_CERTIFICATE_INPUT_BYTES:
+        raise ValueError(
+            f"Certificate input exceeds {MAX_CERTIFICATE_INPUT_BYTES} bytes"
+        )
+
+    try:
+        certificate_pem = certificate_bytes.decode("ascii")
+    except UnicodeDecodeError as error:
+        raise ValueError("Certificate input must be ASCII PEM") from error
+
+    pem_match = re.fullmatch(
+        r"[ \t\r\n]*"
+        r"-----BEGIN CERTIFICATE-----\r?\n"
+        r"(?:[A-Za-z0-9+/=]+\r?\n)+"
+        r"-----END CERTIFICATE-----"
+        r"[ \t\r\n]*",
+        certificate_pem,
+    )
+    if pem_match is None:
+        raise ValueError(
+            "Certificate input must contain exactly one PEM X.509 certificate"
+        )
+
+    try:
+        certificates = x509.load_pem_x509_certificates(certificate_bytes)
+    except ValueError as error:
+        raise ValueError("Certificate input is not valid PEM X.509") from error
+
+    if len(certificates) != 1:
+        raise ValueError("Certificate input must contain exactly one certificate")
+
+    return certificate_pem
+
+
 def sign_pending_csr(
     switch,
     username,
@@ -877,6 +1035,10 @@ def get_device_parameters(switch, username, password):
 
 class CSRGenerationError(ValueError):
     """An error after CSR creation was attempted on the switch."""
+
+
+class CertificateInstallationAttemptError(ValueError):
+    """An error after certificate installation was attempted on the switch."""
 
 
 def retrieve_and_validate_csr(connection, switch, certificate_name, csr_settings):
@@ -1023,6 +1185,305 @@ def retrieve_csr(
         raise ValueError("SSH connection timed out") from error
 
 
+def require_pending_web_certificate(summary_output, certificate_name):
+    entry = get_certificate_summary_entry(summary_output, certificate_name)
+
+    if entry["usage"].casefold() != "web":
+        raise ValueError(
+            f"Certificate {certificate_name} has usage {entry['usage']}; expected Web"
+        )
+
+    if entry["expiration"].casefold() != "csr":
+        raise ValueError(
+            f"Certificate {certificate_name} is installed; expected a pending CSR"
+        )
+
+    return entry
+
+
+def _contains_obvious_cli_error(output):
+    return (
+        re.search(
+            r"(?:^|\n)\s*(?:%\s*)?(?:invalid|unknown|error|failed)|not found",
+            output,
+            re.IGNORECASE,
+        )
+        is not None
+    )
+
+
+def _ends_with_expected_prompt(output, expected_prompt):
+    return not _contains_obvious_cli_error(output) and output.rstrip().endswith(
+        expected_prompt
+    )
+
+
+def _send_certificate_pem(connection, certificate_pem):
+    previous_logging_disable = logging.root.manager.disable
+    logging.disable(logging.DEBUG)
+    try:
+        return connection.send_command_timing(
+            certificate_pem,
+            read_timeout=60,
+            normalize=True,
+        )
+    finally:
+        logging.disable(previous_logging_disable)
+
+
+def install_signed_certificate(
+    connection,
+    certificate_name,
+    certificate_pem,
+    expected_profile,
+):
+    """Install one validated PEM certificate using the guarded AOS-S prompts."""
+    installation_attempted = False
+    entered_config_mode = False
+
+    try:
+        summary_output = connection.send_command(
+            "show crypto pki local-certificate summary"
+        )
+        pending_entry = require_pending_web_certificate(
+            summary_output,
+            certificate_name,
+        )
+        if pending_entry["profile"].casefold() != expected_profile.casefold():
+            raise ValueError(
+                f"Certificate {certificate_name} TA profile changed before installation"
+            )
+
+        connection.config_mode()
+        entered_config_mode = True
+
+        installation_attempted = True
+        paste_prompt = connection.send_command_timing(
+            "crypto pki install-signed-certificate",
+            read_timeout=30,
+        )
+        if not _ends_with_expected_prompt(paste_prompt, CERTIFICATE_PASTE_PROMPT):
+            raise ValueError(
+                "Switch did not return the expected certificate-paste prompt"
+            )
+
+        replacement_prompt = _send_certificate_pem(connection, certificate_pem)
+        if not _ends_with_expected_prompt(
+            replacement_prompt,
+            CERTIFICATE_REPLACEMENT_PROMPT,
+        ):
+            raise ValueError(
+                "Switch did not return the expected certificate-replacement prompt; "
+                "confirmation was not sent"
+            )
+
+        confirmation_output = connection.send_command_timing(
+            "y",
+            read_timeout=60,
+        )
+        if _contains_obvious_cli_error(confirmation_output):
+            raise ValueError(
+                "Switch reported an error while installing the certificate"
+            )
+
+    except Exception as error:
+        if installation_attempted:
+            raise CertificateInstallationAttemptError(
+                f"Certificate installation may already have changed the switch: {error}"
+            ) from error
+        raise
+
+    finally:
+        if entered_config_mode:
+            try:
+                connection.exit_config_mode()
+            except Exception as exit_error:
+                if sys.exc_info()[0] is None:
+                    raise CertificateInstallationAttemptError(
+                        "Certificate installation may already have changed the switch, "
+                        f"and config mode could not be exited: {exit_error}"
+                    ) from exit_error
+
+    try:
+        summary_output = connection.send_command(
+            "show crypto pki local-certificate summary"
+        )
+        installed_entry = get_certificate_summary_entry(
+            summary_output,
+            certificate_name,
+        )
+        if installed_entry["usage"].casefold() != "web":
+            raise ValueError(
+                f"Installed certificate has usage {installed_entry['usage']}; "
+                "expected Web"
+            )
+        if installed_entry["expiration"].casefold() == "csr":
+            raise ValueError("Certificate is still shown as a pending CSR")
+        if installed_entry["profile"].casefold() != expected_profile.casefold():
+            raise ValueError("Installed certificate TA profile changed")
+
+        details_output = connection.send_command(
+            f"show crypto pki local-certificate {certificate_name}",
+            read_timeout=30,
+        )
+        if (
+            _contains_obvious_cli_error(details_output)
+            or re.search(
+                r"(?:^|\n)\s*Certificate Detail:\s*(?:\n|$)",
+                details_output,
+            )
+            is None
+        ):
+            raise ValueError(
+                "Could not confirm the installed certificate in detailed switch output"
+            )
+
+    except CertificateInstallationAttemptError:
+        raise
+    except Exception as error:
+        raise CertificateInstallationAttemptError(
+            "Certificate installation may already have changed the switch, but "
+            f"post-install Aruba verification failed: {error}"
+        ) from error
+
+
+def install_pending_certificate(
+    switch,
+    username,
+    password,
+    certificate_name,
+    certificate_pem,
+    csr_settings,
+    lifetime_days,
+):
+    certificate_name = validate_cli_identifier(
+        certificate_name,
+        "certificate name",
+    )
+    csr_settings = validate_csr_settings(csr_settings)
+    validate_switch_signing_identity(switch)
+    device = get_device_parameters(switch, username, password)
+    installation_completed = False
+
+    try:
+        with ConnectHandler(**device) as connection:
+            summary_output = connection.send_command(
+                "show crypto pki local-certificate summary"
+            )
+            pending_entry = require_pending_web_certificate(
+                summary_output,
+                certificate_name,
+            )
+            csr_pem = retrieve_and_validate_csr(
+                connection,
+                switch,
+                certificate_name,
+                csr_settings,
+            )
+            csr = validate_csr_pem(csr_pem, switch, csr_settings)
+            certificate = validate_issued_certificate(
+                certificate_pem,
+                csr,
+                switch,
+                lifetime_days,
+            )
+
+            install_signed_certificate(
+                connection,
+                certificate_name,
+                certificate_pem,
+                pending_entry["profile"],
+            )
+            installation_completed = True
+            return certificate
+
+    except CertificateInstallationAttemptError:
+        raise
+    except NetmikoAuthenticationException as error:
+        if installation_completed:
+            raise CertificateInstallationAttemptError(
+                "Certificate installation may already have changed the switch; "
+                "SSH authentication failed while closing the connection"
+            ) from error
+        raise ValueError("SSH authentication failed") from error
+    except NetmikoTimeoutException as error:
+        if installation_completed:
+            raise CertificateInstallationAttemptError(
+                "Certificate installation may already have changed the switch; "
+                "SSH timed out while closing the connection"
+            ) from error
+        raise ValueError("SSH connection timed out") from error
+    except (ValueError, OSError) as error:
+        if installation_completed:
+            raise CertificateInstallationAttemptError(
+                "Certificate installation may already have changed the switch; "
+                "an error occurred while closing the SSH connection"
+            ) from error
+        raise
+    except Exception as error:
+        if installation_completed:
+            raise CertificateInstallationAttemptError(
+                "Certificate installation may already have changed the switch; "
+                "an SSH error occurred while closing the connection"
+            ) from error
+        raise ValueError(
+            "SSH operation failed before certificate installation was attempted"
+        ) from error
+
+
+def verify_live_https_certificate(
+    switch,
+    ca_file,
+    expected_certificate,
+    *,
+    verification_window=HTTPS_VERIFICATION_WINDOW_SECONDS,
+    retry_delay=HTTPS_RETRY_DELAY_SECONDS,
+    socket_timeout=HTTPS_SOCKET_TIMEOUT_SECONDS,
+):
+    fqdn, management_ip = validate_switch_signing_identity(switch)
+    expected_der = expected_certificate.public_bytes(serialization.Encoding.DER)
+    context = ssl.create_default_context(cafile=str(ca_file))
+
+    if not context.check_hostname or context.verify_mode != ssl.CERT_REQUIRED:
+        raise ValueError("TLS verification context is not securely configured")
+
+    deadline = time.monotonic() + verification_window
+    last_error = None
+
+    while True:
+        try:
+            with (
+                socket.create_connection(
+                    (str(management_ip), 443),
+                    timeout=socket_timeout,
+                ) as tcp_socket,
+                context.wrap_socket(
+                    tcp_socket,
+                    server_hostname=fqdn,
+                ) as tls_socket,
+            ):
+                peer_der = tls_socket.getpeercert(binary_form=True)
+
+            if peer_der == expected_der:
+                return
+
+            last_error = ValueError(
+                "Live HTTPS service presented a different valid certificate"
+            )
+
+        except (OSError, ssl.SSLError) as error:
+            last_error = error
+
+        now = time.monotonic()
+        if now >= deadline:
+            raise ValueError(
+                "Expected certificate was not verified over live HTTPS within "
+                f"{verification_window} seconds: {last_error}"
+            ) from last_error
+
+        time.sleep(min(retry_delay, deadline - now))
+
+
 def check_switch(switch, username, password, warning_days):
     device = get_device_parameters(switch, username, password)
 
@@ -1131,19 +1592,82 @@ def main():
         warning_days, switches = validate_config(config)
         switches = select_switches(switches, args.switch_name)
 
-        if args.generate_csr or args.retrieve_csr or args.sign_csr:
+        if (
+            args.generate_csr
+            or args.retrieve_csr
+            or args.sign_csr
+            or args.install_certificate
+        ):
             csr_settings = get_csr_settings(config)
             validate_fqdn(switches[0]["fqdn"])
 
-        if args.sign_csr:
+        if args.sign_csr or args.install_certificate:
             opnsense_settings = get_opnsense_settings(config)
             validate_switch_signing_identity(switches[0])
+
+        if args.install_certificate:
+            verification_ca_file = get_verification_ca_file(config, args.config)
+            certificate_pem = read_certificate_input(args.certificate_input)
 
     except ValueError as error:
         print(f"Error: {error}", file=sys.stderr)
         return EXIT_ERROR
 
     username, password = get_credentials()
+
+    if args.install_certificate:
+        switch = switches[0]
+
+        try:
+            certificate = install_pending_certificate(
+                switch,
+                username,
+                password,
+                args.certificate_name,
+                certificate_pem,
+                csr_settings,
+                opnsense_settings["lifetime_days"],
+            )
+
+        except CertificateInstallationAttemptError as error:
+            print(f"Error: Post-install failure: {error}", file=sys.stderr)
+            print(
+                "No automatic rollback was attempted; inspect the switch manually.",
+                file=sys.stderr,
+            )
+            return EXIT_ERROR
+
+        except (ValueError, OSError) as error:
+            print(
+                "Error: Pre-install failure; the switch has not been modified: "
+                f"{error}",
+                file=sys.stderr,
+            )
+            return EXIT_ERROR
+
+        print(f"Certificate validated against pending CSR for {switch['name']}.")
+        print(f"Signed certificate installed on {switch['name']}.")
+
+        try:
+            verify_live_https_certificate(
+                switch,
+                verification_ca_file,
+                certificate,
+            )
+        except (ValueError, OSError, ssl.SSLError) as error:
+            print(
+                "Error: Post-install HTTPS verification failed. The certificate "
+                "may already be active and requires manual investigation: "
+                f"{error}",
+                file=sys.stderr,
+            )
+            print("No automatic rollback was attempted.", file=sys.stderr)
+            return EXIT_ERROR
+
+        print("Live HTTPS certificate chain and hostname verified.")
+        print("Live HTTPS certificate matches the installed certificate.")
+        print("Certificate installation verified successfully.")
+        return EXIT_OK
 
     if args.sign_csr:
         switch = switches[0]

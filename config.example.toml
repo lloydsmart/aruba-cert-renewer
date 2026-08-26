@@ -16,6 +16,9 @@ ca = "internal-ca"
 lifetime_days = 397
 digest = "sha256"
 
+[verification]
+ca_file = "/etc/aruba-cert-renewer/internal-ca.crt.pem"
+
 [[switches]]
 name = "EXAMPLE-SWITCH"
 host = "192.0.2.10"

@@ -15,9 +15,12 @@ Implemented:
   proof-of-possession signatures
 - Signing an existing CSR with an internal OPNsense CA
 - Strict validation and safe output of the issued public certificate
+- Install-only activation of an already-issued certificate on a pending Aruba CSR
+- Mandatory post-install HTTPS chain, hostname, and exact-certificate verification
 
 The `--sign-csr` stage does **not** install or activate the resulting certificate
-on the switch. Installation, HTTPS presentation checks, configuration saving,
+on the switch. Generation, retrieval/signing, and installation remain explicit,
+independently invoked stages. Automatic orchestration, configuration saving,
 container deployment, and unattended renewal remain planned work.
 
 ## Architecture
@@ -29,6 +32,8 @@ There is one user-facing orchestration command:
   and retains the certificate private key.
 - OPNsense communication uses its HTTPS JSON Trust API through the standard
   Python library. TLS server-certificate verification is always enabled.
+- Post-install verification opens a new standard-library TLS connection to the
+  switch management IPv4 address, using the switch FQDN for hostname checking.
 - `src/opnsense_client.py` contains only the narrowly scoped OPNsense HTTP/JSON
   interaction.
 
@@ -88,6 +93,9 @@ ca = "internal-ca"
 lifetime_days = 397
 digest = "sha256"
 
+[verification]
+ca_file = "/etc/aruba-cert-renewer/internal-ca.crt.pem"
+
 [[switches]]
 name = "EXAMPLE-SWITCH"
 host = "192.0.2.10"
@@ -98,6 +106,12 @@ fqdn = "switch.example.com"
 resolves it through `ca_list` and requires exactly one match. For signing,
 `switches.host` must be the switch management IPv4 address; it and
 `switches.fqdn` are explicitly requested as IP and DNS SANs.
+
+`verification.ca_file` is the public PEM certificate for the CA that issued the
+switch HTTPS certificate. It is required by `--install-certificate` and is
+loaded by Python's normal SSL trust machinery. Relative paths are resolved
+relative to `config.toml`, not the process working directory. Do not put a CA
+private key or real infrastructure certificate in the repository.
 
 `config.toml` is excluded from Git and should contain the real inventory. It
 must never contain OPNsense API credentials.
@@ -221,7 +235,52 @@ This operation:
 7. Exclusively creates `--certificate-output` only after validation succeeds.
 
 The command refuses to overwrite an existing output file. It does not install,
-activate, or save the certificate on the Aruba switch in this development stage.
+activate, or save the certificate on the Aruba switch.
+
+### Install an Issued Certificate
+
+Install an already-issued public certificate onto its existing pending CSR:
+
+```bash
+python src/aruba_cert_renewer.py \
+  --switch EXAMPLE-SWITCH \
+  --install-certificate \
+  --certificate-name webcert2027 \
+  --certificate-input switch-2027.crt.pem
+```
+
+The install stage reads one bounded ASCII PEM certificate, retrieves and
+validates the named pending CSR again, and validates the certificate against
+that CSR and the configured switch identity before entering configuration mode.
+It then requires the expected Aruba certificate-paste and replacement prompts;
+the replacement confirmation is never sent for an unexpected prompt.
+
+Installing a Web certificate replaces the switch's current Web certificate.
+The tool confirms that the named entry changed from `CSR` to an installed Web
+certificate without changing its TA profile. It does not issue `write memory`,
+save, reboot, delete, clear, or CSR-generation commands during installation.
+
+Live HTTPS verification is mandatory. The tool opens a new connection to the
+management IPv4 address on TCP/443 and uses the configured FQDN as
+`server_hostname`. Python's normal CA and hostname verification must succeed,
+and the live peer certificate's DER bytes must exactly match the supplied
+certificate. Transient connection, handshake, and old-certificate results are
+retried for a bounded window of about 30 seconds.
+
+If an error occurs after installation is attempted, the certificate may already
+be active. In particular, a failed live HTTPS check returns exit code `2` and
+requires manual investigation. The tool does not automatically restore, delete,
+regenerate, reboot, or otherwise roll back certificate state.
+
+### Staged Renewal Workflow
+
+The current workflow is intentionally explicit:
+
+1. Generate a pending CSR with `--generate-csr`.
+2. Retrieve it with `--retrieve-csr`, or retrieve and sign it with `--sign-csr`.
+3. Install the issued file with `--install-certificate`.
+4. Let the install operation verify the live HTTPS service before treating the
+   renewal as successful.
 
 ## Exit Codes
 
@@ -233,11 +292,13 @@ activate, or save the certificate on the Aruba switch in this development stage.
 
 ## Safety
 
-Monitoring and pending-CSR retrieval are read-only. CSR generation is the only
-operation that creates switch state. Signing creates a public certificate object
-in OPNsense but never retrieves a private key; the corresponding Aruba private
-key remains on the switch. No current operation installs a certificate or issues
-switch save, replacement, clear, or delete commands.
+Monitoring and pending-CSR retrieval are read-only. CSR generation creates
+pending switch state. Signing creates a public certificate object in OPNsense
+but never retrieves a private key; the corresponding Aruba private key remains
+on the switch. Installation explicitly replaces the current Web certificate but
+does not save, clear, delete, reboot, or regenerate certificate state. Success is
+reported only after mandatory verified HTTPS presents the exact installed
+certificate.
 
 ## License
 
