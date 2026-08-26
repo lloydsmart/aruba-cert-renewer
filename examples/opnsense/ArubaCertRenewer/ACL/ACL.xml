@@ -1,0 +1,13 @@
+<acl>
+    <page-api-aruba-cert-renewer>
+        <name>API: Aruba Certificate Renewer</name>
+        <description>
+            Allow CSR signing and public certificate retrieval for Aruba certificate renewal
+        </description>
+        <patterns>
+            <pattern>api/trust/cert/add</pattern>
+            <pattern>api/trust/cert/ca_list</pattern>
+            <pattern>api/trust/cert/generate_file/*/crt</pattern>
+        </patterns>
+    </page-api-aruba-cert-renewer>
+</acl>
