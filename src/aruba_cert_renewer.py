@@ -8,6 +8,7 @@ import os
 import re
 import sys
 import tomllib
+import warnings
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from cryptography import x509
 from cryptography.exceptions import InvalidSignature, UnsupportedAlgorithm
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
+from cryptography.utils import CryptographyDeprecationWarning
 from cryptography.x509.oid import (
     ExtendedKeyUsageOID,
     ExtensionOID,
@@ -674,10 +676,25 @@ def validate_switch_signing_identity(switch):
 
 
 def _require_extension(certificate, extension_oid, name):
-    try:
-        return certificate.extensions.get_extension_for_oid(extension_oid).value
-    except x509.ExtensionNotFound as error:
-        raise ValueError(f"Issued certificate is missing {name}") from error
+    with warnings.catch_warnings():
+        # OPNsense-created self-signed internal CAs may have serial 0, which can
+        # appear as authorityCertSerialNumber=0 in an issued certificate's AKI.
+        # This intentionally narrow compatibility filter does not accept an
+        # arbitrary malformed leaf certificate serial number as valid.
+        # A future cryptography parser exception will still fail validation.
+        warnings.filterwarnings(
+            "ignore",
+            message=(
+                r"^Parsed a serial number which wasn't positive \(i\.e\., it was "
+                r"negative or zero\), which is disallowed by RFC 5280\."
+            ),
+            category=CryptographyDeprecationWarning,
+        )
+
+        try:
+            return certificate.extensions.get_extension_for_oid(extension_oid).value
+        except x509.ExtensionNotFound as error:
+            raise ValueError(f"Issued certificate is missing {name}") from error
 
 
 def _public_key_bytes(public_key):

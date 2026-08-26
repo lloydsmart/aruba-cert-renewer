@@ -1,5 +1,6 @@
 import base64
 import ipaddress
+import warnings
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,8 +9,10 @@ import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, rsa
+from cryptography.utils import CryptographyDeprecationWarning
 from cryptography.x509.oid import (
     ExtendedKeyUsageOID,
+    ExtensionOID,
     NameOID,
     SignatureAlgorithmOID,
 )
@@ -1359,6 +1362,7 @@ def make_test_identity_and_certificate(
     not_after=None,
     lifetime_days=397,
     signature_hash=None,
+    authority_cert_serial_number=None,
 ):
     if not_before is None:
         not_before = datetime(2026, 1, 1, tzinfo=UTC) - timedelta(minutes=1)
@@ -1393,10 +1397,18 @@ def make_test_identity_and_certificate(
     if not certificate_key_matches:
         certificate_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
 
+    issuer_subject = certificate_subject
+    signing_key = certificate_key
+    if authority_cert_serial_number is not None:
+        issuer_subject = x509.Name(
+            [x509.NameAttribute(NameOID.COMMON_NAME, "Synthetic Test CA")]
+        )
+        signing_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
     builder = (
         x509.CertificateBuilder()
         .subject_name(certificate_subject)
-        .issuer_name(certificate_subject)
+        .issuer_name(issuer_subject)
         .public_key(certificate_key.public_key())
         .serial_number(x509.random_serial_number())
         .not_valid_before(not_before)
@@ -1421,7 +1433,20 @@ def make_test_identity_and_certificate(
     if eku is not None:
         builder = builder.add_extension(x509.ExtendedKeyUsage(eku), critical=False)
 
-    certificate = builder.sign(certificate_key, signature_hash)
+    if authority_cert_serial_number is not None:
+        issuer_key_identifier = x509.SubjectKeyIdentifier.from_public_key(
+            signing_key.public_key()
+        ).digest
+        builder = builder.add_extension(
+            x509.AuthorityKeyIdentifier(
+                key_identifier=issuer_key_identifier,
+                authority_cert_issuer=[x509.DirectoryName(issuer_subject)],
+                authority_cert_serial_number=authority_cert_serial_number,
+            ),
+            critical=False,
+        )
+
+    certificate = builder.sign(signing_key, signature_hash)
     return (
         csr.public_bytes(serialization.Encoding.PEM).decode("ascii"),
         csr,
@@ -1492,6 +1517,39 @@ def test_validate_issued_certificate():
     )
 
     assert certificate.public_key().key_size == 2048
+
+
+def test_validate_issued_certificate_contains_zero_aki_serial_warning():
+    _, csr, certificate_pem = make_test_identity_and_certificate(
+        authority_cert_serial_number=0
+    )
+    parsed_certificate = x509.load_pem_x509_certificate(certificate_pem.encode("ascii"))
+
+    assert parsed_certificate.serial_number > 0
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", CryptographyDeprecationWarning)
+        with pytest.raises(
+            CryptographyDeprecationWarning,
+            match="Parsed a serial number which wasn't positive",
+        ):
+            _ = parsed_certificate.extensions
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", CryptographyDeprecationWarning)
+        certificate = checker.validate_issued_certificate(
+            certificate_pem,
+            csr,
+            make_config()["switches"][0],
+            397,
+            now=datetime(2026, 1, 1, tzinfo=UTC),
+        )
+        authority_key_identifier = checker._require_extension(
+            certificate,
+            ExtensionOID.AUTHORITY_KEY_IDENTIFIER,
+            "Authority Key Identifier",
+        )
+
+    assert authority_key_identifier.authority_cert_serial_number == 0
 
 
 def test_validate_issued_certificate_rejects_public_key_mismatch():
