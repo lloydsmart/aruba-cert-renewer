@@ -1,0 +1,7 @@
+[settings]
+warning_days = 30
+
+[[switches]]
+name = "EXAMPLE-SWITCH"
+host = "192.0.2.10"
+fqdn = "switch.example.com"
