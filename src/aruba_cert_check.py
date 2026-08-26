@@ -51,7 +51,46 @@ def parse_args():
         help="Enable Netmiko debug logging",
     )
 
+    parser.add_argument(
+        "--generate-csr",
+        action="store_true",
+        help="Generate and retrieve a CSR for one explicitly selected switch",
+    )
+
+    parser.add_argument(
+        "--certificate-name",
+        metavar="NAME",
+        help="New certificate name to use when generating a CSR",
+    )
+
+    parser.add_argument(
+        "--csr-output",
+        type=Path,
+        metavar="FILE",
+        help="Write the generated PEM CSR to this file instead of stdout",
+    )
+
     return parser.parse_args()
+
+
+def validate_cli_args(args):
+    if args.generate_csr and not args.switch_name:
+        raise ValueError("--generate-csr requires --switch")
+
+    if args.generate_csr and not args.certificate_name:
+        raise ValueError("--generate-csr requires --certificate-name")
+
+    if not args.generate_csr and args.certificate_name:
+        raise ValueError("--certificate-name requires --generate-csr")
+
+    if not args.generate_csr and args.csr_output:
+        raise ValueError("--csr-output requires --generate-csr")
+
+    if args.certificate_name:
+        validate_cli_identifier(args.certificate_name, "certificate name")
+
+    if args.csr_output and args.csr_output.exists():
+        raise ValueError(f"CSR output file already exists: {args.csr_output}")
 
 
 def configure_logging(debug):
@@ -169,7 +208,7 @@ def parse_web_certificates(output):
         r"\s+"
         r"(?P<usage>Web)"
         r"\s+"
-        r"(?P<expiration>\d{4}/\d{2}/\d{2})"
+        r"(?P<expiration>\d{4}/\d{2}/\d{2}|CSR)"
         r"\s+"
         r"(?P<profile>\S+)"
         r"\s*$",
@@ -179,20 +218,64 @@ def parse_web_certificates(output):
     certificates = []
 
     for match in pattern.finditer(output):
-        expiration = datetime.strptime(
-            match.group("expiration"),
-            "%Y/%m/%d",
-        ).date()
+        expiration_text = match.group("expiration")
+        pending = expiration_text == "CSR"
+        expiration = None
+
+        if not pending:
+            expiration = datetime.strptime(
+                expiration_text,
+                "%Y/%m/%d",
+            ).date()
 
         certificates.append(
             {
                 "name": match.group("name"),
                 "expiration": expiration,
                 "profile": match.group("profile"),
+                "pending": pending,
             }
         )
 
     return certificates
+
+
+def get_active_web_certificate(certificates):
+    pending = [certificate for certificate in certificates if certificate["pending"]]
+
+    if pending:
+        names = ", ".join(certificate["name"] for certificate in pending)
+        raise ValueError(f"Found pending Web CSR: {names}")
+
+    installed = [
+        certificate for certificate in certificates if not certificate["pending"]
+    ]
+
+    if not installed:
+        raise ValueError("Could not find an installed Web certificate")
+
+    if len(installed) != 1:
+        raise ValueError(
+            f"Found {len(installed)} installed Web certificates; expected 1"
+        )
+
+    return installed[0]
+
+
+def certificate_name_exists(summary_output, certificate_name):
+    certificate_name = validate_cli_identifier(
+        certificate_name,
+        "certificate name",
+    )
+
+    return (
+        re.search(
+            rf"^\s*{re.escape(certificate_name)}\s+",
+            summary_output,
+            re.MULTILINE | re.IGNORECASE,
+        )
+        is not None
+    )
 
 
 def get_csr_settings(config):
@@ -200,6 +283,13 @@ def get_csr_settings(config):
 
     if not isinstance(csr_settings, dict):
         raise ValueError("A [csr] configuration section is required")
+
+    return validate_csr_settings(csr_settings)
+
+
+def validate_csr_settings(csr_settings):
+    if not isinstance(csr_settings, dict):
+        raise ValueError("CSR settings must be a table")
 
     required_fields = (
         "organization",
@@ -255,6 +345,21 @@ def validate_cli_identifier(value, field_name):
     return value
 
 
+def validate_fqdn(value):
+    if not isinstance(value, str) or len(value) > 253:
+        raise ValueError("switch FQDN contains unsupported characters")
+
+    labels = value.split(".")
+
+    if any(
+        not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label)
+        for label in labels
+    ):
+        raise ValueError("switch FQDN contains unsupported characters")
+
+    return value
+
+
 def quote_cli_subject_value(value):
     if any(character in value for character in ('"', "\r", "\n")):
         raise ValueError("CSR subject value contains unsupported characters")
@@ -266,6 +371,7 @@ def quote_cli_subject_value(value):
 
 
 def build_csr_command(switch, certificate_name, ta_profile, csr_settings):
+    csr_settings = validate_csr_settings(csr_settings)
     certificate_name = validate_cli_identifier(
         certificate_name,
         "certificate name",
@@ -274,10 +380,7 @@ def build_csr_command(switch, certificate_name, ta_profile, csr_settings):
         ta_profile,
         "TA profile",
     )
-    common_name = validate_cli_identifier(
-        switch["fqdn"],
-        "switch FQDN",
-    )
+    common_name = validate_fqdn(switch["fqdn"])
 
     organization = quote_cli_subject_value(csr_settings["organization"])
     organizational_unit = quote_cli_subject_value(csr_settings["organizational_unit"])
@@ -329,6 +432,8 @@ def get_subject_value(subject, oid, field_name):
 
 
 def validate_csr_pem(csr_pem, switch, csr_settings):
+    csr_settings = validate_csr_settings(csr_settings)
+
     try:
         csr = x509.load_pem_x509_csr(csr_pem.encode("ascii"))
 
@@ -388,8 +493,8 @@ def validate_csr_pem(csr_pem, switch, csr_settings):
     return csr
 
 
-def check_switch(switch, username, password, warning_days):
-    device = {
+def get_device_parameters(switch, username, password):
+    return {
         "device_type": "aruba_osswitch",
         "host": switch["host"],
         "username": username,
@@ -398,6 +503,101 @@ def check_switch(switch, username, password, warning_days):
         "banner_timeout": 15,
         "auth_timeout": 15,
     }
+
+
+class CSRGenerationError(ValueError):
+    """An error after CSR creation was attempted on the switch."""
+
+
+def generate_csr(
+    switch,
+    username,
+    password,
+    certificate_name,
+    csr_settings,
+):
+    certificate_name = validate_cli_identifier(
+        certificate_name,
+        "certificate name",
+    )
+    csr_settings = validate_csr_settings(csr_settings)
+    device = get_device_parameters(switch, username, password)
+    csr_creation_attempted = False
+
+    try:
+        with ConnectHandler(**device) as connection:
+            summary_output = connection.send_command(
+                "show crypto pki local-certificate summary"
+            )
+            certificates = parse_web_certificates(summary_output)
+            active_certificate = get_active_web_certificate(certificates)
+
+            if certificate_name.casefold() == active_certificate["name"].casefold():
+                raise ValueError(
+                    "New certificate name must differ from the active Web "
+                    "certificate name"
+                )
+
+            if certificate_name_exists(summary_output, certificate_name):
+                raise ValueError(
+                    f"Certificate name already exists on the switch: {certificate_name}"
+                )
+
+            csr_command = build_csr_command(
+                switch,
+                certificate_name,
+                active_certificate["profile"],
+                csr_settings,
+            )
+
+            print(f"Current active Web certificate: {active_certificate['name']}")
+            print(f"Discovered TA profile: {active_certificate['profile']}")
+            print(f"Requested new certificate name: {certificate_name}")
+            print("Generating CSR...")
+
+            connection.config_mode()
+
+            try:
+                csr_creation_attempted = True
+                connection.send_command_timing(
+                    csr_command,
+                    read_timeout=120,
+                )
+            finally:
+                connection.exit_config_mode()
+
+            csr_output = connection.send_command(
+                f"show crypto pki local-certificate {certificate_name}",
+                read_timeout=30,
+            )
+
+    except NetmikoAuthenticationException as error:
+        raise ValueError("SSH authentication failed") from error
+
+    except NetmikoTimeoutException as error:
+        if csr_creation_attempted:
+            raise CSRGenerationError(
+                "SSH operation timed out after CSR creation was attempted; "
+                "a pending CSR may remain on the switch"
+            ) from error
+
+        raise ValueError("SSH connection timed out") from error
+
+    try:
+        csr_pem = extract_csr_pem(csr_output)
+        validate_csr_pem(csr_pem, switch, csr_settings)
+
+    except ValueError as error:
+        raise CSRGenerationError(
+            f"CSR retrieval or validation failed: {error}. "
+            "The pending CSR was not removed"
+        ) from error
+
+    return csr_pem
+
+
+def check_switch(switch, username, password, warning_days):
+    device = get_device_parameters(switch, username, password)
 
     print()
     print(switch["name"])
@@ -429,21 +629,14 @@ def check_switch(switch, username, password, warning_days):
 
     print(f"AOS-S version:    {parse_aos_version(version_output)}")
 
-    certificates = parse_web_certificates(cert_output)
+    try:
+        certificate = get_active_web_certificate(parse_web_certificates(cert_output))
 
-    if not certificates:
+    except ValueError as error:
         print("Status:           ERROR")
-        print("Reason:           Could not find a Web certificate")
+        print(f"Reason:           {error}")
         return "error"
 
-    if len(certificates) != 1:
-        print("Status:           ERROR")
-        print(
-            f"Reason:           Found {len(certificates)} Web certificates; expected 1"
-        )
-        return "error"
-
-    certificate = certificates[0]
     days_remaining = (certificate["expiration"] - date.today()).days
 
     print(f"Certificate:      {certificate['name']}")
@@ -489,15 +682,56 @@ def main():
     configure_logging(args.debug)
 
     try:
+        validate_cli_args(args)
         config = load_config(args.config)
         warning_days, switches = validate_config(config)
         switches = select_switches(switches, args.switch_name)
+
+        if args.generate_csr:
+            csr_settings = get_csr_settings(config)
+            validate_fqdn(switches[0]["fqdn"])
 
     except ValueError as error:
         print(f"Error: {error}", file=sys.stderr)
         return EXIT_ERROR
 
     username, password = get_credentials()
+
+    if args.generate_csr:
+        switch = switches[0]
+
+        try:
+            csr_pem = generate_csr(
+                switch,
+                username,
+                password,
+                args.certificate_name,
+                csr_settings,
+            )
+
+            print(f"CSR generated and validated for {switch['name']}.")
+
+            if args.csr_output:
+                try:
+                    with args.csr_output.open("x", encoding="ascii") as output_file:
+                        output_file.write(csr_pem)
+
+                except OSError as error:
+                    raise CSRGenerationError(
+                        f"CSR was generated and validated but could not be written "
+                        f"to {args.csr_output}: {error}. The pending CSR remains on "
+                        "the switch and can be retrieved again"
+                    ) from error
+
+                print(f"CSR written to {args.csr_output}")
+            else:
+                print(csr_pem, end="")
+
+            return EXIT_OK
+
+        except ValueError as error:
+            print(f"Error: {error}", file=sys.stderr)
+            return EXIT_ERROR
 
     results = [
         check_switch(switch, username, password, warning_days) for switch in switches
