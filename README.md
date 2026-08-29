@@ -23,11 +23,13 @@ Implemented:
 - Strict validation and safe output of the issued public certificate
 - Install-only activation of an already-issued certificate on a pending Aruba CSR
 - Mandatory post-install HTTPS chain, hostname, and exact-certificate verification
+- Explicit one-command renewal with collision-safe automatic certificate naming
 
 The `--sign-csr` stage does **not** install or activate the resulting certificate
-on the switch. Generation, retrieval/signing, and installation remain explicit,
-independently invoked stages. Automatic orchestration, configuration saving,
-container deployment, and unattended renewal remain planned work.
+on the switch. Generation, retrieval/signing, and installation remain available
+as explicit, independently invoked stages for debugging and recovery. Automatic
+threshold-based renewal, configuration saving, container deployment, and
+unattended renewal remain planned work.
 
 ## Architecture
 
@@ -114,10 +116,10 @@ resolves it through `ca_list` and requires exactly one match. For signing,
 `switches.fqdn` are explicitly requested as IP and DNS SANs.
 
 `verification.ca_file` is the public PEM certificate for the CA that issued the
-switch HTTPS certificate. It is required by `--install-certificate` and is
-loaded by Python's normal SSL trust machinery. Relative paths are resolved
-relative to `config.toml`, not the process working directory. Do not put a CA
-private key or real infrastructure certificate in the repository.
+switch HTTPS certificate. It is required by `--install-certificate` and
+`--renew`, and is loaded by Python's normal SSL trust machinery. Relative paths
+are resolved relative to `config.toml`, not the process working directory. Do
+not put a CA private key or real infrastructure certificate in the repository.
 
 `config.toml` is excluded from Git and should contain the real inventory. It
 must never contain OPNsense API credentials.
@@ -177,6 +179,34 @@ python src/aruba_cert_renewer.py
 Use `--switch NAME` for one switch, `--config FILE` for another configuration
 file, and `--debug` for detailed Netmiko connection logging.
 
+### Renew a Certificate Now
+
+Run the complete, explicitly requested renewal for one switch:
+
+```bash
+python src/aruba_cert_renewer.py \
+  --switch EXAMPLE-SWITCH \
+  --renew
+```
+
+`--renew` renews immediately. It does not consult `settings.warning_days` to
+decide whether renewal is due. Before changing anything, it performs a read-only
+preflight that requires exactly one installed Web certificate and no pending Web
+CSR. It selects the first unused certificate name for the current UTC date in
+the form `webcert-YYYYMMDD-NN`, checking all certificate usages for collisions
+and never deleting or overwriting an existing name.
+
+The command then composes the same independently validated generation, signing,
+installation, Aruba post-install verification, and mandatory live HTTPS
+verification stages described below. It does not persist the intermediate CSR
+or certificate to disk. The staged commands remain available for diagnosis and
+recovery.
+
+If a pending Web CSR already exists, `--renew` fails closed before generating
+anything. It does not guess whether to resume, replace, or clear that CSR. Use
+the staged commands to inspect and recover the pending state. Automatic
+threshold-based unattended renewal remains future work.
+
 ### Generate a CSR
 
 CSR generation is an explicit switch modification. It requires one named switch
@@ -223,10 +253,10 @@ Set the OPNsense environment credentials, then run:
 
 ```bash
 python src/aruba_cert_renewer.py \
-  --switch HOUSE-SWITCH \
+  --switch EXAMPLE-SWITCH \
   --sign-csr \
   --certificate-name webcert2027 \
-  --certificate-output house-switch-2027.crt.pem
+  --certificate-output switch-2027.crt.pem
 ```
 
 This operation:
@@ -280,7 +310,8 @@ regenerate, reboot, or otherwise roll back certificate state.
 
 ### Staged Renewal Workflow
 
-The current workflow is intentionally explicit:
+For debugging, recovery, or separately managed artifacts, the staged workflow
+remains available:
 
 1. Generate a pending CSR with `--generate-csr`.
 2. Retrieve it with `--retrieve-csr`, or retrieve and sign it with `--sign-csr`.

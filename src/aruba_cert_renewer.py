@@ -55,8 +55,7 @@ CERTIFICATE_REPLACEMENT_PROMPT = (
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Monitor and perform staged HTTPS certificate renewal on "
-            "ArubaOS-Switch devices."
+            "Monitor and explicitly renew HTTPS certificates on ArubaOS-Switch devices."
         )
     )
 
@@ -108,6 +107,15 @@ def parse_args():
     )
 
     parser.add_argument(
+        "--renew",
+        action="store_true",
+        help=(
+            "Renew one explicitly selected switch now using automatic "
+            "certificate naming"
+        ),
+    )
+
+    parser.add_argument(
         "--certificate-name",
         metavar="NAME",
         help="Certificate name to generate, retrieve, sign, or install",
@@ -138,21 +146,23 @@ def parse_args():
 
 
 def validate_cli_args(args):
+    renew = getattr(args, "renew", False)
     install_certificate = getattr(args, "install_certificate", False)
     certificate_input = getattr(args, "certificate_input", None)
-    operations = [
+    staged_operations = [
         args.generate_csr,
         args.retrieve_csr,
         args.sign_csr,
         install_certificate,
     ]
+    operations = [*staged_operations, renew]
     if sum(operations) > 1:
         raise ValueError(
-            "--generate-csr, --retrieve-csr, --sign-csr, and "
-            "--install-certificate are mutually exclusive"
+            "--generate-csr, --retrieve-csr, --sign-csr, "
+            "--install-certificate, and --renew are mutually exclusive"
         )
 
-    certificate_operation = any(operations)
+    staged_operation = any(staged_operations)
     if args.generate_csr:
         operation_name = "--generate-csr"
     elif args.retrieve_csr:
@@ -162,22 +172,34 @@ def validate_cli_args(args):
     else:
         operation_name = "--install-certificate"
 
-    if certificate_operation and not args.switch_name:
+    if renew and not args.switch_name:
+        raise ValueError("--renew requires --switch")
+
+    if staged_operation and not args.switch_name:
         raise ValueError(f"{operation_name} requires --switch")
 
-    if certificate_operation and not args.certificate_name:
+    if staged_operation and not args.certificate_name:
         raise ValueError(f"{operation_name} requires --certificate-name")
 
-    if not certificate_operation and args.certificate_name:
+    if renew and args.certificate_name:
+        raise ValueError("--renew does not accept --certificate-name")
+
+    if not staged_operation and not renew and args.certificate_name:
         raise ValueError(
             "--certificate-name requires --generate-csr, --retrieve-csr, "
             "--sign-csr, or --install-certificate"
         )
 
-    if (not certificate_operation or args.sign_csr or install_certificate) and (
-        args.csr_output
-    ):
+    if renew and args.csr_output:
+        raise ValueError("--renew does not accept --csr-output")
+
+    if (
+        not staged_operation or args.sign_csr or install_certificate
+    ) and args.csr_output:
         raise ValueError("--csr-output requires --generate-csr or --retrieve-csr")
+
+    if renew and args.certificate_output:
+        raise ValueError("--renew does not accept --certificate-output")
 
     if not args.sign_csr and args.certificate_output:
         raise ValueError("--certificate-output requires --sign-csr")
@@ -188,7 +210,10 @@ def validate_cli_args(args):
     if install_certificate and not certificate_input:
         raise ValueError("--install-certificate requires --certificate-input")
 
-    if not install_certificate and certificate_input:
+    if renew and certificate_input:
+        raise ValueError("--renew does not accept --certificate-input")
+
+    if not install_certificate and not renew and certificate_input:
         raise ValueError("--certificate-input requires --install-certificate")
 
     if args.certificate_name:
@@ -388,6 +413,32 @@ def certificate_name_exists(summary_output, certificate_name):
     )
 
 
+def choose_renewal_certificate_name(summary_output, *, now=None):
+    """Choose the first unused UTC-dated renewal certificate name."""
+    if now is None:
+        now = datetime.now(UTC)
+
+    if isinstance(now, datetime):
+        if now.tzinfo is None:
+            raise ValueError("Renewal naming time must be timezone-aware")
+        renewal_date = now.astimezone(UTC).date()
+    elif isinstance(now, date):
+        renewal_date = now
+    else:
+        raise ValueError("Renewal naming time must be a date or datetime")
+
+    prefix = f"webcert-{renewal_date:%Y%m%d}-"
+    for sequence in range(1, 100):
+        candidate = f"{prefix}{sequence:02d}"
+        if not certificate_name_exists(summary_output, candidate):
+            return validate_cli_identifier(candidate, "certificate name")
+
+    raise ValueError(
+        f"All 99 renewal certificate names for {renewal_date:%Y-%m-%d} "
+        "already exist on the switch"
+    )
+
+
 def get_certificate_summary_entry(summary_output, certificate_name):
     certificate_name = validate_cli_identifier(
         certificate_name,
@@ -482,7 +533,7 @@ def get_verification_ca_file(config, config_file):
     if not isinstance(settings, dict):
         raise ValueError(
             "A [verification] configuration section is required for "
-            "--install-certificate"
+            "--install-certificate or --renew"
         )
 
     configured_path = settings.get("ca_file")
@@ -1041,6 +1092,162 @@ class CertificateInstallationAttemptError(ValueError):
     """An error after certificate installation was attempted on the switch."""
 
 
+class RenewalPreflightError(ValueError):
+    """A read-only renewal preflight failure."""
+
+
+class CSRGenerationPreAttemptError(ValueError):
+    """A renewal failure before CSR creation was attempted."""
+
+
+class CSRSigningError(ValueError):
+    """A renewal signing failure that leaves a pending CSR on the switch."""
+
+
+class CertificatePreInstallationError(ValueError):
+    """A renewal failure before certificate installation was attempted."""
+
+
+class LiveHTTPSVerificationError(ValueError):
+    """A renewal HTTPS failure after certificate installation completed."""
+
+
+def renewal_preflight(switch, username, password, *, now=None):
+    """Read switch certificate state and select a safe renewal name."""
+    device = get_device_parameters(switch, username, password)
+
+    try:
+        with ConnectHandler(**device) as connection:
+            summary_output = connection.send_command(
+                "show crypto pki local-certificate summary"
+            )
+
+        certificates = parse_web_certificates(summary_output)
+        pending = [
+            certificate for certificate in certificates if certificate["pending"]
+        ]
+        if pending:
+            names = ", ".join(certificate["name"] for certificate in pending)
+            raise RenewalPreflightError(
+                f"A pending Web CSR already exists ({names}). Use the explicit "
+                "staged commands to inspect or recover it; --renew will not "
+                "resume, replace, or clear it"
+            )
+
+        active_certificate = get_active_web_certificate(certificates)
+        certificate_name = choose_renewal_certificate_name(
+            summary_output,
+            now=now,
+        )
+        return {
+            "active_certificate_name": active_certificate["name"],
+            "ta_profile": active_certificate["profile"],
+            "new_certificate_name": certificate_name,
+        }
+
+    except RenewalPreflightError:
+        raise
+    except NetmikoAuthenticationException as error:
+        raise RenewalPreflightError("SSH authentication failed") from error
+    except NetmikoTimeoutException as error:
+        raise RenewalPreflightError("SSH connection timed out") from error
+    except (ValueError, OSError) as error:
+        raise RenewalPreflightError(str(error)) from error
+
+
+def renew_certificate(
+    switch,
+    username,
+    password,
+    csr_settings,
+    opnsense_settings,
+    verification_ca_file,
+    *,
+    now=None,
+):
+    """Compose the proven staged functions into one explicit renewal."""
+    preflight = renewal_preflight(
+        switch,
+        username,
+        password,
+        now=now,
+    )
+    certificate_name = preflight["new_certificate_name"]
+
+    print(f"Current active Web certificate: {preflight['active_certificate_name']}")
+    print(f"Selected renewal certificate name: {certificate_name}")
+
+    try:
+        generate_csr(
+            switch,
+            username,
+            password,
+            certificate_name,
+            csr_settings,
+        )
+    except CSRGenerationError:
+        raise
+    except (ValueError, OSError) as error:
+        raise CSRGenerationPreAttemptError(str(error)) from error
+
+    print("CSR generated and validated.")
+    print("Signing CSR with OPNsense...")
+
+    try:
+        certificate_pem = sign_pending_csr(
+            switch,
+            username,
+            password,
+            certificate_name,
+            csr_settings,
+            opnsense_settings,
+        )
+    except (ValueError, OSError) as error:
+        raise CSRSigningError(
+            f"{error}. The pending CSR remains on the switch; use the explicit "
+            "staged commands for diagnosis or recovery"
+        ) from error
+
+    print("Issued certificate validated.")
+    print("Installing signed certificate...")
+
+    try:
+        certificate = install_pending_certificate(
+            switch,
+            username,
+            password,
+            certificate_name,
+            certificate_pem,
+            csr_settings,
+            opnsense_settings["lifetime_days"],
+        )
+    except CertificateInstallationAttemptError:
+        raise
+    except (ValueError, OSError) as error:
+        raise CertificatePreInstallationError(
+            f"{error}. The pending CSR remains on the switch; use the explicit "
+            "staged commands for diagnosis or recovery"
+        ) from error
+
+    print("Certificate installed and Aruba state verified.")
+    print("Verifying live HTTPS...")
+
+    try:
+        verify_live_https_certificate(
+            switch,
+            verification_ca_file,
+            certificate,
+        )
+    except (ValueError, OSError, ssl.SSLError) as error:
+        raise LiveHTTPSVerificationError(str(error)) from error
+
+    print("Live HTTPS certificate chain and hostname verified.")
+    print("Live HTTPS certificate matches the installed certificate.")
+    print("Renewal completed successfully.")
+    print(f"Active Web certificate: {certificate_name}")
+    return certificate_name
+
+
 def retrieve_and_validate_csr(connection, switch, certificate_name, csr_settings):
     csr_output = connection.send_command(
         f"show crypto pki local-certificate {certificate_name}",
@@ -1122,7 +1329,16 @@ def generate_csr(
                     "The pending CSR was not removed"
                 ) from error
 
+    except CSRGenerationError:
+        raise
+
     except NetmikoAuthenticationException as error:
+        if csr_creation_attempted:
+            raise CSRGenerationError(
+                "SSH authentication failed after CSR creation was attempted; "
+                "a pending CSR may remain on the switch"
+            ) from error
+
         raise ValueError("SSH authentication failed") from error
 
     except NetmikoTimeoutException as error:
@@ -1133,6 +1349,15 @@ def generate_csr(
             ) from error
 
         raise ValueError("SSH connection timed out") from error
+
+    except Exception as error:
+        if csr_creation_attempted:
+            raise CSRGenerationError(
+                "CSR creation was attempted, but the operation failed; "
+                "a pending CSR may remain on the switch"
+            ) from error
+
+        raise
 
 
 def retrieve_csr(
@@ -1595,16 +1820,19 @@ def main():
             or args.retrieve_csr
             or args.sign_csr
             or args.install_certificate
+            or args.renew
         ):
             csr_settings = get_csr_settings(config)
             validate_fqdn(switches[0]["fqdn"])
 
-        if args.sign_csr or args.install_certificate:
+        if args.sign_csr or args.install_certificate or args.renew:
             opnsense_settings = get_opnsense_settings(config)
             validate_switch_signing_identity(switches[0])
 
-        if args.install_certificate:
+        if args.install_certificate or args.renew:
             verification_ca_file = get_verification_ca_file(config, args.config)
+
+        if args.install_certificate:
             certificate_pem = read_certificate_input(args.certificate_input)
 
     except ValueError as error:
@@ -1612,6 +1840,80 @@ def main():
         return EXIT_ERROR
 
     username, password = get_credentials()
+
+    if args.renew:
+        switch = switches[0]
+
+        try:
+            renew_certificate(
+                switch,
+                username,
+                password,
+                csr_settings,
+                opnsense_settings,
+                verification_ca_file,
+            )
+            return EXIT_OK
+
+        except RenewalPreflightError as error:
+            print(
+                "Error: Renewal preflight failed; no renewal change was "
+                f"attempted: {error}",
+                file=sys.stderr,
+            )
+            return EXIT_ERROR
+
+        except CSRGenerationPreAttemptError as error:
+            print(
+                "Error: CSR generation failed before CSR creation was attempted; "
+                f"no pending CSR was created: {error}",
+                file=sys.stderr,
+            )
+            return EXIT_ERROR
+
+        except CSRGenerationError as error:
+            print(f"Error: {error}", file=sys.stderr)
+            print(
+                "CSR creation was attempted. No automatic cleanup was attempted; "
+                "use the explicit staged commands for diagnosis or recovery.",
+                file=sys.stderr,
+            )
+            return EXIT_ERROR
+
+        except CSRSigningError as error:
+            print(f"Error: CSR signing failed: {error}", file=sys.stderr)
+            print(
+                "No certificate installation or automatic OPNsense cleanup was "
+                "attempted.",
+                file=sys.stderr,
+            )
+            return EXIT_ERROR
+
+        except CertificatePreInstallationError as error:
+            print(
+                f"Error: Certificate installation did not begin: {error}",
+                file=sys.stderr,
+            )
+            print("No automatic rollback was attempted.", file=sys.stderr)
+            return EXIT_ERROR
+
+        except CertificateInstallationAttemptError as error:
+            print(f"Error: Post-install failure: {error}", file=sys.stderr)
+            print(
+                "No automatic rollback was attempted; inspect the switch manually.",
+                file=sys.stderr,
+            )
+            return EXIT_ERROR
+
+        except LiveHTTPSVerificationError as error:
+            print(
+                "Error: Post-install HTTPS verification failed. The certificate "
+                "may already be active and requires manual investigation: "
+                f"{error}",
+                file=sys.stderr,
+            )
+            print("No automatic rollback was attempted.", file=sys.stderr)
+            return EXIT_ERROR
 
     if args.install_certificate:
         switch = switches[0]

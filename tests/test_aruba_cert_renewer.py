@@ -733,10 +733,14 @@ class FakeCSRConnection:
         csr_pem,
         summary_output=("webcert2026 Web 2027/09/27 webprofile2026\n"),
         generation_error=None,
+        config_mode_error=None,
+        exit_config_mode_error=None,
     ):
         self.csr_pem = csr_pem
         self.summary_output = summary_output
         self.generation_error = generation_error
+        self.config_mode_error = config_mode_error
+        self.exit_config_mode_error = exit_config_mode_error
         self.commands = []
         self.entered_config_mode = False
         self.exited_config_mode = False
@@ -760,6 +764,8 @@ class FakeCSRConnection:
 
     def config_mode(self):
         self.entered_config_mode = True
+        if self.config_mode_error:
+            raise self.config_mode_error
 
     def send_command_timing(self, command, **kwargs):
         self.commands.append(command)
@@ -772,6 +778,8 @@ class FakeCSRConnection:
 
     def exit_config_mode(self):
         self.exited_config_mode = True
+        if self.exit_config_mode_error:
+            raise self.exit_config_mode_error
 
 
 def test_get_csr_settings():
@@ -1020,14 +1028,16 @@ def test_generate_csr_rejects_pending_csr_before_config_mode(monkeypatch):
     assert not connection.entered_config_mode
 
 
-def test_generate_csr_exits_config_mode_when_generation_raises(monkeypatch):
+def test_generate_csr_classifies_runtime_error_after_attempt_and_exits_config_mode(
+    monkeypatch,
+):
     connection = FakeCSRConnection(
         make_test_csr(),
         generation_error=RuntimeError("generation failed"),
     )
     monkeypatch.setattr(checker, "ConnectHandler", lambda **kwargs: connection)
 
-    with pytest.raises(RuntimeError, match="generation failed"):
+    with pytest.raises(checker.CSRGenerationError, match="pending CSR may remain"):
         checker.generate_csr(
             make_config()["switches"][0],
             "username",
@@ -1037,6 +1047,78 @@ def test_generate_csr_exits_config_mode_when_generation_raises(monkeypatch):
         )
 
     assert connection.exited_config_mode
+
+
+def test_generate_csr_classifies_oserror_from_send_after_attempt(monkeypatch):
+    connection = FakeCSRConnection(
+        make_test_csr(),
+        generation_error=OSError("channel failed"),
+    )
+    monkeypatch.setattr(checker, "ConnectHandler", lambda **kwargs: connection)
+
+    with pytest.raises(checker.CSRGenerationError, match="pending CSR may remain"):
+        checker.generate_csr(
+            make_config()["switches"][0],
+            "username",
+            "password",
+            "webcert2027",
+            make_csr_settings(),
+        )
+
+    assert connection.exited_config_mode
+
+
+@pytest.mark.parametrize(
+    "exit_error",
+    [OSError("channel failed"), RuntimeError("transport failed")],
+    ids=["oserror", "runtimeerror"],
+)
+def test_generate_csr_classifies_config_exit_error_after_attempt(
+    monkeypatch, exit_error
+):
+    connection = FakeCSRConnection(
+        make_test_csr(),
+        exit_config_mode_error=exit_error,
+    )
+    monkeypatch.setattr(checker, "ConnectHandler", lambda **kwargs: connection)
+
+    with pytest.raises(checker.CSRGenerationError, match="pending CSR may remain"):
+        checker.generate_csr(
+            make_config()["switches"][0],
+            "username",
+            "password",
+            "webcert2027",
+            make_csr_settings(),
+        )
+
+    assert connection.commands[1].startswith("crypto pki create-csr")
+    assert connection.exited_config_mode
+
+
+@pytest.mark.parametrize(
+    "pre_attempt_error",
+    [OSError("config mode failed"), RuntimeError("config mode failed")],
+    ids=["oserror", "runtimeerror"],
+)
+def test_generate_csr_preserves_errors_before_attempt(monkeypatch, pre_attempt_error):
+    connection = FakeCSRConnection(
+        make_test_csr(),
+        config_mode_error=pre_attempt_error,
+    )
+    monkeypatch.setattr(checker, "ConnectHandler", lambda **kwargs: connection)
+
+    with pytest.raises(type(pre_attempt_error), match="config mode failed") as raised:
+        checker.generate_csr(
+            make_config()["switches"][0],
+            "username",
+            "password",
+            "webcert2027",
+            make_csr_settings(),
+        )
+
+    assert not isinstance(raised.value, checker.CSRGenerationError)
+    assert connection.commands == ["show crypto pki local-certificate summary"]
+    assert not connection.exited_config_mode
 
 
 def test_generate_csr_reports_post_creation_validation_failure(monkeypatch):
@@ -2691,3 +2773,549 @@ def test_verify_live_https_retries_transient_connection_failure(monkeypatch):
         Path("public-ca.pem"),
         certificate,
     )
+
+
+def make_renew_args(**overrides):
+    values = {
+        "generate_csr": False,
+        "retrieve_csr": False,
+        "sign_csr": False,
+        "install_certificate": False,
+        "renew": True,
+        "switch_name": "EXAMPLE-SWITCH",
+        "certificate_name": None,
+        "csr_output": None,
+        "certificate_output": None,
+        "certificate_input": None,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def test_renew_requires_switch():
+    with pytest.raises(ValueError, match="--renew requires --switch"):
+        checker.validate_cli_args(make_renew_args(switch_name=None))
+
+
+@pytest.mark.parametrize(
+    "staged_operation",
+    ["generate_csr", "retrieve_csr", "sign_csr", "install_certificate"],
+)
+def test_renew_is_mutually_exclusive_with_staged_operations(staged_operation):
+    args = make_renew_args()
+    setattr(args, staged_operation, True)
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        checker.validate_cli_args(args)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "option"),
+    [
+        ("certificate_name", "manual-name", "--certificate-name"),
+        ("csr_output", Path("request.pem"), "--csr-output"),
+        ("certificate_output", Path("certificate.pem"), "--certificate-output"),
+        ("certificate_input", Path("certificate.pem"), "--certificate-input"),
+    ],
+)
+def test_renew_rejects_staged_file_and_name_options(field, value, option):
+    with pytest.raises(ValueError, match=f"does not accept {option}"):
+        checker.validate_cli_args(make_renew_args(**{field: value}))
+
+
+def test_choose_renewal_name_starts_at_01_and_is_a_valid_identifier():
+    result = checker.choose_renewal_certificate_name(
+        "webcert-20260828-01 Web 2027/09/27 profile\n",
+        now=datetime(2026, 8, 29, 12, tzinfo=UTC),
+    )
+
+    assert result == "webcert-20260829-01"
+    assert checker.validate_cli_identifier(result, "certificate name") == result
+
+
+def test_choose_renewal_name_skips_case_insensitive_non_web_collision():
+    result = checker.choose_renewal_certificate_name(
+        "WEBCERT-20260829-01 Client 2027/09/27 clientprofile\n",
+        now=date(2026, 8, 29),
+    )
+
+    assert result == "webcert-20260829-02"
+
+
+def test_choose_renewal_name_can_select_sequence_99():
+    summary = "".join(
+        f"webcert-20260829-{sequence:02d} Client 2027/09/27 profile\n"
+        for sequence in range(1, 99)
+    )
+
+    assert (
+        checker.choose_renewal_certificate_name(
+            summary,
+            now=date(2026, 8, 29),
+        )
+        == "webcert-20260829-99"
+    )
+
+
+def test_choose_renewal_name_fails_when_all_99_names_exist():
+    summary = "".join(
+        f"webcert-20260829-{sequence:02d} Any 2027/09/27 profile\n"
+        for sequence in range(1, 100)
+    )
+
+    with pytest.raises(ValueError, match="All 99 renewal certificate names"):
+        checker.choose_renewal_certificate_name(
+            summary,
+            now=date(2026, 8, 29),
+        )
+
+
+def test_choose_renewal_name_uses_utc_for_datetime_dependency():
+    result = checker.choose_renewal_certificate_name(
+        "",
+        now=datetime.fromisoformat("2026-08-30T00:30:00+01:00"),
+    )
+
+    assert result == "webcert-20260829-01"
+
+
+def test_renewal_preflight_is_read_only_and_records_state(monkeypatch):
+    summary = "".join(
+        [
+            "webcert2026 Web 2027/09/27 webprofile2026\n",
+            "webcert-20260829-01 Client 2027/09/27 clientprofile\n",
+        ]
+    )
+    connection = FakeCSRConnection(make_test_csr(), summary_output=summary)
+    monkeypatch.setattr(checker, "ConnectHandler", lambda **kwargs: connection)
+
+    result = checker.renewal_preflight(
+        make_config()["switches"][0],
+        "username",
+        "password",
+        now=date(2026, 8, 29),
+    )
+
+    assert result == {
+        "active_certificate_name": "webcert2026",
+        "ta_profile": "webprofile2026",
+        "new_certificate_name": "webcert-20260829-02",
+    }
+    assert connection.commands == ["show crypto pki local-certificate summary"]
+    assert not connection.entered_config_mode
+    assert connection.timing_kwargs is None
+
+
+def test_renewal_preflight_rejects_pending_web_csr(monkeypatch):
+    summary = "".join(
+        [
+            "webcert2026 Web 2027/09/27 webprofile2026\n",
+            "webcert2027 Web CSR webprofile2026\n",
+        ]
+    )
+    connection = FakeCSRConnection(make_test_csr(), summary_output=summary)
+    monkeypatch.setattr(checker, "ConnectHandler", lambda **kwargs: connection)
+
+    with pytest.raises(checker.RenewalPreflightError, match="staged commands"):
+        checker.renewal_preflight(
+            make_config()["switches"][0],
+            "username",
+            "password",
+            now=date(2026, 8, 29),
+        )
+
+    assert connection.commands == ["show crypto pki local-certificate summary"]
+    assert not connection.entered_config_mode
+
+
+def test_renewal_preflight_rejects_multiple_installed_web_certificates(monkeypatch):
+    summary = "".join(
+        [
+            "webcert2026 Web 2027/09/27 webprofile2026\n",
+            "webcert2027 Web 2028/09/27 webprofile2026\n",
+        ]
+    )
+    connection = FakeCSRConnection(make_test_csr(), summary_output=summary)
+    monkeypatch.setattr(checker, "ConnectHandler", lambda **kwargs: connection)
+
+    with pytest.raises(checker.RenewalPreflightError, match="2 installed"):
+        checker.renewal_preflight(
+            make_config()["switches"][0],
+            "username",
+            "password",
+            now=date(2026, 8, 29),
+        )
+
+    assert not connection.entered_config_mode
+
+
+def test_renew_certificate_composes_stages_in_order_without_files(monkeypatch):
+    calls = []
+    switch = make_config()["switches"][0]
+    csr_settings = make_csr_settings()
+    opnsense_settings = make_opnsense_settings()
+    certificate_pem = "issued certificate PEM"
+    certificate = object()
+    ca_file = Path("public-ca.pem")
+
+    monkeypatch.setattr(
+        checker,
+        "renewal_preflight",
+        lambda *args, **kwargs: (
+            calls.append(("preflight", args, kwargs))
+            or {
+                "active_certificate_name": "webcert2026",
+                "ta_profile": "webprofile2026",
+                "new_certificate_name": "webcert-20260829-01",
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        checker,
+        "generate_csr",
+        lambda *args: calls.append(("generate", args)) or "unpersisted CSR",
+    )
+    monkeypatch.setattr(
+        checker,
+        "sign_pending_csr",
+        lambda *args: calls.append(("sign", args)) or certificate_pem,
+    )
+    monkeypatch.setattr(
+        checker,
+        "install_pending_certificate",
+        lambda *args: calls.append(("install", args)) or certificate,
+    )
+    monkeypatch.setattr(
+        checker,
+        "verify_live_https_certificate",
+        lambda *args: calls.append(("https", args)),
+    )
+    monkeypatch.setattr(
+        checker,
+        "write_or_print_csr",
+        lambda *args: pytest.fail("CSR must not be written"),
+    )
+    monkeypatch.setattr(
+        checker,
+        "write_certificate",
+        lambda *args: pytest.fail("certificate must not be written"),
+    )
+
+    result = checker.renew_certificate(
+        switch,
+        "username",
+        "password",
+        csr_settings,
+        opnsense_settings,
+        ca_file,
+        now=date(2026, 8, 29),
+    )
+
+    assert result == "webcert-20260829-01"
+    assert [call[0] for call in calls] == [
+        "preflight",
+        "generate",
+        "sign",
+        "install",
+        "https",
+    ]
+    assert calls[0][1] == (switch, "username", "password")
+    assert calls[0][2] == {"now": date(2026, 8, 29)}
+    for call in calls[1:4]:
+        assert call[1][0:4] == (
+            switch,
+            "username",
+            "password",
+            "webcert-20260829-01",
+        )
+    assert calls[3][1][4] == certificate_pem
+    assert calls[4][1] == (switch, ca_file, certificate)
+
+
+@pytest.mark.parametrize(
+    ("failing_stage", "exception_type", "expected_calls"),
+    [
+        ("generate", checker.CSRGenerationError, ["preflight", "generate"]),
+        ("sign", checker.CSRSigningError, ["preflight", "generate", "sign"]),
+        (
+            "install",
+            checker.CertificateInstallationAttemptError,
+            ["preflight", "generate", "sign", "install"],
+        ),
+        (
+            "https",
+            checker.LiveHTTPSVerificationError,
+            ["preflight", "generate", "sign", "install", "https"],
+        ),
+    ],
+)
+def test_renew_certificate_stops_after_failed_stage(
+    monkeypatch, failing_stage, exception_type, expected_calls
+):
+    calls = []
+
+    def stage(name, result=None):
+        def invoke(*args, **kwargs):
+            calls.append(name)
+            if name == failing_stage:
+                if name == "generate":
+                    raise checker.CSRGenerationError("generation failed")
+                if name == "install":
+                    raise checker.CertificateInstallationAttemptError(
+                        "installation failed"
+                    )
+                raise ValueError(f"{name} failed")
+            return result
+
+        return invoke
+
+    monkeypatch.setattr(
+        checker,
+        "renewal_preflight",
+        stage(
+            "preflight",
+            {
+                "active_certificate_name": "webcert2026",
+                "ta_profile": "webprofile2026",
+                "new_certificate_name": "webcert-20260829-01",
+            },
+        ),
+    )
+    monkeypatch.setattr(checker, "generate_csr", stage("generate", "CSR"))
+    monkeypatch.setattr(checker, "sign_pending_csr", stage("sign", "certificate"))
+    monkeypatch.setattr(
+        checker, "install_pending_certificate", stage("install", object())
+    )
+    monkeypatch.setattr(checker, "verify_live_https_certificate", stage("https"))
+
+    with pytest.raises(exception_type):
+        checker.renew_certificate(
+            make_config()["switches"][0],
+            "username",
+            "password",
+            make_csr_settings(),
+            make_opnsense_settings(),
+            Path("public-ca.pem"),
+        )
+
+    assert calls == expected_calls
+
+
+def test_renew_certificate_preflight_failure_attempts_no_stage(monkeypatch):
+    monkeypatch.setattr(
+        checker,
+        "renewal_preflight",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            checker.RenewalPreflightError("pending CSR exists")
+        ),
+    )
+    for stage_name in (
+        "generate_csr",
+        "sign_pending_csr",
+        "install_pending_certificate",
+        "verify_live_https_certificate",
+    ):
+        monkeypatch.setattr(
+            checker,
+            stage_name,
+            lambda *args, _stage_name=stage_name: pytest.fail(
+                f"{_stage_name} must not run after a preflight failure"
+            ),
+        )
+
+    with pytest.raises(checker.RenewalPreflightError):
+        checker.renew_certificate(
+            make_config()["switches"][0],
+            "username",
+            "password",
+            make_csr_settings(),
+            make_opnsense_settings(),
+            Path("public-ca.pem"),
+        )
+
+
+def test_renew_signing_failure_reports_that_pending_csr_remains(monkeypatch):
+    monkeypatch.setattr(
+        checker,
+        "renewal_preflight",
+        lambda *args, **kwargs: {
+            "active_certificate_name": "webcert2026",
+            "ta_profile": "webprofile2026",
+            "new_certificate_name": "webcert-20260829-01",
+        },
+    )
+    monkeypatch.setattr(checker, "generate_csr", lambda *args: "CSR")
+    monkeypatch.setattr(
+        checker,
+        "sign_pending_csr",
+        lambda *args: (_ for _ in ()).throw(ValueError("OPNsense unavailable")),
+    )
+    monkeypatch.setattr(
+        checker,
+        "install_pending_certificate",
+        lambda *args: pytest.fail("installation must not be attempted"),
+    )
+
+    with pytest.raises(checker.CSRSigningError, match="pending CSR remains"):
+        checker.renew_certificate(
+            make_config()["switches"][0],
+            "username",
+            "password",
+            make_csr_settings(),
+            make_opnsense_settings(),
+            Path("public-ca.pem"),
+        )
+
+
+def renewal_config_text():
+    return signing_config_text() + '\n\n[verification]\nca_file = "public-ca.pem"\n'
+
+
+def test_renew_invalid_config_fails_before_credentials(monkeypatch, tmp_path):
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(
+        renewal_config_text().replace('digest = "sha256"', 'digest = "sha1"'),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        checker.sys,
+        "argv",
+        [
+            "aruba_cert_renewer.py",
+            "--config",
+            str(config_file),
+            "--switch",
+            "EXAMPLE-SWITCH",
+            "--renew",
+        ],
+    )
+    monkeypatch.setattr(
+        checker,
+        "get_credentials",
+        lambda: pytest.fail("Credentials should not be requested"),
+    )
+
+    assert checker.main() == checker.EXIT_ERROR
+
+
+def test_renew_verification_ca_is_validated_before_credentials(monkeypatch, tmp_path):
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(renewal_config_text(), encoding="utf-8")
+    calls = []
+    monkeypatch.setattr(
+        checker.sys,
+        "argv",
+        [
+            "aruba_cert_renewer.py",
+            "--config",
+            str(config_file),
+            "--switch",
+            "EXAMPLE-SWITCH",
+            "--renew",
+        ],
+    )
+    monkeypatch.setattr(
+        checker,
+        "get_verification_ca_file",
+        lambda *args: calls.append("verification") or Path("public-ca.pem"),
+    )
+    monkeypatch.setattr(
+        checker,
+        "get_credentials",
+        lambda: calls.append("credentials") or ("username", "password"),
+    )
+    monkeypatch.setattr(
+        checker,
+        "renew_certificate",
+        lambda *args: calls.append("renewal"),
+    )
+
+    assert checker.main() == checker.EXIT_OK
+    assert calls == ["verification", "credentials", "renewal"]
+
+
+def test_renew_https_failure_returns_error_with_post_install_warning(
+    monkeypatch, tmp_path, capsys
+):
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(renewal_config_text(), encoding="utf-8")
+    monkeypatch.setattr(
+        checker.sys,
+        "argv",
+        [
+            "aruba_cert_renewer.py",
+            "--config",
+            str(config_file),
+            "--switch",
+            "EXAMPLE-SWITCH",
+            "--renew",
+        ],
+    )
+    monkeypatch.setattr(
+        checker,
+        "get_verification_ca_file",
+        lambda *args: Path("public-ca.pem"),
+    )
+    monkeypatch.setattr(checker, "get_credentials", lambda: ("username", "password"))
+    monkeypatch.setattr(
+        checker,
+        "renew_certificate",
+        lambda *args: (_ for _ in ()).throw(
+            checker.LiveHTTPSVerificationError("verification timed out")
+        ),
+    )
+
+    assert checker.main() == checker.EXIT_ERROR
+    error_output = capsys.readouterr().err
+    assert "may already be active" in error_output
+    assert "No automatic rollback" in error_output
+
+
+def test_renew_post_attempt_generation_oserror_never_claims_no_pending_csr(
+    monkeypatch, tmp_path, capsys
+):
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(renewal_config_text(), encoding="utf-8")
+    connection = FakeCSRConnection(
+        make_test_csr(),
+        generation_error=OSError("channel failed"),
+    )
+    monkeypatch.setattr(
+        checker.sys,
+        "argv",
+        [
+            "aruba_cert_renewer.py",
+            "--config",
+            str(config_file),
+            "--switch",
+            "EXAMPLE-SWITCH",
+            "--renew",
+        ],
+    )
+    monkeypatch.setattr(
+        checker,
+        "get_verification_ca_file",
+        lambda *args: Path("public-ca.pem"),
+    )
+    monkeypatch.setattr(checker, "get_credentials", lambda: ("username", "password"))
+    monkeypatch.setattr(
+        checker,
+        "renewal_preflight",
+        lambda *args, **kwargs: {
+            "active_certificate_name": "webcert2026",
+            "ta_profile": "webprofile2026",
+            "new_certificate_name": "webcert-20260829-01",
+        },
+    )
+    monkeypatch.setattr(checker, "ConnectHandler", lambda **kwargs: connection)
+    monkeypatch.setattr(
+        checker,
+        "sign_pending_csr",
+        lambda *args: pytest.fail("signing must not be attempted"),
+    )
+
+    assert checker.main() == checker.EXIT_ERROR
+    error_output = capsys.readouterr().err
+    assert "CSR creation was attempted" in error_output
+    assert "pending CSR may remain" in error_output
+    assert "no pending CSR was created" not in error_output
