@@ -2091,6 +2091,9 @@ class FakeInstallConnection:
         self.details_output = details_output
         self.context_exit_error = context_exit_error
         self.commands = []
+        self.interactions = []
+        self.channel_writes = []
+        self.channel_output = ""
         self.summary_calls = 0
         self.entered_config_mode = False
         self.exited_config_mode = False
@@ -2124,11 +2127,46 @@ class FakeInstallConnection:
 
     def send_command_timing(self, command, **kwargs):
         self.commands.append(command)
+        self.interactions.append(("send_command_timing", command))
         if command == "crypto pki install-signed-certificate":
             return self.paste_prompt
         if command == "y":
             return "Certificate installed"
-        return self.replacement_prompt
+        raise AssertionError(f"Unexpected timing command: {command}")
+
+    def write_channel(self, data):
+        self.commands.append(data)
+        self.interactions.append(("write_channel", data))
+        self.channel_writes.append(data)
+
+        if len(self.channel_writes) == 1:
+            self.channel_output = ""
+        elif len(self.channel_writes) == 2 and data == "\n":
+            self.channel_output = self.replacement_prompt
+        else:
+            raise AssertionError(f"Unexpected channel write: {data!r}")
+
+    def read_channel_timing(self, **kwargs):
+        output = self.channel_output
+        self.interactions.append(("read_channel_timing", output))
+        self.channel_output = ""
+        return output
+
+
+def test_fake_aruba_requires_blank_line_after_normally_terminated_pem():
+    csr_pem, _, certificate_pem = make_test_identity_and_certificate()
+    connection = FakeInstallConnection(csr_pem)
+
+    assert certificate_pem.endswith("\n")
+    assert not certificate_pem.endswith("\n\n")
+
+    connection.write_channel(certificate_pem)
+
+    assert connection.read_channel_timing() == ""
+
+    connection.write_channel("\n")
+
+    assert connection.read_channel_timing() == checker.CERTIFICATE_REPLACEMENT_PROMPT
 
 
 def test_install_pending_certificate_accepts_real_detail_shape_and_uses_guarded_interaction(
@@ -2160,9 +2198,17 @@ def test_install_pending_certificate_accepts_real_detail_shape_and_uses_guarded_
         "show crypto pki local-certificate summary",
         "crypto pki install-signed-certificate",
         certificate_pem,
+        "\n",
         "y",
         "show crypto pki local-certificate summary",
         "show crypto pki local-certificate webcert2027",
+    ]
+    assert connection.channel_writes == [certificate_pem, "\n"]
+    assert connection.interactions[1:5] == [
+        ("write_channel", certificate_pem),
+        ("write_channel", "\n"),
+        ("read_channel_timing", checker.CERTIFICATE_REPLACEMENT_PROMPT),
+        ("send_command_timing", "y"),
     ]
     forbidden_patterns = (
         r"\bwrite\s+memory\b",
@@ -2223,12 +2269,14 @@ def test_bad_paste_prompt_never_sends_certificate(monkeypatch, paste_prompt):
 
     assert connection.exited_config_mode
     assert certificate_pem not in connection.commands
+    assert connection.channel_writes == []
     assert "y" not in connection.commands
 
 
 @pytest.mark.parametrize(
     "replacement_prompt",
     [
+        "",
         f"Error: rejected certificate\n{checker.CERTIFICATE_REPLACEMENT_PROMPT}",
         f"{checker.CERTIFICATE_REPLACEMENT_PROMPT}\nUnexpected follow-up text",
     ],
@@ -2261,6 +2309,7 @@ def test_bad_replacement_prompt_never_sends_confirmation(
 
     assert connection.exited_config_mode
     assert certificate_pem in connection.commands
+    assert connection.channel_writes == [certificate_pem, "\n"]
     assert "y" not in connection.commands
 
 

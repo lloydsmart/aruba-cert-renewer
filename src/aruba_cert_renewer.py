@@ -1222,11 +1222,9 @@ def _send_certificate_pem(connection, certificate_pem):
     previous_logging_disable = logging.root.manager.disable
     logging.disable(logging.DEBUG)
     try:
-        return connection.send_command_timing(
-            certificate_pem,
-            read_timeout=60,
-            normalize=True,
-        )
+        connection.write_channel(certificate_pem)
+        connection.write_channel("\n")
+        return connection.read_channel_timing(read_timeout=60)
     finally:
         logging.disable(previous_logging_disable)
 
