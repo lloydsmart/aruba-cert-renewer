@@ -153,16 +153,40 @@ ARUBA_SSH_USERNAME
 ARUBA_SSH_PASSWORD
 ```
 
-OPNsense credentials are accepted **only** through:
+OPNsense API keys and secrets can be supplied directly through environment
+variables, which is convenient for interactive or manual use:
 
 ```text
 OPNSENSE_API_KEY
 OPNSENSE_API_SECRET
 ```
 
+For unattended containers, reference mounted secret files instead:
+
+```text
+OPNSENSE_API_KEY_FILE
+OPNSENSE_API_SECRET_FILE
+```
+
+Each credential is resolved independently. Its `*_FILE` variable takes
+precedence over the corresponding direct variable, so the key and secret may
+use different source types. A configured file is authoritative: an empty,
+invalid, unreadable, or malformed file fails closed and does not fall back to
+the direct variable. Each secret file must contain exactly one non-empty UTF-8
+line; either no terminator, one final LF, or one final CRLF is accepted.
+
+For example, Docker or another container runtime can mount secrets beneath
+`/run/secrets`:
+
+```sh
+export OPNSENSE_API_KEY_FILE=/run/secrets/opnsense_api_key
+export OPNSENSE_API_SECRET_FILE=/run/secrets/opnsense_api_secret
+```
+
 The OPNsense API key and secret are sent using HTTP Basic authentication over
-verified HTTPS. They are not accepted in TOML or as command-line arguments and
-must not be logged or committed.
+verified HTTPS. Credentials and secret-file contents must never be placed in
+`config.toml`, logged, or committed. OPNsense credentials are not accepted in
+TOML or as command-line arguments.
 
 ## OPNsense Least-Privilege ACL
 

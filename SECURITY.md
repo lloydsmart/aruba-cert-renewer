@@ -74,7 +74,8 @@ The automation is limited to CA description lookup, CSR signing, and public-cert
 * Never call `/api/trust/cert/search`.
 * Never request private-key or PKCS#12 downloads from OPNsense.
 * Never log OPNsense API keys, secrets, Basic Authorization headers, full CSRs, or full certificates.
-* Keep `OPNSENSE_API_KEY` and `OPNSENSE_API_SECRET` in the environment; do not put them in TOML or CLI arguments.
+* Supply OPNsense credentials through `OPNSENSE_API_KEY` and `OPNSENSE_API_SECRET`, or reference mounted secret files
+  through `OPNSENSE_API_KEY_FILE` and `OPNSENSE_API_SECRET_FILE`; do not put credentials in TOML or CLI arguments.
 * Keep TLS certificate and hostname verification enabled for every OPNsense request.
 
 Aruba certificate private keys are generated and stored on the switch. They must not be exported to or retrieved from

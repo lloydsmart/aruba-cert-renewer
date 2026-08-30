@@ -4342,6 +4342,13 @@ def test_renew_due_selected_switch_fails_before_credentials(monkeypatch):
 def test_renew_due_main_healthy_run_uses_selection_without_opnsense_contact(
     monkeypatch, capsys, switch_args, expected_switch
 ):
+    for variable in (
+        "OPNSENSE_API_KEY",
+        "OPNSENSE_API_SECRET",
+        "OPNSENSE_API_KEY_FILE",
+        "OPNSENSE_API_SECRET_FILE",
+    ):
+        monkeypatch.delenv(variable, raising=False)
     monkeypatch.setattr(
         checker.sys,
         "argv",

@@ -5,6 +5,8 @@ import json
 import os
 import re
 import ssl
+import stat
+import unicodedata
 import uuid
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
@@ -19,6 +21,7 @@ CA_LIST_PATH = "/api/trust/cert/ca_list"
 CERT_ADD_PATH = "/api/trust/cert/add"
 CERTIFICATE_PATH = "/api/trust/cert/generate_file/{uuid}/crt"
 MAX_RESPONSE_BYTES = 1024 * 1024
+MAX_SECRET_FILE_BYTES = 16 * 1024
 
 
 class OPNsenseAPIError(ValueError):
@@ -70,6 +73,62 @@ def validate_base_url(base_url):
     return base_url
 
 
+def _read_secret_file(configured_path, source_name):
+    if (
+        not configured_path
+        or not configured_path.strip()
+        or any(unicodedata.category(character) == "Cc" for character in configured_path)
+    ):
+        raise OPNsenseAPIError(f"{source_name} must be a non-empty safe path")
+
+    try:
+        with open(configured_path, "rb") as secret_file:
+            if not stat.S_ISREG(os.fstat(secret_file.fileno()).st_mode):
+                raise OPNsenseAPIError(f"{source_name} is not a regular file")
+            secret_bytes = secret_file.read(MAX_SECRET_FILE_BYTES + 1)
+    except OPNsenseAPIError:
+        raise
+    except IsADirectoryError:
+        raise OPNsenseAPIError(f"{source_name} is not a regular file") from None
+    except (OSError, ValueError):
+        raise OPNsenseAPIError(f"{source_name} could not be read") from None
+
+    if len(secret_bytes) > MAX_SECRET_FILE_BYTES:
+        raise OPNsenseAPIError(f"{source_name} exceeds {MAX_SECRET_FILE_BYTES} bytes")
+
+    if b"\x00" in secret_bytes:
+        raise OPNsenseAPIError(f"{source_name} contains NUL")
+
+    try:
+        secret = secret_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        raise OPNsenseAPIError(f"{source_name} must contain valid UTF-8") from None
+
+    if secret.endswith("\r\n"):
+        secret = secret[:-2]
+    elif secret.endswith("\n"):
+        secret = secret[:-1]
+
+    if "\r" in secret or "\n" in secret:
+        raise OPNsenseAPIError(f"{source_name} must contain exactly one line")
+
+    if not secret:
+        raise OPNsenseAPIError(f"{source_name} is empty")
+
+    return secret
+
+
+def _load_credential(direct_name, file_name):
+    if file_name in os.environ:
+        return _read_secret_file(os.environ[file_name], file_name)
+
+    credential = os.environ.get(direct_name)
+    if not credential:
+        raise OPNsenseAPIError(f"{direct_name} or {file_name} must be set")
+
+    return credential
+
+
 class OPNsenseClient:
     """Access only the Trust API routes needed to sign and fetch a certificate."""
 
@@ -81,13 +140,14 @@ class OPNsenseClient:
 
     @staticmethod
     def _load_authorization():
-        api_key = os.environ.get("OPNSENSE_API_KEY")
-        api_secret = os.environ.get("OPNSENSE_API_SECRET")
-
-        if not api_key or not api_secret:
-            raise OPNsenseAPIError(
-                "OPNSENSE_API_KEY and OPNSENSE_API_SECRET must be set"
-            )
+        api_key = _load_credential(
+            "OPNSENSE_API_KEY",
+            "OPNSENSE_API_KEY_FILE",
+        )
+        api_secret = _load_credential(
+            "OPNSENSE_API_SECRET",
+            "OPNSENSE_API_SECRET_FILE",
+        )
 
         credentials = f"{api_key}:{api_secret}".encode()
         return "Basic " + base64.b64encode(credentials).decode("ascii")
