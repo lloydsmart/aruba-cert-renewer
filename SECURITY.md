@@ -25,6 +25,22 @@ Do not include passwords, API credentials, private keys, or other live secrets i
 
 Security reports will be reviewed and addressed as appropriate.
 
+## Container Runtime
+
+Production deployments should retain the container's non-root UID/GID
+`10001:10001`, read-only root filesystem, and tmpfs-only writable `/tmp`.
+Drop all Linux capabilities and enable `no-new-privileges`. Do not use
+privileged mode, host networking, a Docker socket mount, published inbound
+ports, or broad host filesystem mounts.
+
+Mount only the required configuration, public CA, and credential files, each
+read-only, and ensure credential source files are readable by UID `10001` but
+not by unrelated host users. Restrict network egress to the Aruba SSH and HTTPS
+services, the OPNsense HTTPS API, and supporting DNS/NTP required by the
+environment. These runtime controls reduce container privileges; they do not
+replace the application's credential, TLS, certificate, or device-level safety
+checks.
+
 ## Security-Sensitive Areas
 
 This project is intended to interact with network switches and certificate authority infrastructure. Security issues may

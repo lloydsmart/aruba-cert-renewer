@@ -1,0 +1,12 @@
+# Deny all build-context content unless explicitly allowed below.
+**
+
+!Dockerfile
+!requirements.txt
+!LICENSE
+!src/
+!src/**
+
+# Exclude generated Python files even when they appear below src/.
+src/**/__pycache__/
+src/**/*.py[cod]

@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 .env
 config.toml
+secrets/
 .vscode/
 *.csr.pem
 *.crt.pem

@@ -1,0 +1,22 @@
+services:
+  aruba-cert-renewer:
+    build:
+      context: .
+    image: aruba-cert-renewer:local
+    restart: "no"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
+    environment:
+      OPNSENSE_API_KEY_FILE: /run/secrets/opnsense_api_key
+      OPNSENSE_API_SECRET_FILE: /run/secrets/opnsense_api_secret
+    volumes:
+      - ./config.toml:/config/config.toml:ro
+      - ./internal-ca.crt.pem:/config/internal-ca.crt.pem:ro
+      - ./secrets/opnsense_api_key:/run/secrets/opnsense_api_key:ro
+      - ./secrets/opnsense_api_secret:/run/secrets/opnsense_api_secret:ro
+      - ./secrets/aruba_example_switch_password:/run/secrets/aruba_example_switch_password:ro

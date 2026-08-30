@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+image=${1:-aruba-cert-renewer:test}
+repository_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+temporary_directory=$(mktemp -d "${TMPDIR:-/tmp}/aruba-cert-renewer-smoke.XXXXXX")
+
+cleanup() {
+    rm -rf -- "$temporary_directory"
+}
+trap cleanup EXIT
+
+docker build --tag "$image" "$repository_root"
+
+docker run --rm \
+    --network none \
+    "$image" \
+    --help >/dev/null
+
+docker run --rm \
+    --network none \
+    --read-only \
+    --tmpfs /tmp:rw,noexec,nosuid,nodev,size=16m \
+    --cap-drop ALL \
+    --security-opt no-new-privileges:true \
+    "$image" \
+    --help >/dev/null
+
+image_user=$(docker image inspect --format '{{.Config.User}}' "$image")
+exposed_ports=$(docker image inspect --format '{{json .Config.ExposedPorts}}' "$image")
+entrypoint=$(docker image inspect --format '{{json .Config.Entrypoint}}' "$image")
+default_command=$(docker image inspect --format '{{json .Config.Cmd}}' "$image")
+
+[[ "$image_user" == "10001:10001" ]]
+[[ "$exposed_ports" == "null" || "$exposed_ports" == "{}" ]]
+[[ "$entrypoint" == '["python","/app/src/aruba_cert_renewer.py"]' ]]
+[[ "$default_command" == '["--config","/config/config.toml","--renew-due"]' ]]
+
+docker run --rm \
+    --network none \
+    --read-only \
+    --entrypoint /bin/sh \
+    "$image" \
+    -c 'test -z "$(find /config /run/secrets -mindepth 1 -print -quit)" && test ! -w /app/src/aruba_cert_renewer.py'
+
+printf '%s\n' 'synthetic-api-key' >"$temporary_directory/opnsense_api_key"
+printf '%s\n' 'synthetic-api-secret' >"$temporary_directory/opnsense_api_secret"
+chmod 0444 \
+    "$temporary_directory/opnsense_api_key" \
+    "$temporary_directory/opnsense_api_secret"
+
+docker run --rm \
+    --network none \
+    --read-only \
+    --tmpfs /tmp:rw,noexec,nosuid,nodev,size=16m \
+    --cap-drop ALL \
+    --security-opt no-new-privileges:true \
+    --mount "type=bind,src=$temporary_directory/opnsense_api_key,dst=/run/secrets/opnsense_api_key,readonly" \
+    --mount "type=bind,src=$temporary_directory/opnsense_api_secret,dst=/run/secrets/opnsense_api_secret,readonly" \
+    --env OPNSENSE_API_KEY_FILE=/run/secrets/opnsense_api_key \
+    --env OPNSENSE_API_SECRET_FILE=/run/secrets/opnsense_api_secret \
+    --entrypoint python \
+    "$image" \
+    -c 'import sys; sys.path.insert(0, "/app/src"); from opnsense_client import OPNsenseClient; OPNsenseClient("https://opnsense.example.com")'
+
+docker compose -f "$repository_root/compose.example.yaml" config --quiet
+
+printf '%s\n' "Container smoke tests passed for $image"

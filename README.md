@@ -25,12 +25,12 @@ Implemented:
 - Mandatory post-install HTTPS chain, hostname, and exact-certificate verification
 - Explicit one-command renewal with collision-safe automatic certificate naming
 - Sequential threshold-based renewal across all or one configured switch
+- Hardened one-shot container packaging for unattended threshold renewal
 
 The `--sign-csr` stage does **not** install or activate the resulting certificate
 on the switch. Generation, retrieval/signing, and installation remain available
 as explicit, independently invoked stages for debugging and recovery.
-Configuration saving, container deployment, scheduling, and unattended
-execution remain planned work.
+External scheduling and final network deployment remain planned work.
 
 ## Architecture
 
@@ -72,6 +72,83 @@ pip install -r requirements-dev.txt
 ```
 
 No additional HTTP runtime dependency is needed.
+
+## Docker
+
+The container is a finite, one-shot job. With no command override, it runs
+`--config /config/config.toml --renew-due`, processes configured switches
+sequentially, prints the aggregate result, and exits with the application's
+normal exit code. It contains no scheduler, daemon, web service, health check,
+or inbound port. External scheduling and the final network deployment are
+separate concerns.
+
+Build the local image with:
+
+```bash
+docker build -t aruba-cert-renewer:local .
+```
+
+The image runs as UID/GID `10001:10001`. A hardened, network-isolated help
+check requires no deployment files:
+
+```bash
+docker run --rm \
+  --network none \
+  --read-only \
+  --tmpfs /tmp:rw,noexec,nosuid,nodev,size=16m \
+  --cap-drop ALL \
+  --security-opt no-new-privileges:true \
+  aruba-cert-renewer:local \
+  --help
+```
+
+[`compose.example.yaml`](compose.example.yaml) shows the intended generic
+mounts and runtime restrictions. Validate its syntax with:
+
+```bash
+docker compose -f compose.example.yaml config
+```
+
+Do not start the example until local configuration, public CA, and secret files
+have been created. The expected paths inside the container are:
+
+- `/config/config.toml`
+- `/config/internal-ca.crt.pem`
+- `/run/secrets/opnsense_api_key`
+- `/run/secrets/opnsense_api_secret`
+- `/run/secrets/aruba_example_switch_password`
+
+The real `config.toml`, public CA, and credential files are read-only mounts;
+they are not baked into the image. A portable container configuration resolves
+the public CA relative to `config.toml` and references the Aruba credential by
+its absolute mounted path:
+
+```toml
+[verification]
+ca_file = "internal-ca.crt.pem"
+
+[[switches]]
+name = "EXAMPLE-SWITCH"
+host = "switch.example.com"
+username = "cert-renewer"
+password_file = "/run/secrets/aruba_example_switch_password"
+```
+
+All bind-mounted source files needed at runtime must be readable by container
+UID `10001`, including `config.toml`, the public CA certificate, and credential
+or secret files. Credential files should also remain inaccessible to unrelated
+host users. For a typical root-managed deployment, set each source secret's
+ownership and mode before starting the container, for example:
+
+```bash
+chown 10001:10001 secrets/opnsense_api_key
+chmod 0400 secrets/opnsense_api_key
+```
+
+The Compose file is an example, not the final network deployment. A production
+network policy should allow only required outbound Aruba SSH (TCP/22), Aruba
+HTTPS (TCP/443), OPNsense HTTPS API, and environmental DNS/NTP access. No
+inbound connectivity is required.
 
 ## Configuration
 
@@ -127,8 +204,7 @@ Duplicate identities are removed without performing DNS resolution. The former
 The optional `username` and `password_file` fields select credentials for that
 switch. Literal `password` values are forbidden in TOML. Relative password-file
 paths are resolved relative to `config.toml`; absolute paths such as
-`/run/secrets/...` support anticipated container secret mounts, although Docker
-packaging is not implemented yet.
+`/run/secrets/...` support container secret mounts.
 
 `verification.ca_file` is the public PEM certificate for the CA that issued the
 switch HTTPS certificate. It is required by `--install-certificate`, `--renew`,

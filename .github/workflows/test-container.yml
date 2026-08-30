@@ -1,0 +1,45 @@
+name: Container tests
+
+on:
+  workflow_dispatch:
+
+  push:
+    branches:
+      - main
+    paths:
+      - 'Dockerfile'
+      - '.dockerignore'
+      - 'compose.example.yaml'
+      - 'LICENSE'
+      - 'requirements.txt'
+      - 'src/**'
+      - 'tests/container-smoke.sh'
+      - '.github/workflows/test-container.yml'
+
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'Dockerfile'
+      - '.dockerignore'
+      - 'compose.example.yaml'
+      - 'LICENSE'
+      - 'requirements.txt'
+      - 'src/**'
+      - 'tests/container-smoke.sh'
+      - '.github/workflows/test-container.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Container smoke tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Build and test container
+        run: tests/container-smoke.sh
