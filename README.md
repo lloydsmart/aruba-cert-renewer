@@ -24,12 +24,13 @@ Implemented:
 - Install-only activation of an already-issued certificate on a pending Aruba CSR
 - Mandatory post-install HTTPS chain, hostname, and exact-certificate verification
 - Explicit one-command renewal with collision-safe automatic certificate naming
+- Sequential threshold-based renewal across all or one configured switch
 
 The `--sign-csr` stage does **not** install or activate the resulting certificate
 on the switch. Generation, retrieval/signing, and installation remain available
-as explicit, independently invoked stages for debugging and recovery. Automatic
-threshold-based renewal, configuration saving, container deployment, and
-unattended renewal remain planned work.
+as explicit, independently invoked stages for debugging and recovery.
+Configuration saving, container deployment, scheduling, and unattended
+execution remain planned work.
 
 ## Architecture
 
@@ -130,10 +131,11 @@ paths are resolved relative to `config.toml`; absolute paths such as
 packaging is not implemented yet.
 
 `verification.ca_file` is the public PEM certificate for the CA that issued the
-switch HTTPS certificate. It is required by `--install-certificate` and
-`--renew`, and is loaded by Python's normal SSL trust machinery. Relative paths
-are resolved relative to `config.toml`, not the process working directory. Do
-not put a CA private key or real infrastructure certificate in the repository.
+switch HTTPS certificate. It is required by `--install-certificate`, `--renew`,
+and `--renew-due`, and is loaded by Python's normal SSL trust machinery.
+Relative paths are resolved relative to `config.toml`, not the process working
+directory. Do not put a CA private key or real infrastructure certificate in
+the repository.
 
 `config.toml` is excluded from Git and should contain the real inventory. It
 must never contain OPNsense API credentials.
@@ -220,10 +222,23 @@ verification stages described below. It does not persist the intermediate CSR
 or certificate to disk. The staged commands remain available for diagnosis and
 recovery.
 
-If a pending Web CSR already exists, `--renew` fails closed before generating
-anything. It does not guess whether to resume, replace, or clear that CSR. Use
-the staged commands to inspect and recover the pending state. Automatic
-threshold-based unattended renewal remains future work.
+### Renew Certificates at the Warning Threshold
+
+Check every configured switch sequentially and renew only certificates whose
+remaining lifetime is less than or equal to `settings.warning_days`:
+
+```bash
+python src/aruba_cert_renewer.py --renew-due
+```
+
+Add `--switch EXAMPLE-SWITCH` to consider only one switch. Healthy switches do
+not contact OPNsense or perform renewal. Per-switch credential, monitoring, or
+renewal failures are reported and do not prevent later switches from being
+processed; any such error makes the command exit with code 2.
+
+If a pending Web CSR already exists, both renewal modes fail closed without
+resuming, replacing, or clearing it. Use the staged commands to inspect and
+recover the pending state.
 
 ### Generate a CSR
 
@@ -342,8 +357,8 @@ remains available:
 
 | Code | Meaning                                                              |
 | ---: | -------------------------------------------------------------------- |
-|  `0` | The requested operation succeeded or all certificates are healthy    |
-|  `1` | One or more certificates are expired or within the renewal threshold |
+|  `0` | The operation succeeded; `--renew-due` switches are healthy/renewed  |
+|  `1` | Read-only monitoring found an expired or renewal-due certificate     |
 |  `2` | The requested operation failed or a switch could not be checked      |
 
 ## Safety

@@ -118,6 +118,15 @@ def parse_args():
     )
 
     parser.add_argument(
+        "--renew-due",
+        action="store_true",
+        help=(
+            "Check selected switches and renew only certificates at or beyond "
+            "the configured warning threshold"
+        ),
+    )
+
+    parser.add_argument(
         "--certificate-name",
         metavar="NAME",
         help="Certificate name to generate, retrieve, sign, or install",
@@ -149,6 +158,7 @@ def parse_args():
 
 def validate_cli_args(args):
     renew = getattr(args, "renew", False)
+    renew_due = getattr(args, "renew_due", False)
     install_certificate = getattr(args, "install_certificate", False)
     certificate_input = getattr(args, "certificate_input", None)
     staged_operations = [
@@ -157,11 +167,11 @@ def validate_cli_args(args):
         args.sign_csr,
         install_certificate,
     ]
-    operations = [*staged_operations, renew]
+    operations = [*staged_operations, renew, renew_due]
     if sum(operations) > 1:
         raise ValueError(
             "--generate-csr, --retrieve-csr, --sign-csr, "
-            "--install-certificate, and --renew are mutually exclusive"
+            "--install-certificate, --renew, and --renew-due are mutually exclusive"
         )
 
     staged_operation = any(staged_operations)
@@ -183,25 +193,27 @@ def validate_cli_args(args):
     if staged_operation and not args.certificate_name:
         raise ValueError(f"{operation_name} requires --certificate-name")
 
-    if renew and args.certificate_name:
-        raise ValueError("--renew does not accept --certificate-name")
+    renewal_mode = "--renew-due" if renew_due else "--renew"
 
-    if not staged_operation and not renew and args.certificate_name:
+    if (renew or renew_due) and args.certificate_name:
+        raise ValueError(f"{renewal_mode} does not accept --certificate-name")
+
+    if not staged_operation and not renew and not renew_due and args.certificate_name:
         raise ValueError(
             "--certificate-name requires --generate-csr, --retrieve-csr, "
             "--sign-csr, or --install-certificate"
         )
 
-    if renew and args.csr_output:
-        raise ValueError("--renew does not accept --csr-output")
+    if (renew or renew_due) and args.csr_output:
+        raise ValueError(f"{renewal_mode} does not accept --csr-output")
 
     if (
         not staged_operation or args.sign_csr or install_certificate
     ) and args.csr_output:
         raise ValueError("--csr-output requires --generate-csr or --retrieve-csr")
 
-    if renew and args.certificate_output:
-        raise ValueError("--renew does not accept --certificate-output")
+    if (renew or renew_due) and args.certificate_output:
+        raise ValueError(f"{renewal_mode} does not accept --certificate-output")
 
     if not args.sign_csr and args.certificate_output:
         raise ValueError("--certificate-output requires --sign-csr")
@@ -212,10 +224,10 @@ def validate_cli_args(args):
     if install_certificate and not certificate_input:
         raise ValueError("--install-certificate requires --certificate-input")
 
-    if renew and certificate_input:
-        raise ValueError("--renew does not accept --certificate-input")
+    if (renew or renew_due) and certificate_input:
+        raise ValueError(f"{renewal_mode} does not accept --certificate-input")
 
-    if not install_certificate and not renew and certificate_input:
+    if not install_certificate and not renew and not renew_due and certificate_input:
         raise ValueError("--certificate-input requires --install-certificate")
 
     if args.certificate_name:
@@ -714,7 +726,7 @@ def get_verification_ca_file(config, config_file):
     if not isinstance(settings, dict):
         raise ValueError(
             "A [verification] configuration section is required for "
-            "--install-certificate or --renew"
+            "--install-certificate, --renew, or --renew-due"
         )
 
     configured_path = settings.get("ca_file")
@@ -1954,6 +1966,16 @@ def print_summary(results):
     print(f"Errors:           {results.count('error')}")
 
 
+def print_renewal_summary(results):
+    print()
+    print("Renewal summary")
+    print("---------------")
+    print(f"Switches processed: {len(results)}")
+    print(f"Healthy:             {results.count('healthy')}")
+    print(f"Renewed:             {results.count('renewed')}")
+    print(f"Errors:              {results.count('error')}")
+
+
 def get_exit_code(results):
     if "error" in results:
         return EXIT_ERROR
@@ -1962,6 +1984,155 @@ def get_exit_code(results):
         return EXIT_WARNING
 
     return EXIT_OK
+
+
+def report_renewal_failure(error):
+    """Print the established explicit-renewal safety message for an error."""
+    if isinstance(error, RenewalPreflightError):
+        print(
+            "Error: Renewal preflight failed; no renewal change was "
+            f"attempted: {error}",
+            file=sys.stderr,
+        )
+    elif isinstance(error, CSRGenerationPreAttemptError):
+        print(
+            "Error: CSR generation failed before CSR creation was attempted; "
+            f"no pending CSR was created: {error}",
+            file=sys.stderr,
+        )
+    elif isinstance(error, CSRGenerationError):
+        print(f"Error: {error}", file=sys.stderr)
+        print(
+            "CSR creation was attempted. No automatic cleanup was attempted; "
+            "use the explicit staged commands for diagnosis or recovery.",
+            file=sys.stderr,
+        )
+    elif isinstance(error, CSRSigningError):
+        print(f"Error: CSR signing failed: {error}", file=sys.stderr)
+        print(
+            "No certificate installation or automatic OPNsense cleanup was attempted.",
+            file=sys.stderr,
+        )
+    elif isinstance(error, CertificatePreInstallationError):
+        print(
+            f"Error: Certificate installation did not begin: {error}",
+            file=sys.stderr,
+        )
+        print("No automatic rollback was attempted.", file=sys.stderr)
+    elif isinstance(error, CertificateInstallationAttemptError):
+        print(f"Error: Post-install failure: {error}", file=sys.stderr)
+        print(
+            "No automatic rollback was attempted; inspect the switch manually.",
+            file=sys.stderr,
+        )
+    elif isinstance(error, LiveHTTPSVerificationError):
+        print(
+            "Error: Post-install HTTPS verification failed. The certificate "
+            "may already be active and requires manual investigation: "
+            f"{error}",
+            file=sys.stderr,
+        )
+        print("No automatic rollback was attempted.", file=sys.stderr)
+
+
+RENEWAL_FAILURE_TYPES = (
+    RenewalPreflightError,
+    CSRGenerationPreAttemptError,
+    CSRGenerationError,
+    CSRSigningError,
+    CertificatePreInstallationError,
+    CertificateInstallationAttemptError,
+    LiveHTTPSVerificationError,
+)
+
+
+def renew_due_certificates(
+    switches,
+    config_file,
+    warning_days,
+    csr_settings,
+    opnsense_settings,
+    verification_ca_file,
+):
+    results = []
+
+    for switch in switches:
+        username = password = None
+        try:
+            try:
+                username, password = get_switch_credentials(switch, config_file)
+            except ValueError as error:
+                print()
+                print(switch["name"])
+                print("-" * len(switch["name"]))
+                print(f"Host:             {switch['host']}")
+                print("Status:           ERROR")
+                print(f"Reason:           {error}")
+                print("Action:           No renewal attempted")
+                results.append("error")
+                continue
+            except Exception:
+                print()
+                print(switch["name"])
+                print("-" * len(switch["name"]))
+                print(f"Host:             {switch['host']}")
+                print("Status:           ERROR")
+                print("Reason:           Unexpected credential resolution failure")
+                print("Action:           No renewal attempted")
+                results.append("error")
+                continue
+
+            try:
+                status = check_switch(switch, username, password, warning_days)
+            except Exception as error:
+                print("Status:           ERROR")
+                print(f"Reason:           {error}")
+                print("Action:           No renewal attempted")
+                results.append("error")
+                continue
+            if status == "ok":
+                print("Action:           No renewal required")
+                results.append("healthy")
+                continue
+
+            if status not in {"renewal_due", "expired"}:
+                print("Action:           No renewal attempted")
+                results.append("error")
+                continue
+
+            print("Action:           Renewing certificate")
+            try:
+                renew_certificate(
+                    switch,
+                    username,
+                    password,
+                    csr_settings,
+                    opnsense_settings,
+                    verification_ca_file,
+                )
+            except RENEWAL_FAILURE_TYPES as error:
+                report_renewal_failure(error)
+                results.append("error")
+            except Exception as error:
+                print(
+                    "Error: Unexpected renewal failure "
+                    f"({type(error).__name__}). Renewal state may be uncertain.",
+                    file=sys.stderr,
+                )
+                print(
+                    "No automatic retry, cleanup, or rollback was attempted; "
+                    "inspect the switch and use the explicit staged commands "
+                    "if necessary.",
+                    file=sys.stderr,
+                )
+                results.append("error")
+            else:
+                results.append("renewed")
+        finally:
+            username = password = None
+
+    print_renewal_summary(results)
+    return EXIT_ERROR if "error" in results else EXIT_OK
 
 
 def write_or_print_csr(csr_pem, output_path):
@@ -1990,6 +2161,7 @@ def main():
         config = load_config(args.config)
         warning_days, switches = validate_config(config)
         switches = select_switches(switches, args.switch_name)
+        renew_due = getattr(args, "renew_due", False)
 
         if (
             args.generate_csr
@@ -1997,14 +2169,16 @@ def main():
             or args.sign_csr
             or args.install_certificate
             or args.renew
+            or renew_due
         ):
             csr_settings = get_csr_settings(config)
 
-        if args.sign_csr or args.install_certificate or args.renew:
+        if args.sign_csr or args.install_certificate or args.renew or renew_due:
             opnsense_settings = get_opnsense_settings(config)
-            validate_switch_signing_identity(switches[0])
+            for switch in switches if renew_due else switches[:1]:
+                validate_switch_signing_identity(switch)
 
-        if args.install_certificate or args.renew:
+        if args.install_certificate or args.renew or renew_due:
             verification_ca_file = get_verification_ca_file(config, args.config)
 
         if args.install_certificate:
@@ -2030,6 +2204,16 @@ def main():
             print(f"Error: {error}", file=sys.stderr)
             return EXIT_ERROR
 
+    if renew_due:
+        return renew_due_certificates(
+            switches,
+            args.config,
+            warning_days,
+            csr_settings,
+            opnsense_settings,
+            verification_ca_file,
+        )
+
     if args.renew:
         switch = switches[0]
 
@@ -2044,64 +2228,8 @@ def main():
             )
             return EXIT_OK
 
-        except RenewalPreflightError as error:
-            print(
-                "Error: Renewal preflight failed; no renewal change was "
-                f"attempted: {error}",
-                file=sys.stderr,
-            )
-            return EXIT_ERROR
-
-        except CSRGenerationPreAttemptError as error:
-            print(
-                "Error: CSR generation failed before CSR creation was attempted; "
-                f"no pending CSR was created: {error}",
-                file=sys.stderr,
-            )
-            return EXIT_ERROR
-
-        except CSRGenerationError as error:
-            print(f"Error: {error}", file=sys.stderr)
-            print(
-                "CSR creation was attempted. No automatic cleanup was attempted; "
-                "use the explicit staged commands for diagnosis or recovery.",
-                file=sys.stderr,
-            )
-            return EXIT_ERROR
-
-        except CSRSigningError as error:
-            print(f"Error: CSR signing failed: {error}", file=sys.stderr)
-            print(
-                "No certificate installation or automatic OPNsense cleanup was "
-                "attempted.",
-                file=sys.stderr,
-            )
-            return EXIT_ERROR
-
-        except CertificatePreInstallationError as error:
-            print(
-                f"Error: Certificate installation did not begin: {error}",
-                file=sys.stderr,
-            )
-            print("No automatic rollback was attempted.", file=sys.stderr)
-            return EXIT_ERROR
-
-        except CertificateInstallationAttemptError as error:
-            print(f"Error: Post-install failure: {error}", file=sys.stderr)
-            print(
-                "No automatic rollback was attempted; inspect the switch manually.",
-                file=sys.stderr,
-            )
-            return EXIT_ERROR
-
-        except LiveHTTPSVerificationError as error:
-            print(
-                "Error: Post-install HTTPS verification failed. The certificate "
-                "may already be active and requires manual investigation: "
-                f"{error}",
-                file=sys.stderr,
-            )
-            print("No automatic rollback was attempted.", file=sys.stderr)
+        except RENEWAL_FAILURE_TYPES as error:
+            report_renewal_failure(error)
             return EXIT_ERROR
 
     if args.install_certificate:

@@ -3277,6 +3277,61 @@ def test_renew_rejects_staged_file_and_name_options(field, value, option):
         checker.validate_cli_args(make_renew_args(**{field: value}))
 
 
+def make_renew_due_args(**overrides):
+    values = {
+        "generate_csr": False,
+        "retrieve_csr": False,
+        "sign_csr": False,
+        "install_certificate": False,
+        "renew": False,
+        "renew_due": True,
+        "switch_name": None,
+        "certificate_name": None,
+        "csr_output": None,
+        "certificate_output": None,
+        "certificate_input": None,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+@pytest.mark.parametrize("switch_name", [None, "EXAMPLE-SWITCH"])
+def test_renew_due_accepts_with_or_without_switch(switch_name):
+    checker.validate_cli_args(make_renew_due_args(switch_name=switch_name))
+
+
+@pytest.mark.parametrize(
+    "other_operation",
+    [
+        "renew",
+        "generate_csr",
+        "retrieve_csr",
+        "sign_csr",
+        "install_certificate",
+    ],
+)
+def test_renew_due_is_mutually_exclusive_with_other_operations(other_operation):
+    args = make_renew_due_args()
+    setattr(args, other_operation, True)
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        checker.validate_cli_args(args)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "option"),
+    [
+        ("certificate_name", "manual-name", "--certificate-name"),
+        ("csr_output", Path("request.pem"), "--csr-output"),
+        ("certificate_output", Path("certificate.pem"), "--certificate-output"),
+        ("certificate_input", Path("certificate.pem"), "--certificate-input"),
+    ],
+)
+def test_renew_due_rejects_staged_file_and_name_options(field, value, option):
+    with pytest.raises(ValueError, match=f"--renew-due does not accept {option}"):
+        checker.validate_cli_args(make_renew_due_args(**{field: value}))
+
+
 def test_choose_renewal_name_starts_at_01_and_is_a_valid_identifier():
     result = checker.choose_renewal_certificate_name(
         "webcert-20260828-01 Web 2027/09/27 profile\n",
@@ -3777,3 +3832,551 @@ def test_renew_post_attempt_generation_oserror_never_claims_no_pending_csr(
     assert "CSR creation was attempted" in error_output
     assert "pending CSR may remain" in error_output
     assert "no pending CSR was created" not in error_output
+
+
+def make_multi_switch_config():
+    config = make_config()
+    config["switches"] = [
+        {
+            "name": "SWITCH-A",
+            "host": "switch-a.example.com",
+            "additional_sans": [],
+        },
+        {
+            "name": "SWITCH-B",
+            "host": "switch-b.example.com",
+            "additional_sans": [],
+        },
+    ]
+    config["csr"] = make_csr_settings()
+    config["opnsense"] = make_opnsense_settings()
+    config["verification"] = {"ca_file": "public-ca.pem"}
+    return config
+
+
+@pytest.mark.parametrize(
+    ("exception", "expected_error"),
+    [
+        (
+            checker.RenewalPreflightError("pending CSR"),
+            "Error: Renewal preflight failed; no renewal change was attempted: "
+            "pending CSR\n",
+        ),
+        (
+            checker.CSRGenerationPreAttemptError("invalid settings"),
+            "Error: CSR generation failed before CSR creation was attempted; no "
+            "pending CSR was created: invalid settings\n",
+        ),
+        (
+            checker.CSRGenerationError("pending CSR may remain"),
+            "Error: pending CSR may remain\n"
+            "CSR creation was attempted. No automatic cleanup was attempted; use "
+            "the explicit staged commands for diagnosis or recovery.\n",
+        ),
+        (
+            checker.CSRSigningError("signing failed"),
+            "Error: CSR signing failed: signing failed\n"
+            "No certificate installation or automatic OPNsense cleanup was "
+            "attempted.\n",
+        ),
+        (
+            checker.CertificatePreInstallationError("validation failed"),
+            "Error: Certificate installation did not begin: validation failed\n"
+            "No automatic rollback was attempted.\n",
+        ),
+        (
+            checker.CertificateInstallationAttemptError("channel failed"),
+            "Error: Post-install failure: channel failed\n"
+            "No automatic rollback was attempted; inspect the switch manually.\n",
+        ),
+        (
+            checker.LiveHTTPSVerificationError("timed out"),
+            "Error: Post-install HTTPS verification failed. The certificate may "
+            "already be active and requires manual investigation: timed out\n"
+            "No automatic rollback was attempted.\n",
+        ),
+    ],
+)
+def test_explicit_renew_preserves_safety_messages(
+    monkeypatch, capsys, exception, expected_error
+):
+    config = make_config()
+    config["csr"] = make_csr_settings()
+    config["opnsense"] = make_opnsense_settings()
+    config["verification"] = {"ca_file": "public-ca.pem"}
+    monkeypatch.setattr(
+        checker.sys,
+        "argv",
+        [
+            "aruba_cert_renewer.py",
+            "--switch",
+            "EXAMPLE-SWITCH",
+            "--renew",
+        ],
+    )
+    monkeypatch.setattr(checker, "load_config", lambda config_file: config)
+    monkeypatch.setattr(
+        checker,
+        "get_verification_ca_file",
+        lambda config, config_file: Path("public-ca.pem"),
+    )
+    monkeypatch.setattr(
+        checker,
+        "get_switch_credentials",
+        lambda switch, config_file: ("user", "password"),
+    )
+    monkeypatch.setattr(
+        checker,
+        "renew_certificate",
+        lambda *args: (_ for _ in ()).throw(exception),
+    )
+
+    assert checker.main() == checker.EXIT_ERROR
+    assert capsys.readouterr().err == expected_error
+
+
+@pytest.mark.parametrize(
+    ("statuses", "renewed_names", "exit_code", "summary_counts"),
+    [
+        ({"SWITCH-A": "ok", "SWITCH-B": "ok"}, [], checker.EXIT_OK, (2, 0, 0)),
+        (
+            {"SWITCH-A": "ok", "SWITCH-B": "renewal_due"},
+            ["SWITCH-B"],
+            checker.EXIT_OK,
+            (1, 1, 0),
+        ),
+        (
+            {"SWITCH-A": "renewal_due", "SWITCH-B": "ok"},
+            ["SWITCH-A"],
+            checker.EXIT_OK,
+            (1, 1, 0),
+        ),
+        (
+            {"SWITCH-A": "renewal_due", "SWITCH-B": "expired"},
+            ["SWITCH-A", "SWITCH-B"],
+            checker.EXIT_OK,
+            (0, 2, 0),
+        ),
+        (
+            {"SWITCH-A": "error", "SWITCH-B": "ok"},
+            [],
+            checker.EXIT_ERROR,
+            (1, 0, 1),
+        ),
+    ],
+)
+def test_renew_due_orchestrates_and_summarizes_switches(
+    monkeypatch,
+    capsys,
+    statuses,
+    renewed_names,
+    exit_code,
+    summary_counts,
+):
+    switches = make_multi_switch_config()["switches"]
+    credentials_calls = []
+    check_calls = []
+    renewal_calls = []
+
+    def credentials(switch, config_file):
+        credentials_calls.append(switch["name"])
+        return f"user-{switch['name']}", f"password-{switch['name']}"
+
+    def check(switch, username, password, warning_days):
+        check_calls.append(switch["name"])
+        assert username == f"user-{switch['name']}"
+        assert password == f"password-{switch['name']}"
+        assert warning_days == 30
+        return statuses[switch["name"]]
+
+    def renew(switch, username, password, *settings):
+        renewal_calls.append(switch["name"])
+        assert username == f"user-{switch['name']}"
+        assert password == f"password-{switch['name']}"
+
+    monkeypatch.setattr(checker, "get_switch_credentials", credentials)
+    monkeypatch.setattr(checker, "check_switch", check)
+    monkeypatch.setattr(checker, "renew_certificate", renew)
+
+    result = checker.renew_due_certificates(
+        switches,
+        Path("config.toml"),
+        30,
+        make_csr_settings(),
+        make_opnsense_settings(),
+        Path("public-ca.pem"),
+    )
+
+    assert result == exit_code
+    assert credentials_calls == ["SWITCH-A", "SWITCH-B"]
+    assert check_calls == ["SWITCH-A", "SWITCH-B"]
+    assert renewal_calls == renewed_names
+    healthy, renewed, errors = summary_counts
+    output = capsys.readouterr().out
+    assert "Renewal summary" in output
+    assert "Switches processed: 2" in output
+    assert f"Healthy:             {healthy}" in output
+    assert f"Renewed:             {renewed}" in output
+    assert f"Errors:              {errors}" in output
+
+
+def test_renew_due_credential_failure_does_not_stop_later_switch(monkeypatch, capsys):
+    switches = make_multi_switch_config()["switches"]
+    checked = []
+    renewed = []
+
+    def credentials(switch, config_file):
+        if switch["name"] == "SWITCH-A":
+            raise ValueError("missing password file")
+        return "user-b", "password-b"
+
+    monkeypatch.setattr(checker, "get_switch_credentials", credentials)
+    monkeypatch.setattr(
+        checker,
+        "check_switch",
+        lambda switch, *args: checked.append(switch["name"]) or "renewal_due",
+    )
+    monkeypatch.setattr(
+        checker,
+        "renew_certificate",
+        lambda switch, *args: renewed.append(switch["name"]),
+    )
+
+    result = checker.renew_due_certificates(
+        switches,
+        Path("config.toml"),
+        30,
+        make_csr_settings(),
+        make_opnsense_settings(),
+        Path("public-ca.pem"),
+    )
+
+    assert result == checker.EXIT_ERROR
+    assert checked == ["SWITCH-B"]
+    assert renewed == ["SWITCH-B"]
+    output = capsys.readouterr().out
+    assert "Switches processed: 2" in output
+    assert "Renewed:             1" in output
+    assert "Errors:              1" in output
+
+
+def test_renew_due_unexpected_credential_failure_is_sanitized_and_isolated(
+    monkeypatch, capsys
+):
+    switches = make_multi_switch_config()["switches"]
+    checked = []
+
+    def credentials(switch, config_file):
+        if switch["name"] == "SWITCH-A":
+            raise EOFError("synthetic input failure")
+        return "user-b", "password-b"
+
+    monkeypatch.setattr(checker, "get_switch_credentials", credentials)
+    monkeypatch.setattr(
+        checker,
+        "check_switch",
+        lambda switch, *args: checked.append(switch["name"]) or "ok",
+    )
+    monkeypatch.setattr(
+        checker,
+        "renew_certificate",
+        lambda *args: pytest.fail("A healthy switch must not be renewed"),
+    )
+
+    result = checker.renew_due_certificates(
+        switches,
+        Path("config.toml"),
+        30,
+        make_csr_settings(),
+        make_opnsense_settings(),
+        Path("public-ca.pem"),
+    )
+
+    assert result == checker.EXIT_ERROR
+    assert checked == ["SWITCH-B"]
+    captured = capsys.readouterr()
+    assert "Unexpected credential resolution failure" in captured.out
+    assert "Action:           No renewal attempted" in captured.out
+    assert "synthetic input failure" not in captured.out + captured.err
+    assert "Renewal summary" in captured.out
+    assert "Healthy:             1" in captured.out
+    assert "Errors:              1" in captured.out
+
+
+def test_renew_due_credential_keyboard_interrupt_propagates(monkeypatch):
+    switches = make_multi_switch_config()["switches"]
+    monkeypatch.setattr(
+        checker,
+        "get_switch_credentials",
+        lambda *args: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+    monkeypatch.setattr(
+        checker,
+        "check_switch",
+        lambda *args: pytest.fail("No check should follow interrupted credentials"),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        checker.renew_due_certificates(
+            switches,
+            Path("config.toml"),
+            30,
+            make_csr_settings(),
+            make_opnsense_settings(),
+            Path("public-ca.pem"),
+        )
+
+
+@pytest.mark.parametrize(
+    ("exception", "message"),
+    [
+        (checker.RenewalPreflightError("pending CSR"), "no renewal change"),
+        (
+            checker.CSRGenerationPreAttemptError("invalid settings"),
+            "before CSR creation was attempted",
+        ),
+        (
+            checker.CSRGenerationError("pending CSR may remain"),
+            "pending CSR may remain",
+        ),
+        (checker.CSRSigningError("signing failed"), "CSR signing failed"),
+        (
+            checker.CertificatePreInstallationError("validation failed"),
+            "installation did not begin",
+        ),
+        (
+            checker.CertificateInstallationAttemptError("channel failed"),
+            "inspect the switch manually",
+        ),
+        (
+            checker.LiveHTTPSVerificationError("timed out"),
+            "may already be active",
+        ),
+    ],
+)
+def test_renew_due_failure_class_continues_without_retry(
+    monkeypatch, capsys, exception, message
+):
+    switches = make_multi_switch_config()["switches"]
+    renewal_calls = []
+
+    monkeypatch.setattr(
+        checker, "get_switch_credentials", lambda switch, config_file: ("user", "pass")
+    )
+    monkeypatch.setattr(checker, "check_switch", lambda *args: "renewal_due")
+
+    def renew(switch, *args):
+        renewal_calls.append(switch["name"])
+        if switch["name"] == "SWITCH-A":
+            raise exception
+
+    monkeypatch.setattr(checker, "renew_certificate", renew)
+
+    result = checker.renew_due_certificates(
+        switches,
+        Path("config.toml"),
+        30,
+        make_csr_settings(),
+        make_opnsense_settings(),
+        Path("public-ca.pem"),
+    )
+
+    assert result == checker.EXIT_ERROR
+    assert renewal_calls == ["SWITCH-A", "SWITCH-B"]
+    captured = capsys.readouterr()
+    assert message in captured.err
+    assert "Renewed:             1" in captured.out
+    assert "Errors:              1" in captured.out
+
+
+def test_renew_due_unexpected_renewal_failure_is_sanitized_and_isolated(
+    monkeypatch, capsys
+):
+    switches = make_multi_switch_config()["switches"]
+    renewal_calls = []
+
+    monkeypatch.setattr(
+        checker, "get_switch_credentials", lambda switch, config_file: ("user", "pass")
+    )
+    monkeypatch.setattr(checker, "check_switch", lambda *args: "renewal_due")
+
+    def renew(switch, *args):
+        renewal_calls.append(switch["name"])
+        if switch["name"] == "SWITCH-A":
+            raise RuntimeError("synthetic unexpected failure")
+
+    monkeypatch.setattr(checker, "renew_certificate", renew)
+
+    result = checker.renew_due_certificates(
+        switches,
+        Path("config.toml"),
+        30,
+        make_csr_settings(),
+        make_opnsense_settings(),
+        Path("public-ca.pem"),
+    )
+
+    assert result == checker.EXIT_ERROR
+    assert renewal_calls == ["SWITCH-A", "SWITCH-B"]
+    captured = capsys.readouterr()
+    combined_output = captured.out + captured.err
+    assert "Unexpected renewal failure (RuntimeError)" in captured.err
+    assert "Renewal state may be uncertain" in captured.err
+    assert "No automatic retry, cleanup, or rollback was attempted" in captured.err
+    assert "synthetic unexpected failure" not in combined_output
+    assert "no pending CSR was created" not in combined_output
+    assert "no renewal change was attempted" not in combined_output
+    assert "installation did not begin" not in combined_output
+    assert "Renewal summary" in captured.out
+    assert "Renewed:             1" in captured.out
+    assert "Errors:              1" in captured.out
+
+
+def test_renew_due_renewal_keyboard_interrupt_propagates(monkeypatch):
+    switches = make_multi_switch_config()["switches"]
+    monkeypatch.setattr(
+        checker, "get_switch_credentials", lambda switch, config_file: ("user", "pass")
+    )
+    monkeypatch.setattr(checker, "check_switch", lambda *args: "renewal_due")
+    monkeypatch.setattr(
+        checker,
+        "renew_certificate",
+        lambda *args: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        checker.renew_due_certificates(
+            switches,
+            Path("config.toml"),
+            30,
+            make_csr_settings(),
+            make_opnsense_settings(),
+            Path("public-ca.pem"),
+        )
+
+
+def test_renew_due_monitor_exception_does_not_stop_later_switch(monkeypatch):
+    switches = make_multi_switch_config()["switches"]
+    renewed = []
+
+    monkeypatch.setattr(
+        checker, "get_switch_credentials", lambda switch, config_file: ("user", "pass")
+    )
+
+    def check(switch, *args):
+        if switch["name"] == "SWITCH-A":
+            raise OSError("SSH channel failed")
+        return "renewal_due"
+
+    monkeypatch.setattr(checker, "check_switch", check)
+    monkeypatch.setattr(
+        checker,
+        "renew_certificate",
+        lambda switch, *args: renewed.append(switch["name"]),
+    )
+
+    assert (
+        checker.renew_due_certificates(
+            switches,
+            Path("config.toml"),
+            30,
+            make_csr_settings(),
+            make_opnsense_settings(),
+            Path("public-ca.pem"),
+        )
+        == checker.EXIT_ERROR
+    )
+    assert renewed == ["SWITCH-B"]
+
+
+@pytest.mark.parametrize(
+    ("missing_section", "message"),
+    [
+        ("csr", r"\[csr\]"),
+        ("opnsense", r"\[opnsense\]"),
+        ("verification", r"\[verification\]"),
+    ],
+)
+def test_renew_due_validates_renewal_config_before_credentials(
+    monkeypatch, capsys, missing_section, message
+):
+    config = make_multi_switch_config()
+    del config[missing_section]
+    monkeypatch.setattr(checker.sys, "argv", ["aruba_cert_renewer.py", "--renew-due"])
+    monkeypatch.setattr(checker, "load_config", lambda config_file: config)
+    monkeypatch.setattr(
+        checker,
+        "get_switch_credentials",
+        lambda *args: pytest.fail("Credentials should not be requested"),
+    )
+
+    assert checker.main() == checker.EXIT_ERROR
+    assert re.search(message, capsys.readouterr().err)
+
+
+def test_renew_due_selected_switch_fails_before_credentials(monkeypatch):
+    monkeypatch.setattr(
+        checker.sys,
+        "argv",
+        ["aruba_cert_renewer.py", "--renew-due", "--switch", "UNKNOWN"],
+    )
+    monkeypatch.setattr(
+        checker, "load_config", lambda config_file: make_multi_switch_config()
+    )
+    monkeypatch.setattr(
+        checker,
+        "get_switch_credentials",
+        lambda *args: pytest.fail("Credentials should not be requested"),
+    )
+
+    assert checker.main() == checker.EXIT_ERROR
+
+
+@pytest.mark.parametrize(
+    ("switch_args", "expected_switch"),
+    [
+        ([], ["SWITCH-A", "SWITCH-B"]),
+        (["--switch", "SWITCH-B"], ["SWITCH-B"]),
+    ],
+)
+def test_renew_due_main_healthy_run_uses_selection_without_opnsense_contact(
+    monkeypatch, capsys, switch_args, expected_switch
+):
+    monkeypatch.setattr(
+        checker.sys,
+        "argv",
+        ["aruba_cert_renewer.py", "--renew-due", *switch_args],
+    )
+    monkeypatch.setattr(
+        checker, "load_config", lambda config_file: make_multi_switch_config()
+    )
+    monkeypatch.setattr(
+        checker,
+        "get_verification_ca_file",
+        lambda config, config_file: Path("public-ca.pem"),
+    )
+    monkeypatch.setattr(
+        checker,
+        "get_switch_credentials",
+        lambda switch, config_file: ("user", "password"),
+    )
+    checked = []
+    monkeypatch.setattr(
+        checker,
+        "check_switch",
+        lambda switch, *args: checked.append(switch["name"]) or "ok",
+    )
+    monkeypatch.setattr(
+        checker,
+        "renew_certificate",
+        lambda *args: pytest.fail("Healthy certificates must not be renewed"),
+    )
+    monkeypatch.setattr(
+        checker,
+        "OPNsenseClient",
+        lambda *args, **kwargs: pytest.fail("Healthy run must not contact OPNsense"),
+    )
+
+    assert checker.main() == checker.EXIT_OK
+    assert checked == expected_switch
+    assert f"Switches processed: {len(expected_switch)}" in capsys.readouterr().out
