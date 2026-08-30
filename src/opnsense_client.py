@@ -187,8 +187,8 @@ class OPNsenseClient:
         caref,
         digest,
         lifetime_days,
-        dns_name,
-        ip_address,
+        dns_names,
+        ip_addresses,
         description,
     ):
         response = self._request_json(
@@ -203,8 +203,8 @@ class OPNsenseClient:
                     "lifetime": lifetime_days,
                     "key_type": "2048",
                     "csr_payload": csr_pem,
-                    "altnames_dns": dns_name,
-                    "altnames_ip": ip_address,
+                    "altnames_dns": "\n".join(dns_names),
+                    "altnames_ip": "\n".join(ip_addresses),
                     "descr": description,
                 }
             },

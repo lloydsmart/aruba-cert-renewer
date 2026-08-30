@@ -92,7 +92,7 @@ After installation, a new TLS connection to the switch must verify all three of
 these properties before the operation succeeds:
 
 * The served certificate chains to the configured CA.
-* Normal hostname verification succeeds for the configured switch FQDN.
+* Normal hostname or IP verification succeeds for the configured switch host.
 * The served certificate is byte-for-byte the expected certificate in DER form.
 
 The configured CA file contains public certificate material only. It must be

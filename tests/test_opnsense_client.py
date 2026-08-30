@@ -165,8 +165,8 @@ def test_post_redirect_is_rejected_without_following_authorization(monkeypatch):
             caref=CA_REF,
             digest="sha256",
             lifetime_days=397,
-            dns_name="switch.example.com",
-            ip_address="192.0.2.10",
+            dns_names=["switch.example.com"],
+            ip_addresses=["192.0.2.10"],
             description="Aruba certificate",
         )
 
@@ -252,8 +252,8 @@ def test_sign_csr_sends_nested_model_payload(monkeypatch):
         caref=CA_REF,
         digest="sha256",
         lifetime_days=397,
-        dns_name="switch.example.com",
-        ip_address="192.0.2.10",
+        dns_names=["switch.example.com"],
+        ip_addresses=["192.0.2.10"],
         description="Aruba certificate",
     )
 
@@ -278,6 +278,47 @@ def test_sign_csr_sends_nested_model_payload(monkeypatch):
 
 
 @pytest.mark.parametrize(
+    ("dns_names", "ip_addresses", "expected_dns", "expected_ip"),
+    [
+        (["switch.example.com"], [], "switch.example.com", ""),
+        ([], ["192.0.2.10"], "", "192.0.2.10"),
+        ([], ["2001:db8::10"], "", "2001:db8::10"),
+        (
+            ["switch.example.com", "alias.example.com"],
+            ["192.0.2.10", "2001:db8::10"],
+            "switch.example.com\nalias.example.com",
+            "192.0.2.10\n2001:db8::10",
+        ),
+    ],
+)
+def test_sign_csr_serializes_typed_san_lists(
+    monkeypatch, dns_names, ip_addresses, expected_dns, expected_ip
+):
+    captured = {}
+
+    def fake_open_url(request, **kwargs):
+        captured["request"] = request
+        return json_response({"result": "saved", "uuid": CERTIFICATE_UUID})
+
+    monkeypatch.setattr(opnsense_client, "_open_url", fake_open_url)
+
+    opnsense_client.OPNsenseClient(BASE_URL).sign_csr(
+        "CSR",
+        caref=CA_REF,
+        digest="sha256",
+        lifetime_days=397,
+        dns_names=dns_names,
+        ip_addresses=ip_addresses,
+        description="Aruba certificate",
+    )
+
+    payload = json.loads(captured["request"].data)
+    assert set(payload) == {"cert"}
+    assert payload["cert"]["altnames_dns"] == expected_dns
+    assert payload["cert"]["altnames_ip"] == expected_ip
+
+
+@pytest.mark.parametrize(
     "response",
     [
         {"result": "failed", "uuid": CERTIFICATE_UUID},
@@ -299,8 +340,8 @@ def test_sign_csr_rejects_failed_or_invalid_uuid_response(monkeypatch, response)
             caref=CA_REF,
             digest="sha256",
             lifetime_days=397,
-            dns_name="switch.example.com",
-            ip_address="192.0.2.10",
+            dns_names=["switch.example.com"],
+            ip_addresses=["192.0.2.10"],
             description="Aruba certificate",
         )
 

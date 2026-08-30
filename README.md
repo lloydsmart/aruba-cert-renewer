@@ -41,7 +41,7 @@ There is one user-facing orchestration command:
 - OPNsense communication uses its HTTPS JSON Trust API through the standard
   Python library. TLS server-certificate verification is always enabled.
 - Post-install verification opens a new standard-library TLS connection to the
-  switch management IPv4 address, using the switch FQDN for hostname checking.
+  configured switch host and verifies that same DNS or IP identity.
 - `src/opnsense_client.py` contains only the narrowly scoped OPNsense HTTP/JSON
   interaction.
 
@@ -106,14 +106,28 @@ ca_file = "/etc/aruba-cert-renewer/internal-ca.crt.pem"
 
 [[switches]]
 name = "EXAMPLE-SWITCH"
-host = "192.0.2.10"
-fqdn = "switch.example.com"
+host = "switch.example.com"
+additional_sans = ["192.0.2.10"]
+username = "cert-renewer"
+password_file = "/run/secrets/aruba_example_switch_password"
 ```
 
 `opnsense.ca` is the CA's human-readable description, not its refid. The tool
-resolves it through `ca_list` and requires exactly one match. For signing,
-`switches.host` must be the switch management IPv4 address; it and
-`switches.fqdn` are explicitly requested as IP and DNS SANs.
+resolves it through `ca_list` and requires exactly one match.
+
+Each switch requires only `name` and `host`. The host may be a DNS hostname,
+IPv4 address, or IPv6 address. It is the SSH and live HTTPS connection target,
+the certificate Common Name, and the primary SAN; it is included automatically
+and does not need to be repeated in `additional_sans`. Optional
+`additional_sans` may mix DNS names, IPv4 addresses, and IPv6 addresses.
+Duplicate identities are removed without performing DNS resolution. The former
+`fqdn` field has been removed and is rejected with a migration error.
+
+The optional `username` and `password_file` fields select credentials for that
+switch. Literal `password` values are forbidden in TOML. Relative password-file
+paths are resolved relative to `config.toml`; absolute paths such as
+`/run/secrets/...` support anticipated container secret mounts, although Docker
+packaging is not implemented yet.
 
 `verification.ca_file` is the public PEM certificate for the CA that issued the
 switch HTTPS certificate. It is required by `--install-certificate` and
@@ -126,7 +140,11 @@ must never contain OPNsense API credentials.
 
 ## Credentials
 
-Aruba SSH credentials can be supplied interactively or through:
+Aruba SSH credentials are resolved independently for every switch. A configured
+`switches.username` takes precedence over `ARUBA_SSH_USERNAME`, followed by an
+interactive prompt. A configured `switches.password_file` takes precedence over
+`ARUBA_SSH_PASSWORD`, followed by a non-echoing interactive prompt. The
+environment variables therefore remain convenient global fallbacks:
 
 ```text
 ARUBA_SSH_USERNAME
@@ -264,7 +282,7 @@ This operation:
 1. Confirms that the named Aruba certificate is an existing pending Web CSR.
 2. Retrieves and validates it without generating or replacing anything.
 3. Resolves the configured OPNsense CA description.
-4. Requests a server certificate with explicit FQDN and management-IP SANs.
+4. Requests a server certificate with exactly the configured DNS and IP SANs.
 5. Retrieves only the public certificate.
 6. Validates the key, subject, CN, SANs, Basic Constraints, serverAuth EKU,
    validity period, signature strength, and RSA key size.
@@ -297,11 +315,12 @@ certificate without changing its TA profile. It does not issue `write memory`,
 save, reboot, delete, clear, or CSR-generation commands during installation.
 
 Live HTTPS verification is mandatory. The tool opens a new connection to the
-management IPv4 address on TCP/443 and uses the configured FQDN as
-`server_hostname`. Python's normal CA and hostname verification must succeed,
-and the live peer certificate's DER bytes must exactly match the supplied
-certificate. Transient connection, handshake, and old-certificate results are
-retried for a bounded window of about 30 seconds.
+configured `host` on TCP/443 and uses that same DNS name or IP address as
+`server_hostname`; `additional_sans` never change the endpoint. Python's normal
+CA and identity verification must succeed, and the live peer certificate's DER
+bytes must exactly match the supplied certificate. Transient connection,
+handshake, and old-certificate results are retried for a bounded window of about
+30 seconds.
 
 If an error occurs after installation is attempted, the certificate may already
 be active. In particular, a failed live HTTPS check returns exit code `2` and

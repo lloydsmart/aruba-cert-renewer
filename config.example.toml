@@ -21,5 +21,7 @@ ca_file = "/etc/aruba-cert-renewer/internal-ca.crt.pem"
 
 [[switches]]
 name = "EXAMPLE-SWITCH"
-host = "192.0.2.10"
-fqdn = "switch.example.com"
+host = "switch.example.com"
+additional_sans = ["192.0.2.10"]
+username = "cert-renewer"
+password_file = "/run/secrets/aruba_example_switch_password"

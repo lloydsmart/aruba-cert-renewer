@@ -42,6 +42,8 @@ EXIT_WARNING = 1
 EXIT_ERROR = 2
 
 MAX_CERTIFICATE_INPUT_BYTES = 64 * 1024
+MAX_PASSWORD_FILE_BYTES = 16 * 1024
+MAX_ADDITIONAL_SANS = 100
 HTTPS_VERIFICATION_WINDOW_SECONDS = 30
 HTTPS_RETRY_DELAY_SECONDS = 2
 HTTPS_SOCKET_TIMEOUT_SECONDS = 5
@@ -258,6 +260,63 @@ def load_config(config_file):
         ) from error
 
 
+def parse_identity(value, field_name="identity"):
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 253
+        or any(character.isspace() or ord(character) < 32 for character in value)
+    ):
+        raise ValueError(f"{field_name} contains unsupported characters")
+
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        # Colons indicate an IPv6 literal or host:port, while an all-numeric,
+        # dotted value is intended as IPv4. Neither may fall through and be
+        # accepted as a DNS hostname when malformed.
+        if ":" in value or re.fullmatch(r"[0-9.]+", value):
+            raise ValueError(f"{field_name} is not a valid IP address") from None
+
+        labels = value.split(".")
+        if "*" in value or any(
+            not re.fullmatch(
+                r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?",
+                label,
+            )
+            for label in labels
+        ):
+            raise ValueError(f"{field_name} is not a valid DNS hostname") from None
+
+        canonical = value.lower()
+        return {"kind": "dns", "value": canonical, "key": ("dns", canonical)}
+
+    kind = "ipv4" if address.version == 4 else "ipv6"
+    return {"kind": kind, "value": str(address), "key": ("ip", address)}
+
+
+def get_certificate_identities(switch):
+    identities = []
+    seen = set()
+    for value in [switch["host"], *switch.get("additional_sans", [])]:
+        identity = parse_identity(value, "switch identity")
+        if identity["key"] in seen:
+            continue
+        seen.add(identity["key"])
+        identities.append(identity)
+
+    host = identities[0]
+    return {
+        "common_name": host["value"],
+        "dns_names": [
+            identity["value"] for identity in identities if identity["kind"] == "dns"
+        ],
+        "ip_addresses": [
+            identity["value"] for identity in identities if identity["kind"] != "dns"
+        ],
+    }
+
+
 def validate_config(config):
     settings = config.get("settings", {})
     warning_days = settings.get("warning_days", 30)
@@ -273,12 +332,24 @@ def validate_config(config):
     if not isinstance(switches, list) or not switches:
         raise ValueError("At least one [[switches]] entry must be configured")
 
-    required_fields = ("name", "host", "fqdn")
+    required_fields = ("name", "host")
     seen_names = set()
 
     for index, switch in enumerate(switches, start=1):
         if not isinstance(switch, dict):
             raise ValueError(f"Switch entry {index} must be a TOML table")
+
+        if "fqdn" in switch:
+            raise ValueError(
+                "switches.fqdn is no longer supported; use host and optional "
+                "additional_sans"
+            )
+
+        if "password" in switch:
+            raise ValueError(
+                "switches.password is not supported; passwords must come from "
+                "password_file, ARUBA_SSH_PASSWORD, or interactive input"
+            )
 
         for field in required_fields:
             value = switch.get(field)
@@ -287,6 +358,48 @@ def validate_config(config):
                 raise ValueError(
                     f"Switch entry {index} must contain a non-empty '{field}'"
                 )
+
+        switch["host"] = parse_identity(
+            switch["host"],
+            f"Switch entry {index} host",
+        )["value"]
+
+        additional_sans = switch.get("additional_sans", [])
+        if not isinstance(additional_sans, list) or any(
+            not isinstance(value, str) for value in additional_sans
+        ):
+            raise ValueError(
+                f"Switch entry {index} additional_sans must be an array of strings"
+            )
+        if len(additional_sans) > MAX_ADDITIONAL_SANS:
+            raise ValueError(
+                f"Switch entry {index} additional_sans cannot contain more than "
+                f"{MAX_ADDITIONAL_SANS} entries"
+            )
+
+        switch["additional_sans"] = [
+            parse_identity(value, f"Switch entry {index} additional_sans item")["value"]
+            for value in additional_sans
+        ]
+
+        username = switch.get("username")
+        if username is not None:
+            validate_ssh_username(username, f"Switch entry {index} username")
+
+        password_file = switch.get("password_file")
+        if password_file is not None and (
+            not isinstance(password_file, str)
+            or not password_file
+            or not password_file.strip()
+            or "\x00" in password_file
+            or any(
+                ord(character) < 32 or ord(character) == 127
+                for character in password_file
+            )
+        ):
+            raise ValueError(
+                f"Switch entry {index} password_file must be a non-empty safe path"
+            )
 
         normalized_name = switch["name"].casefold()
 
@@ -314,15 +427,83 @@ def select_switches(switches, switch_name):
     return matches
 
 
-def get_credentials():
-    username = os.environ.get("ARUBA_SSH_USERNAME")
-    password = os.environ.get("ARUBA_SSH_PASSWORD")
+def validate_ssh_username(username, field_name="SSH username"):
+    if (
+        not isinstance(username, str)
+        or not username
+        or not username.strip()
+        or any(ord(character) < 32 or ord(character) == 127 for character in username)
+    ):
+        raise ValueError(f"{field_name} must be a non-empty string without controls")
+    return username
 
+
+def read_password_file(configured_path, config_file):
+    password_file = Path(configured_path)
+    if not password_file.is_absolute():
+        password_file = config_file.resolve().parent / password_file
+
+    try:
+        with password_file.open("rb") as file:
+            if not stat.S_ISREG(os.fstat(file.fileno()).st_mode):
+                raise ValueError(
+                    f"switches.password_file is not a regular file: {password_file}"
+                )
+            password_bytes = file.read(MAX_PASSWORD_FILE_BYTES + 1)
+    except FileNotFoundError:
+        raise ValueError(f"switches.password_file not found: {password_file}") from None
+    except IsADirectoryError:
+        raise ValueError(
+            f"switches.password_file is not a regular file: {password_file}"
+        ) from None
+    except OSError as error:
+        raise ValueError(
+            f"switches.password_file cannot be read: {password_file}: {error}"
+        ) from error
+
+    if len(password_bytes) > MAX_PASSWORD_FILE_BYTES:
+        raise ValueError(
+            f"switches.password_file exceeds {MAX_PASSWORD_FILE_BYTES} bytes: "
+            f"{password_file}"
+        )
+    if b"\x00" in password_bytes:
+        raise ValueError(f"switches.password_file contains NUL: {password_file}")
+
+    if password_bytes.endswith(b"\r\n"):
+        password_bytes = password_bytes[:-2]
+    elif password_bytes.endswith(b"\n"):
+        password_bytes = password_bytes[:-1]
+
+    if not password_bytes:
+        raise ValueError(f"switches.password_file is empty: {password_file}")
+    if b"\r" in password_bytes or b"\n" in password_bytes:
+        raise ValueError(
+            f"switches.password_file must contain exactly one line: {password_file}"
+        )
+
+    try:
+        return password_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError(
+            f"switches.password_file must contain valid UTF-8: {password_file}"
+        ) from None
+
+
+def get_switch_credentials(switch, config_file):
+    username = switch.get("username") or os.environ.get("ARUBA_SSH_USERNAME")
     if not username:
-        username = input("SSH username: ")
+        username = input(f"SSH username for {switch['name']}: ")
+    username = validate_ssh_username(username)
+
+    if "password_file" in switch:
+        password = read_password_file(switch["password_file"], config_file)
+    else:
+        password = os.environ.get("ARUBA_SSH_PASSWORD")
+        if not password:
+            password = getpass.getpass(f"SSH password for {switch['name']}: ")
 
     if not password:
-        password = getpass.getpass("SSH password: ")
+        raise ValueError(f"SSH password for {switch['name']} cannot be empty")
 
     return username, password
 
@@ -633,21 +814,6 @@ def validate_cli_identifier(value, field_name):
     return value
 
 
-def validate_fqdn(value):
-    if not isinstance(value, str) or len(value) > 253:
-        raise ValueError("switch FQDN contains unsupported characters")
-
-    labels = value.split(".")
-
-    if any(
-        not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label)
-        for label in labels
-    ):
-        raise ValueError("switch FQDN contains unsupported characters")
-
-    return value
-
-
 def quote_cli_subject_value(value):
     if any(character in value for character in ('"', "\r", "\n")):
         raise ValueError("CSR subject value contains unsupported characters")
@@ -668,7 +834,7 @@ def build_csr_command(switch, certificate_name, ta_profile, csr_settings):
         ta_profile,
         "TA profile",
     )
-    common_name = validate_fqdn(switch["fqdn"])
+    common_name = get_certificate_identities(switch)["common_name"]
 
     organization = quote_cli_subject_value(csr_settings["organization"])
     organizational_unit = quote_cli_subject_value(csr_settings["organizational_unit"])
@@ -775,7 +941,10 @@ def validate_csr_pem(csr_pem, switch, csr_settings):
     verify_csr_signature(csr, public_key)
 
     expected_subject = {
-        NameOID.COMMON_NAME: ("common name", switch["fqdn"]),
+        NameOID.COMMON_NAME: (
+            "common name",
+            get_certificate_identities(switch)["common_name"],
+        ),
         NameOID.ORGANIZATION_NAME: (
             "organization",
             csr_settings["organization"],
@@ -814,17 +983,7 @@ def validate_csr_pem(csr_pem, switch, csr_settings):
 
 
 def validate_switch_signing_identity(switch):
-    fqdn = validate_fqdn(switch["fqdn"])
-
-    try:
-        management_ip = ipaddress.IPv4Address(switch["host"])
-    except ipaddress.AddressValueError as error:
-        raise ValueError(
-            "switch host must be a management IPv4 address for certificate "
-            "signing or installation"
-        ) from error
-
-    return fqdn, management_ip
+    return get_certificate_identities(switch)
 
 
 def _require_extension(certificate, extension_oid, name):
@@ -891,10 +1050,12 @@ def validate_issued_certificate(
     if _public_key_bytes(certificate_key) != _public_key_bytes(csr_key):
         raise ValueError("Issued certificate public key does not match the CSR")
 
+    identities = get_certificate_identities(switch)
     common_names = certificate.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
-    if len(common_names) != 1 or common_names[0].value != switch["fqdn"]:
+    if len(common_names) != 1 or common_names[0].value != identities["common_name"]:
         raise ValueError(
-            f"Issued certificate CN must equal switch FQDN {switch['fqdn']!r}"
+            f"Issued certificate CN must equal switch host "
+            f"{identities['common_name']!r}"
         )
 
     if certificate.subject != csr.subject:
@@ -906,13 +1067,27 @@ def validate_issued_certificate(
         "Subject Alternative Name",
     )
     dns_names = subject_alt_name.get_values_for_type(x509.DNSName)
-    if switch["fqdn"].casefold() not in {name.casefold() for name in dns_names}:
-        raise ValueError("Issued certificate is missing the switch DNS SAN")
-
-    expected_ip = ipaddress.IPv4Address(switch["host"])
     ip_addresses = subject_alt_name.get_values_for_type(x509.IPAddress)
-    if expected_ip not in ip_addresses:
-        raise ValueError("Issued certificate is missing the switch IP SAN")
+    if any(
+        not isinstance(name, (x509.DNSName, x509.IPAddress))
+        for name in subject_alt_name
+    ):
+        raise ValueError("Issued certificate SAN contains an unsupported identity type")
+    expected_dns = {name.casefold() for name in identities["dns_names"]}
+    actual_dns = {name.casefold() for name in dns_names}
+    if actual_dns != expected_dns:
+        raise ValueError(
+            "Issued certificate DNS SAN set does not exactly match configured "
+            "identities"
+        )
+
+    expected_ips = {
+        ipaddress.ip_address(address) for address in identities["ip_addresses"]
+    }
+    if set(ip_addresses) != expected_ips:
+        raise ValueError(
+            "Issued certificate IP SAN set does not exactly match configured identities"
+        )
 
     basic_constraints = _require_extension(
         certificate,
@@ -1041,7 +1216,7 @@ def sign_pending_csr(
     csr_settings,
     opnsense_settings,
 ):
-    fqdn, management_ip = validate_switch_signing_identity(switch)
+    identities = validate_switch_signing_identity(switch)
     csr_pem = retrieve_csr(
         switch,
         username,
@@ -1058,9 +1233,11 @@ def sign_pending_csr(
         caref=caref,
         digest=opnsense_settings["digest"],
         lifetime_days=opnsense_settings["lifetime_days"],
-        dns_name=fqdn,
-        ip_address=str(management_ip),
-        description=f"Aruba Web certificate {certificate_name} for {fqdn}",
+        dns_names=identities["dns_names"],
+        ip_addresses=identities["ip_addresses"],
+        description=(
+            f"Aruba Web certificate {certificate_name} for {identities['common_name']}"
+        ),
     )
     certificate_pem = client.get_certificate(certificate_uuid)
     validate_issued_certificate(
@@ -1663,7 +1840,7 @@ def verify_live_https_certificate(
     retry_delay=HTTPS_RETRY_DELAY_SECONDS,
     socket_timeout=HTTPS_SOCKET_TIMEOUT_SECONDS,
 ):
-    fqdn, management_ip = validate_switch_signing_identity(switch)
+    host = validate_switch_signing_identity(switch)["common_name"]
     expected_der = expected_certificate.public_bytes(serialization.Encoding.DER)
     context = ssl.create_default_context(cafile=str(ca_file))
 
@@ -1677,12 +1854,12 @@ def verify_live_https_certificate(
         try:
             with (
                 socket.create_connection(
-                    (str(management_ip), 443),
+                    (host, 443),
                     timeout=socket_timeout,
                 ) as tcp_socket,
                 context.wrap_socket(
                     tcp_socket,
-                    server_hostname=fqdn,
+                    server_hostname=host,
                 ) as tls_socket,
             ):
                 peer_der = tls_socket.getpeercert(binary_form=True)
@@ -1713,8 +1890,7 @@ def check_switch(switch, username, password, warning_days):
     print()
     print(switch["name"])
     print("-" * len(switch["name"]))
-    print(f"Address:          {switch['host']}")
-    print(f"FQDN:             {switch['fqdn']}")
+    print(f"Host:             {switch['host']}")
 
     try:
         with ConnectHandler(**device) as connection:
@@ -1823,7 +1999,6 @@ def main():
             or args.renew
         ):
             csr_settings = get_csr_settings(config)
-            validate_fqdn(switches[0]["fqdn"])
 
         if args.sign_csr or args.install_certificate or args.renew:
             opnsense_settings = get_opnsense_settings(config)
@@ -1839,7 +2014,21 @@ def main():
         print(f"Error: {error}", file=sys.stderr)
         return EXIT_ERROR
 
-    username, password = get_credentials()
+    explicit_operation = any(
+        (
+            args.generate_csr,
+            args.retrieve_csr,
+            args.sign_csr,
+            args.install_certificate,
+            args.renew,
+        )
+    )
+    if explicit_operation:
+        try:
+            username, password = get_switch_credentials(switches[0], args.config)
+        except ValueError as error:
+            print(f"Error: {error}", file=sys.stderr)
+            return EXIT_ERROR
 
     if args.renew:
         switch = switches[0]
@@ -2038,9 +2227,21 @@ def main():
             print(f"Error: {error}", file=sys.stderr)
             return EXIT_ERROR
 
-    results = [
-        check_switch(switch, username, password, warning_days) for switch in switches
-    ]
+    results = []
+    for switch in switches:
+        try:
+            username, password = get_switch_credentials(switch, args.config)
+        except ValueError as error:
+            print()
+            print(switch["name"])
+            print("-" * len(switch["name"]))
+            print(f"Host:             {switch['host']}")
+            print("Status:           ERROR")
+            print(f"Reason:           {error}")
+            results.append("error")
+            continue
+
+        results.append(check_switch(switch, username, password, warning_days))
 
     print_summary(results)
 

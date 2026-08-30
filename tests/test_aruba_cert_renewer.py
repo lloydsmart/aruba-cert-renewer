@@ -35,8 +35,8 @@ def make_config():
         "switches": [
             {
                 "name": "EXAMPLE-SWITCH",
-                "host": "192.0.2.10",
-                "fqdn": "switch.example.com",
+                "host": "switch.example.com",
+                "additional_sans": ["192.0.2.10"],
             }
         ],
     }
@@ -209,9 +209,113 @@ def test_validate_config_rejects_invalid_warning_days(warning_days):
 
 def test_validate_config_rejects_missing_switch_field():
     config = make_config()
-    del config["switches"][0]["fqdn"]
+    del config["switches"][0]["host"]
 
-    with pytest.raises(ValueError, match="fqdn"):
+    with pytest.raises(ValueError, match="host"):
+        checker.validate_config(config)
+
+
+def test_validate_config_rejects_removed_fqdn_field():
+    config = make_config()
+    config["switches"][0]["fqdn"] = "old.example.com"
+
+    with pytest.raises(ValueError, match="fqdn is no longer supported"):
+        checker.validate_config(config)
+
+
+@pytest.mark.parametrize("host", ["switch.example.com", "192.0.2.10", "2001:db8::10"])
+def test_validate_config_accepts_dns_ipv4_and_ipv6_hosts(host):
+    config = make_config()
+    config["switches"][0] = {"name": "EXAMPLE-SWITCH", "host": host}
+
+    _, switches = checker.validate_config(config)
+
+    assert switches[0]["host"] == host
+    assert switches[0]["additional_sans"] == []
+
+
+def test_validate_config_accepts_optional_switch_fields():
+    config = make_config()
+    config["switches"][0].update(
+        username="cert-renewer",
+        password_file="secrets/switch-password",
+    )
+
+    _, switches = checker.validate_config(config)
+
+    assert switches[0]["username"] == "cert-renewer"
+    assert switches[0]["password_file"] == "secrets/switch-password"
+
+
+def test_validate_config_rejects_literal_password_without_exposing_it():
+    config = make_config()
+    config["switches"][0]["password"] = "never-print-this"
+
+    with pytest.raises(ValueError, match="password_file") as raised:
+        checker.validate_config(config)
+
+    assert "never-print-this" not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    "additional_sans",
+    ["alias.example.com", ["alias.example.com", 123]],
+)
+def test_validate_config_requires_additional_sans_array_of_strings(additional_sans):
+    config = make_config()
+    config["switches"][0]["additional_sans"] = additional_sans
+
+    with pytest.raises(ValueError, match="array of strings"):
+        checker.validate_config(config)
+
+
+@pytest.mark.parametrize(
+    "identity",
+    [
+        "https://switch.example.com",
+        "switch.example.com:443",
+        "[2001:db8::10]",
+        "*.example.com",
+        "bad_name.example.com",
+        "999.0.2.10",
+        "2001:db8::gg",
+        "switch.example.com/path",
+        "switch.example.com\nreload",
+        "",
+    ],
+)
+def test_validate_config_rejects_malformed_host(identity):
+    config = make_config()
+    config["switches"][0]["host"] = identity
+
+    with pytest.raises(ValueError, match="host"):
+        checker.validate_config(config)
+
+
+def test_validate_config_rejects_malformed_additional_san():
+    config = make_config()
+    config["switches"][0]["additional_sans"] = ["2001:db8::gg"]
+
+    with pytest.raises(ValueError, match="additional_sans"):
+        checker.validate_config(config)
+
+
+def test_validate_config_bounds_additional_sans():
+    config = make_config()
+    config["switches"][0]["additional_sans"] = [
+        f"alias-{index}.example.com" for index in range(checker.MAX_ADDITIONAL_SANS + 1)
+    ]
+
+    with pytest.raises(ValueError, match="cannot contain more"):
+        checker.validate_config(config)
+
+
+@pytest.mark.parametrize("username", ["", "   ", "user\nname", "user\x7fname"])
+def test_validate_config_rejects_invalid_username(username):
+    config = make_config()
+    config["switches"][0]["username"] = username
+
+    with pytest.raises(ValueError, match="username"):
         checker.validate_config(config)
 
 
@@ -221,7 +325,6 @@ def test_validate_config_rejects_duplicate_switch_names():
         {
             "name": "example-switch",
             "host": "192.0.2.11",
-            "fqdn": "switch2.example.com",
         }
     )
 
@@ -243,6 +346,156 @@ def test_select_switches_rejects_unknown_switch():
 
     with pytest.raises(ValueError, match="Switch not found"):
         checker.select_switches(switches, "DOES-NOT-EXIST")
+
+
+@pytest.mark.parametrize(
+    ("host", "dns_names", "ip_addresses"),
+    [
+        ("Switch.Example.COM", ["switch.example.com"], []),
+        ("192.0.2.10", [], ["192.0.2.10"]),
+        ("2001:0db8:0:0::10", [], ["2001:db8::10"]),
+    ],
+)
+def test_certificate_identities_classify_and_canonicalize_host(
+    host, dns_names, ip_addresses
+):
+    identities = checker.get_certificate_identities({"host": host})
+
+    assert identities == {
+        "common_name": dns_names[0] if dns_names else ip_addresses[0],
+        "dns_names": dns_names,
+        "ip_addresses": ip_addresses,
+    }
+
+
+def test_certificate_identities_mix_types_deduplicate_and_preserve_order():
+    identities = checker.get_certificate_identities(
+        {
+            "host": "Switch.Example.COM",
+            "additional_sans": [
+                "192.0.2.10",
+                "switch.example.com",
+                "alias.example.com",
+                "2001:0db8:0:0::10",
+                "2001:db8::10",
+            ],
+        }
+    )
+
+    assert identities == {
+        "common_name": "switch.example.com",
+        "dns_names": ["switch.example.com", "alias.example.com"],
+        "ip_addresses": ["192.0.2.10", "2001:db8::10"],
+    }
+
+
+def test_switch_credentials_prefer_switch_username_and_password_file(
+    monkeypatch, tmp_path
+):
+    config_file = tmp_path / "config.toml"
+    secret_file = tmp_path / "switch.secret"
+    secret_file.write_bytes(b"  switch password  \n")
+    monkeypatch.setenv("ARUBA_SSH_USERNAME", "global-user")
+    monkeypatch.setenv("ARUBA_SSH_PASSWORD", "global-password")
+
+    credentials = checker.get_switch_credentials(
+        {
+            "name": "EXAMPLE-SWITCH",
+            "host": "switch.example.com",
+            "username": "switch-user",
+            "password_file": "switch.secret",
+        },
+        config_file,
+    )
+
+    assert credentials == ("switch-user", "  switch password  ")
+
+
+def test_switch_credentials_use_global_environment_fallback(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARUBA_SSH_USERNAME", "global-user")
+    monkeypatch.setenv("ARUBA_SSH_PASSWORD", "global-password")
+
+    credentials = checker.get_switch_credentials(
+        {"name": "EXAMPLE-SWITCH", "host": "switch.example.com"},
+        tmp_path / "config.toml",
+    )
+
+    assert credentials == ("global-user", "global-password")
+
+
+def test_switch_credentials_use_identified_interactive_prompts(monkeypatch, tmp_path):
+    prompts = []
+    monkeypatch.delenv("ARUBA_SSH_USERNAME", raising=False)
+    monkeypatch.delenv("ARUBA_SSH_PASSWORD", raising=False)
+    monkeypatch.setattr(
+        "builtins.input", lambda prompt: prompts.append(prompt) or "prompt-user"
+    )
+    monkeypatch.setattr(
+        checker.getpass,
+        "getpass",
+        lambda prompt: prompts.append(prompt) or "prompt-password",
+    )
+
+    credentials = checker.get_switch_credentials(
+        {"name": "EXAMPLE-SWITCH", "host": "switch.example.com"},
+        tmp_path / "config.toml",
+    )
+
+    assert credentials == ("prompt-user", "prompt-password")
+    assert prompts == [
+        "SSH username for EXAMPLE-SWITCH: ",
+        "SSH password for EXAMPLE-SWITCH: ",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("contents", "expected"),
+    [
+        (b"password", "password"),
+        (b"password\n", "password"),
+        (b"password\r\n", "password"),
+        (b" password ", " password "),
+    ],
+)
+def test_read_password_file_accepts_one_bounded_line(tmp_path, contents, expected):
+    secret_file = tmp_path / "secret"
+    secret_file.write_bytes(contents)
+
+    assert (
+        checker.read_password_file(str(secret_file), tmp_path / "config.toml")
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("contents", "message"),
+    [
+        (b"", "empty"),
+        (b"one\ntwo", "exactly one line"),
+        (b"secret\x00value", "NUL"),
+        (b"secret-\xff-value", "valid UTF-8"),
+        (b"x" * (checker.MAX_PASSWORD_FILE_BYTES + 1), "exceeds"),
+    ],
+)
+def test_read_password_file_rejects_unsafe_content_without_exposure(
+    tmp_path, contents, message
+):
+    secret_file = tmp_path / "secret"
+    secret_file.write_bytes(contents)
+
+    with pytest.raises(ValueError, match=message) as raised:
+        checker.read_password_file(str(secret_file), tmp_path / "config.toml")
+
+    assert "secret" not in str(raised.value).replace(str(secret_file), "")
+    assert raised.value.__cause__ is None
+
+
+def test_read_password_file_rejects_missing_file_and_directory(tmp_path):
+    with pytest.raises(ValueError, match="not found"):
+        checker.read_password_file("missing", tmp_path / "config.toml")
+
+    with pytest.raises(ValueError, match="not a regular file"):
+        checker.read_password_file(str(tmp_path), tmp_path / "config.toml")
 
 
 @pytest.mark.parametrize(
@@ -346,6 +599,81 @@ def test_check_switch_rejects_pending_web_csr(monkeypatch):
     assert result == "error"
 
 
+def test_monitoring_resolves_credentials_for_each_switch(monkeypatch, tmp_path):
+    (tmp_path / "a.secret").write_text("password-a\n", encoding="utf-8")
+    (tmp_path / "b.secret").write_text("password-b\n", encoding="utf-8")
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(
+        """
+[[switches]]
+name = "SWITCH-A"
+host = "switch-a.example.com"
+username = "user-a"
+password_file = "a.secret"
+
+[[switches]]
+name = "SWITCH-B"
+host = "switch-b.example.com"
+username = "user-b"
+password_file = "b.secret"
+""".strip(),
+        encoding="utf-8",
+    )
+    calls = []
+    monkeypatch.setattr(
+        checker.sys, "argv", ["aruba_cert_renewer.py", "--config", str(config_file)]
+    )
+    monkeypatch.setattr(
+        checker,
+        "check_switch",
+        lambda switch, username, password, warning_days: (
+            calls.append((switch["name"], username, password)) or "ok"
+        ),
+    )
+
+    assert checker.main() == checker.EXIT_OK
+    assert calls == [
+        ("SWITCH-A", "user-a", "password-a"),
+        ("SWITCH-B", "user-b", "password-b"),
+    ]
+
+
+def test_monitoring_reports_one_switch_credential_failure_and_continues(
+    monkeypatch, tmp_path, capsys
+):
+    (tmp_path / "b.secret").write_text("password-b\n", encoding="utf-8")
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(
+        """
+[[switches]]
+name = "SWITCH-A"
+host = "switch-a.example.com"
+username = "user-a"
+password_file = "missing.secret"
+
+[[switches]]
+name = "SWITCH-B"
+host = "switch-b.example.com"
+username = "user-b"
+password_file = "b.secret"
+""".strip(),
+        encoding="utf-8",
+    )
+    calls = []
+    monkeypatch.setattr(
+        checker.sys, "argv", ["aruba_cert_renewer.py", "--config", str(config_file)]
+    )
+    monkeypatch.setattr(
+        checker,
+        "check_switch",
+        lambda switch, *args: calls.append(switch["name"]) or "ok",
+    )
+
+    assert checker.main() == checker.EXIT_ERROR
+    assert calls == ["SWITCH-B"]
+    assert "SWITCH-A" in capsys.readouterr().out
+
+
 def test_unknown_switch_fails_before_credentials(
     monkeypatch,
     tmp_path,
@@ -359,8 +687,8 @@ warning_days = 30
 
 [[switches]]
 name = "EXAMPLE-SWITCH"
-host = "192.0.2.10"
-fqdn = "switch.example.com"
+host = "switch.example.com"
+additional_sans = ["192.0.2.10"]
 """.strip(),
         encoding="utf-8",
     )
@@ -377,12 +705,12 @@ fqdn = "switch.example.com"
         ],
     )
 
-    def unexpected_credentials_request():
+    def unexpected_credentials_request(*args):
         pytest.fail("Credentials should not be requested")
 
     monkeypatch.setattr(
         checker,
-        "get_credentials",
+        "get_switch_credentials",
         unexpected_credentials_request,
     )
 
@@ -401,10 +729,12 @@ fqdn = "switch.example.com"
 def test_csr_operations_require_arguments_before_credentials(monkeypatch, argv):
     monkeypatch.setattr(checker.sys, "argv", argv)
 
-    def unexpected_credentials_request():
+    def unexpected_credentials_request(*args):
         pytest.fail("Credentials should not be requested")
 
-    monkeypatch.setattr(checker, "get_credentials", unexpected_credentials_request)
+    monkeypatch.setattr(
+        checker, "get_switch_credentials", unexpected_credentials_request
+    )
 
     assert checker.main() == checker.EXIT_ERROR
 
@@ -464,8 +794,8 @@ def test_mutually_exclusive_csr_operations_fail_before_credentials(monkeypatch):
     )
     monkeypatch.setattr(
         checker,
-        "get_credentials",
-        lambda: calls.append("credentials"),
+        "get_switch_credentials",
+        lambda *args: calls.append("credentials"),
     )
 
     assert checker.main() == checker.EXIT_ERROR
@@ -491,8 +821,8 @@ key_size = 2048
 
 [[switches]]
 name = "EXAMPLE-SWITCH"
-host = "192.0.2.10"
-fqdn = "switch.example.com"
+host = "switch.example.com"
+additional_sans = ["192.0.2.10"]
 """.strip(),
         encoding="utf-8",
     )
@@ -509,11 +839,17 @@ fqdn = "switch.example.com"
         str(output_file),
     ]
     csr_pem = make_test_csr()
+    credential_calls = []
     monkeypatch.setattr(checker.sys, "argv", argv)
-    monkeypatch.setattr(checker, "get_credentials", lambda: ("username", "password"))
+    monkeypatch.setattr(
+        checker,
+        "get_switch_credentials",
+        lambda *args: credential_calls.append(args) or ("username", "password"),
+    )
     monkeypatch.setattr(checker, "generate_csr", lambda *args, **kwargs: csr_pem)
 
     assert checker.main() == checker.EXIT_OK
+    assert len(credential_calls) == 1
     assert output_file.read_text(encoding="ascii") == csr_pem
 
 
@@ -533,8 +869,8 @@ key_size = 2048
 
 [[switches]]
 name = "EXAMPLE-SWITCH"
-host = "192.0.2.10"
-fqdn = "switch.example.com"
+host = "switch.example.com"
+additional_sans = ["192.0.2.10"]
 """.strip(),
         encoding="utf-8",
     )
@@ -555,7 +891,9 @@ fqdn = "switch.example.com"
         ],
     )
     csr_pem = make_test_csr()
-    monkeypatch.setattr(checker, "get_credentials", lambda: ("username", "password"))
+    monkeypatch.setattr(
+        checker, "get_switch_credentials", lambda *args: ("username", "password")
+    )
     monkeypatch.setattr(checker, "retrieve_csr", lambda *args, **kwargs: csr_pem)
 
     def unexpected_generation(*args, **kwargs):
@@ -592,8 +930,8 @@ def test_existing_csr_output_fails_before_credentials_or_ssh(
     )
     monkeypatch.setattr(
         checker,
-        "get_credentials",
-        lambda: calls.append("credentials"),
+        "get_switch_credentials",
+        lambda *args: calls.append("credentials"),
     )
     monkeypatch.setattr(
         checker,
@@ -626,8 +964,8 @@ key_size = 2048
 
 [[switches]]
 name = "EXAMPLE-SWITCH"
-host = "192.0.2.10"
-fqdn = "switch.example.com"
+host = "switch.example.com"
+additional_sans = ["192.0.2.10"]
 """.strip(),
         encoding="utf-8",
     )
@@ -646,10 +984,12 @@ fqdn = "switch.example.com"
         ],
     )
 
-    def unexpected_credentials_request():
+    def unexpected_credentials_request(*args):
         pytest.fail("Credentials should not be requested")
 
-    monkeypatch.setattr(checker, "get_credentials", unexpected_credentials_request)
+    monkeypatch.setattr(
+        checker, "get_switch_credentials", unexpected_credentials_request
+    )
 
     assert checker.main() == checker.EXIT_ERROR
 
@@ -847,6 +1187,20 @@ def test_build_csr_command():
     )
 
 
+@pytest.mark.parametrize("host", ["switch.example.com", "192.0.2.10", "2001:db8::10"])
+def test_build_csr_command_uses_host_as_common_name(host):
+    switch = {"name": "EXAMPLE-SWITCH", "host": host}
+
+    command = checker.build_csr_command(
+        switch,
+        "webcert2027",
+        "webprofile2026",
+        make_csr_settings(),
+    )
+
+    assert f"common-name {host} " in command
+
+
 @pytest.mark.parametrize(
     "certificate_name",
     [
@@ -883,20 +1237,20 @@ def test_build_csr_command_rejects_unsafe_ta_profile(ta_profile):
 
 
 @pytest.mark.parametrize(
-    "fqdn",
+    "host",
     [
         "switch.example.com; reload",
         "switch.example.com\nreload",
-        'bad"fqdn',
-        "bad_fqdn.example.com",
+        'bad"host',
+        "bad_host.example.com",
         "-switch.example.com",
     ],
 )
-def test_build_csr_command_rejects_unsafe_fqdn(fqdn):
+def test_build_csr_command_rejects_unsafe_host(host):
     switch = make_config()["switches"][0]
-    switch["fqdn"] = fqdn
+    switch["host"] = host
 
-    with pytest.raises(ValueError, match="switch FQDN"):
+    with pytest.raises(ValueError, match="switch identity"):
         checker.build_csr_command(
             switch,
             "webcert2027",
@@ -1457,7 +1811,7 @@ def make_test_identity_and_certificate(
     csr_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     csr_subject = x509.Name(
         [
-            x509.NameAttribute(NameOID.COMMON_NAME, "switch.example.com"),
+            x509.NameAttribute(NameOID.COMMON_NAME, common_name),
             x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Example Organization"),
             x509.NameAttribute(NameOID.ORGANIZATIONAL_UNIT_NAME, "Infrastructure"),
             x509.NameAttribute(NameOID.LOCALITY_NAME, "Example City"),
@@ -1580,12 +1934,13 @@ def test_get_opnsense_settings_rejects_credentials(field):
     assert "must-not-be-accepted" not in str(raised.value)
 
 
-def test_validate_switch_signing_identity_requires_ipv4():
+def test_validate_switch_signing_identity_accepts_dns_host():
     switch = make_config()["switches"][0]
     switch["host"] = "switch-management.example.com"
 
-    with pytest.raises(ValueError, match="management IPv4"):
-        checker.validate_switch_signing_identity(switch)
+    identities = checker.validate_switch_signing_identity(switch)
+
+    assert identities["common_name"] == "switch-management.example.com"
 
 
 def test_validate_issued_certificate():
@@ -1600,6 +1955,71 @@ def test_validate_issued_certificate():
     )
 
     assert certificate.public_key().key_size == 2048
+
+
+@pytest.mark.parametrize(
+    ("switch", "common_name", "dns_names", "ip_addresses"),
+    [
+        (
+            {"host": "switch.example.com"},
+            "switch.example.com",
+            ("SWITCH.EXAMPLE.COM",),
+            (),
+        ),
+        ({"host": "192.0.2.10"}, "192.0.2.10", (), ("192.0.2.10",)),
+        ({"host": "2001:db8::10"}, "2001:db8::10", (), ("2001:0db8::10",)),
+        (
+            {
+                "host": "switch.example.com",
+                "additional_sans": ["alias.example.com", "192.0.2.10", "2001:db8::10"],
+            },
+            "switch.example.com",
+            ("switch.example.com", "alias.example.com"),
+            ("192.0.2.10", "2001:0db8::10"),
+        ),
+    ],
+)
+def test_validate_issued_certificate_accepts_exact_configured_identity_sets(
+    switch, common_name, dns_names, ip_addresses
+):
+    _, csr, certificate_pem = make_test_identity_and_certificate(
+        common_name=common_name,
+        dns_names=dns_names,
+        ip_addresses=ip_addresses,
+    )
+
+    checker.validate_issued_certificate(
+        certificate_pem,
+        csr,
+        switch,
+        397,
+        now=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+
+
+@pytest.mark.parametrize(
+    ("dns_names", "ip_addresses", "message"),
+    [
+        (("switch.example.com", "extra.example.com"), ("192.0.2.10",), "DNS SAN"),
+        (("switch.example.com",), ("192.0.2.10", "192.0.2.11"), "IP SAN"),
+    ],
+)
+def test_validate_issued_certificate_rejects_unexpected_sans(
+    dns_names, ip_addresses, message
+):
+    _, csr, certificate_pem = make_test_identity_and_certificate(
+        dns_names=dns_names,
+        ip_addresses=ip_addresses,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        checker.validate_issued_certificate(
+            certificate_pem,
+            csr,
+            make_config()["switches"][0],
+            397,
+            now=datetime(2026, 1, 1, tzinfo=UTC),
+        )
 
 
 def test_validate_issued_certificate_contains_zero_aki_serial_warning():
@@ -1784,8 +2204,8 @@ def test_sign_csr_requires_arguments_before_credentials(monkeypatch, argv):
     monkeypatch.setattr(checker.sys, "argv", argv)
     monkeypatch.setattr(
         checker,
-        "get_credentials",
-        lambda: pytest.fail("Credentials should not be requested"),
+        "get_switch_credentials",
+        lambda *args: pytest.fail("Credentials should not be requested"),
     )
 
     assert checker.main() == checker.EXIT_ERROR
@@ -1839,8 +2259,8 @@ def test_sign_pending_csr_retrieves_existing_csr_and_never_generates(monkeypatch
     sign_call = next(
         call for call in calls if isinstance(call, tuple) and call[0] == "sign"
     )
-    assert sign_call[2]["dns_name"] == "switch.example.com"
-    assert sign_call[2]["ip_address"] == "192.0.2.10"
+    assert sign_call[2]["dns_names"] == ["switch.example.com"]
+    assert sign_call[2]["ip_addresses"] == ["192.0.2.10"]
 
 
 def signing_config_text():
@@ -1862,8 +2282,8 @@ digest = "sha256"
 
 [[switches]]
 name = "EXAMPLE-SWITCH"
-host = "192.0.2.10"
-fqdn = "switch.example.com"
+host = "switch.example.com"
+additional_sans = ["192.0.2.10"]
 """.strip()
 
 
@@ -1888,7 +2308,9 @@ def test_sign_csr_main_writes_validated_certificate(monkeypatch, tmp_path):
             str(output_file),
         ],
     )
-    monkeypatch.setattr(checker, "get_credentials", lambda: ("username", "password"))
+    monkeypatch.setattr(
+        checker, "get_switch_credentials", lambda *args: ("username", "password")
+    )
     monkeypatch.setattr(
         checker, "sign_pending_csr", lambda *args, **kwargs: certificate_pem
     )
@@ -1917,7 +2339,9 @@ def test_sign_csr_does_not_write_output_when_validation_fails(monkeypatch, tmp_p
             str(output_file),
         ],
     )
-    monkeypatch.setattr(checker, "get_credentials", lambda: ("username", "password"))
+    monkeypatch.setattr(
+        checker, "get_switch_credentials", lambda *args: ("username", "password")
+    )
     monkeypatch.setattr(
         checker,
         "sign_pending_csr",
@@ -1949,8 +2373,8 @@ def test_existing_certificate_output_is_not_overwritten(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(
         checker,
-        "get_credentials",
-        lambda: pytest.fail("Credentials should not be requested"),
+        "get_switch_credentials",
+        lambda *args: pytest.fail("Credentials should not be requested"),
     )
 
     assert checker.main() == checker.EXIT_ERROR
@@ -2105,8 +2529,8 @@ def test_invalid_install_config_fails_before_credentials(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(
         checker,
-        "get_credentials",
-        lambda: pytest.fail("Credentials should not be requested"),
+        "get_switch_credentials",
+        lambda *args: pytest.fail("Credentials should not be requested"),
     )
 
     assert checker.main() == checker.EXIT_ERROR
@@ -2143,8 +2567,8 @@ def test_malformed_certificate_input_fails_before_credentials(monkeypatch, tmp_p
     )
     monkeypatch.setattr(
         checker,
-        "get_credentials",
-        lambda: pytest.fail("Credentials should not be requested"),
+        "get_switch_credentials",
+        lambda *args: pytest.fail("Credentials should not be requested"),
     )
 
     assert checker.main() == checker.EXIT_ERROR
@@ -2566,7 +2990,9 @@ def test_context_exit_oserror_cannot_reach_main_pre_install_path(
         "get_verification_ca_file",
         lambda *args: tmp_path / "public-ca.pem",
     )
-    monkeypatch.setattr(checker, "get_credentials", lambda: ("username", "password"))
+    monkeypatch.setattr(
+        checker, "get_switch_credentials", lambda *args: ("username", "password")
+    )
     monkeypatch.setattr(
         checker.sys,
         "argv",
@@ -2675,10 +3101,38 @@ def test_verify_live_https_uses_verified_hostname_and_exact_der(monkeypatch):
     )
 
     assert context_calls == ["public-ca.pem"]
-    assert connection_calls == [(("192.0.2.10", 443), 5)]
+    assert connection_calls == [(("switch.example.com", 443), 5)]
     assert context.wrap_calls == [(tcp_socket, "switch.example.com")]
     assert context.check_hostname is True
     assert context.verify_mode == checker.ssl.CERT_REQUIRED
+
+
+@pytest.mark.parametrize("host", ["192.0.2.10", "2001:db8::10"])
+def test_verify_live_https_uses_ip_host_for_connection_and_identity(monkeypatch, host):
+    _, _, certificate_pem = make_test_identity_and_certificate()
+    certificate = x509.load_pem_x509_certificate(certificate_pem.encode("ascii"))
+    expected_der = certificate.public_bytes(serialization.Encoding.DER)
+    context = FakeVerifyingSSLContext([expected_der])
+    connection_calls = []
+    monkeypatch.setattr(
+        checker.ssl, "create_default_context", lambda *, cafile: context
+    )
+    monkeypatch.setattr(
+        checker.socket,
+        "create_connection",
+        lambda address, *, timeout: (
+            connection_calls.append((address, timeout)) or FakeTLSSocket()
+        ),
+    )
+
+    checker.verify_live_https_certificate(
+        {"host": host, "additional_sans": ["alias.example.com"]},
+        Path("public-ca.pem"),
+        certificate,
+    )
+
+    assert connection_calls == [((host, 443), 5)]
+    assert context.wrap_calls[0][1] == host
 
 
 def test_verify_live_https_retries_until_expected_certificate_appears(monkeypatch):
@@ -3191,8 +3645,8 @@ def test_renew_invalid_config_fails_before_credentials(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(
         checker,
-        "get_credentials",
-        lambda: pytest.fail("Credentials should not be requested"),
+        "get_switch_credentials",
+        lambda *args: pytest.fail("Credentials should not be requested"),
     )
 
     assert checker.main() == checker.EXIT_ERROR
@@ -3221,8 +3675,8 @@ def test_renew_verification_ca_is_validated_before_credentials(monkeypatch, tmp_
     )
     monkeypatch.setattr(
         checker,
-        "get_credentials",
-        lambda: calls.append("credentials") or ("username", "password"),
+        "get_switch_credentials",
+        lambda *args: calls.append("credentials") or ("username", "password"),
     )
     monkeypatch.setattr(
         checker,
@@ -3256,7 +3710,9 @@ def test_renew_https_failure_returns_error_with_post_install_warning(
         "get_verification_ca_file",
         lambda *args: Path("public-ca.pem"),
     )
-    monkeypatch.setattr(checker, "get_credentials", lambda: ("username", "password"))
+    monkeypatch.setattr(
+        checker, "get_switch_credentials", lambda *args: ("username", "password")
+    )
     monkeypatch.setattr(
         checker,
         "renew_certificate",
@@ -3297,7 +3753,9 @@ def test_renew_post_attempt_generation_oserror_never_claims_no_pending_csr(
         "get_verification_ca_file",
         lambda *args: Path("public-ca.pem"),
     )
-    monkeypatch.setattr(checker, "get_credentials", lambda: ("username", "password"))
+    monkeypatch.setattr(
+        checker, "get_switch_credentials", lambda *args: ("username", "password")
+    )
     monkeypatch.setattr(
         checker,
         "renewal_preflight",
