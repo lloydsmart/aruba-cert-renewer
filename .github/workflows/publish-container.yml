@@ -1,0 +1,138 @@
+name: Publish release container
+
+on:
+  release:
+    types:
+      - published
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    name: Test and publish release container
+    runs-on: ubuntu-latest
+    env:
+      CANDIDATE_IMAGE: aruba-cert-renewer:release-candidate
+      IMAGE_NAME: ghcr.io/lloydsmart/aruba-cert-renewer
+      IS_GITHUB_PRERELEASE: ${{ github.event.release.prerelease }}
+      RELEASE_TAG: ${{ github.event.release.tag_name }}
+
+    steps:
+      - name: Validate release tag
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tag_pattern='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$'
+          if [[ ! "$RELEASE_TAG" =~ $tag_pattern ]]; then
+            printf 'Invalid release tag: %s\n' "$RELEASE_TAG" >&2
+            printf '%s\n' 'Expected vMAJOR.MINOR.PATCH with an optional -SUFFIX; build metadata is not supported.' >&2
+            exit 1
+          fi
+
+          publish_latest=true
+          if [[ "$IS_GITHUB_PRERELEASE" == 'true' || "$RELEASE_TAG" == *-* ]]; then
+            publish_latest=false
+          fi
+          printf 'publish_latest=%s\n' "$publish_latest" >>"$GITHUB_OUTPUT"
+
+      - name: Checkout exact release tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve and validate release commit
+        id: commit
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          commit_sha=$(git rev-parse HEAD)
+          if [[ ! "$commit_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            printf 'Resolved release commit is not a full lowercase SHA: %s\n' "$commit_sha" >&2
+            exit 1
+          fi
+
+          if ! git show-ref --verify --quiet refs/remotes/origin/main; then
+            printf '%s\n' 'Remote main ref is unavailable; cannot validate the release commit.' >&2
+            exit 1
+          fi
+
+          if ! git merge-base --is-ancestor "$commit_sha" origin/main; then
+            printf 'Release commit %s is not part of main history.\n' "$commit_sha" >&2
+            printf '%s\n' 'Release commits must already belong to main before publication.' >&2
+            exit 1
+          fi
+
+          printf 'sha=%s\n' "$commit_sha" >>"$GITHUB_OUTPUT"
+
+      - name: Build and smoke-test release candidate
+        run: tests/container-smoke.sh "$CANDIDATE_IMAGE"
+
+      - name: Tag and verify tested image
+        env:
+          COMMIT_SHA: ${{ steps.commit.outputs.sha }}
+          PUBLISH_LATEST: ${{ steps.release.outputs.publish_latest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tested_image_id=$(docker image inspect --format '{{.Id}}' "$CANDIDATE_IMAGE")
+          if [[ ! "$tested_image_id" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            printf 'Unexpected tested image ID: %s\n' "$tested_image_id" >&2
+            exit 1
+          fi
+
+          release_references=(
+            "$IMAGE_NAME:$RELEASE_TAG"
+            "$IMAGE_NAME:sha-$COMMIT_SHA"
+          )
+          if [[ "$PUBLISH_LATEST" == 'true' ]]; then
+            release_references+=("$IMAGE_NAME:latest")
+          fi
+
+          for reference in "${release_references[@]}"; do
+            docker image tag "$tested_image_id" "$reference"
+          done
+
+          for reference in "${release_references[@]}"; do
+            tagged_image_id=$(docker image inspect --format '{{.Id}}' "$reference")
+            if [[ "$tagged_image_id" != "$tested_image_id" ]]; then
+              printf 'Image ID mismatch for %s: expected %s, got %s\n' \
+                "$reference" "$tested_image_id" "$tagged_image_id" >&2
+              exit 1
+            fi
+          done
+
+      - name: Log in to GHCR
+        id: login
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USERNAME: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io \
+            --username "$GHCR_USERNAME" \
+            --password-stdin
+
+      - name: Publish tested image
+        env:
+          COMMIT_SHA: ${{ steps.commit.outputs.sha }}
+          PUBLISH_LATEST: ${{ steps.release.outputs.publish_latest }}
+        run: |
+          set -euo pipefail
+
+          docker push "$IMAGE_NAME:$RELEASE_TAG"
+          docker push "$IMAGE_NAME:sha-$COMMIT_SHA"
+          if [[ "$PUBLISH_LATEST" == 'true' ]]; then
+            docker push "$IMAGE_NAME:latest"
+          fi
+
+      - name: Log out of GHCR
+        if: ${{ always() && steps.login.outcome != 'skipped' }}
+        run: docker logout ghcr.io

@@ -41,6 +41,17 @@ environment. These runtime controls reduce container privileges; they do not
 replace the application's credential, TLS, certificate, or device-level safety
 checks.
 
+## Container Publication
+
+Normal container CI has no package-write permission and never publishes an
+image. Only the GitHub Release publishing workflow receives `packages: write`,
+and it authenticates with the repository-scoped `GITHUB_TOKEN`, not a personal
+access token, after the exact release image passes the full smoke tests. The SHA
+tag provides an exact source-commit audit reference.
+
+Publication does not add real deployment configuration, CA material, or
+secrets to the image, and does not weaken the documented runtime hardening.
+
 ## Security-Sensitive Areas
 
 This project is intended to interact with network switches and certificate authority infrastructure. Security issues may

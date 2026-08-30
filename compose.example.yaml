@@ -1,8 +1,6 @@
 services:
   aruba-cert-renewer:
-    build:
-      context: .
-    image: aruba-cert-renewer:local
+    image: ghcr.io/lloydsmart/aruba-cert-renewer:latest
     restart: "no"
     read_only: true
     cap_drop:

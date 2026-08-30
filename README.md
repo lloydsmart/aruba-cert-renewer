@@ -89,6 +89,46 @@ Build the local image with:
 docker build -t aruba-cert-renewer:local .
 ```
 
+For a normal deployment, pull the most recently published stable release:
+
+```bash
+docker pull ghcr.io/lloydsmart/aruba-cert-renewer:latest
+```
+
+Container CI and container publishing are deliberately separate. During normal
+development, a relevant pull request or push to `main` builds the container,
+runs the full container smoke tests, and discards the local CI image. Nothing is
+published to GHCR, and pushes to `main` never update registry tags.
+
+Publishing a GitHub Release with a tag such as `v1.2.3` is the explicit
+promotion action; creating a Git tag alone does not publish an image. Release
+tags must have the form `vMAJOR.MINOR.PATCH`, optionally followed by a
+prerelease suffix such as `-rc.1`; build metadata using `+` is not supported.
+The release workflow checks out that exact tag, builds and smoke-tests its
+source independently of normal CI, and only then publishes the tested image. A
+successful stable release publishes:
+
+```text
+ghcr.io/lloydsmart/aruba-cert-renewer:vX.Y.Z
+ghcr.io/lloydsmart/aruba-cert-renewer:sha-<commit>
+ghcr.io/lloydsmart/aruba-cert-renewer:latest
+```
+
+The `vX.Y.Z` tag identifies the human release, the `sha-...` tag identifies its
+exact source commit for audit purposes, and `latest` identifies the newest
+successfully published stable release. A GitHub prerelease such as
+`v1.2.3-rc.1` publishes its version and SHA tags but does not move `latest`.
+
+The release workflow has not by itself demonstrated that a package is already
+available. Its first successful publication may create a GHCR package whose
+visibility must then be checked and, for the intended deployment, manually set
+to public in GitHub. The workflow does not administer package visibility and
+does not use a personal access token.
+
+Unraid is intended to consume `latest` once the package is public. Whether
+Unraid automatically pulls a changed image and recreates or restarts the
+container is a separate operational policy.
+
 The image runs as UID/GID `10001:10001`. A hardened, network-isolated help
 check requires no deployment files:
 
