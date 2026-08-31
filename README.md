@@ -5,6 +5,7 @@
 [![Actions lint](https://github.com/lloydsmart/aruba-cert-renewer/actions/workflows/lint-actions.yml/badge.svg)](https://github.com/lloydsmart/aruba-cert-renewer/actions/workflows/lint-actions.yml)
 [![Tests](https://github.com/lloydsmart/aruba-cert-renewer/actions/workflows/test-python.yml/badge.svg)](https://github.com/lloydsmart/aruba-cert-renewer/actions/workflows/test-python.yml)
 [![Container tests](https://github.com/lloydsmart/aruba-cert-renewer/actions/workflows/test-container.yml/badge.svg)](https://github.com/lloydsmart/aruba-cert-renewer/actions/workflows/test-container.yml)
+[![CodeQL](https://github.com/lloydsmart/aruba-cert-renewer/actions/workflows/github-code-scanning/codeql/badge.svg)](https://github.com/lloydsmart/aruba-cert-renewer/actions/workflows/github-code-scanning/codeql)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 
 Automates monitoring and staged renewal of HTTPS certificates on
