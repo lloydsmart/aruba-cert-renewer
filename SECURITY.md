@@ -53,6 +53,181 @@ tag provides an exact source-commit audit reference.
 Publication does not add real deployment configuration, CA material, or
 secrets to the image, and does not weaken the documented runtime hardening.
 
+## Repository and Release Protection
+
+Repository rulesets protect the integrity and provenance of the default branch
+and published release references. They prevent direct or destructive changes
+to `main`, require signed commits and CodeQL results for protected history, and
+make existing release tags immutable.
+
+The active `Protect main` branch ruleset has no bypass actors and targets
+`~DEFAULT_BRANCH`, currently `main`. It applies these rules:
+
+* `deletion`: deletion of `main` is prohibited.
+* `non_fast_forward`: force pushes and other non-fast-forward updates are
+  prohibited.
+* `required_signatures`: commits introduced into protected history must have
+  verified signatures.
+* `pull_request`: changes require a pull request. The allowed merge methods are
+  merge, squash, and rebase. The required approving review count is zero;
+  code-owner review, last-push approval, stale-review dismissal, and review
+  thread resolution are not required.
+* `code_scanning`: CodeQL security alerts at Medium or higher block the merge;
+  non-security alerts do not.
+
+GitHub may report
+`require_extra_approval_for_unattributed_changes: true` as managed/default
+behaviour. It has no practical effect while the required approving review
+count is zero and is not a repository policy requirement.
+
+The active `Protect release tags` tag ruleset has no bypass actors and targets
+`refs/tags/v*`. Its `update` rule prevents an existing matching tag from being
+moved to another commit, and its `deletion` rule prevents deletion. It has no
+creation restriction: new tags such as `v1.2.3` can be created, but once
+created, matching `v*` tags cannot be moved or deleted.
+
+The existing Python tests, Python lint, Actions lint, Markdown lint, and
+container tests intentionally retain their workflow `paths:` filters. Relevant
+CI runs on pull requests according to those filters; these jobs are not
+universal required merge gates or required status checks in the ruleset.
+CodeQL merge protection is enforced separately by the native `code_scanning`
+rule described above.
+
+There is no standing administrator or other bypass. An exceptional recovery
+that requires bypassing protection is a deliberate break-glass action:
+
+1. Explicitly edit or temporarily disable the relevant ruleset.
+2. Perform only the minimum necessary recovery.
+3. Document the reason and actions taken.
+4. Restore the ruleset immediately afterward.
+
+### Reconstructing and Verifying the Rulesets
+
+After a repository migration or accidental removal, an authorized maintainer
+can recreate the rulesets with the GitHub CLI. Confirm the target repository
+before issuing either POST request:
+
+```bash
+REPO="lloydsmart/aruba-cert-renewer"
+```
+
+Create `Protect main`:
+
+```bash
+gh api --method POST \
+  -H "X-GitHub-Api-Version: 2026-03-10" \
+  "repos/$REPO/rulesets" \
+  --input - <<'JSON'
+{
+  "name": "Protect main",
+  "target": "branch",
+  "enforcement": "active",
+  "bypass_actors": [],
+  "conditions": {
+    "ref_name": {
+      "include": [
+        "~DEFAULT_BRANCH"
+      ],
+      "exclude": []
+    }
+  },
+  "rules": [
+    {
+      "type": "deletion"
+    },
+    {
+      "type": "non_fast_forward"
+    },
+    {
+      "type": "required_signatures"
+    },
+    {
+      "type": "pull_request",
+      "parameters": {
+        "allowed_merge_methods": [
+          "merge",
+          "squash",
+          "rebase"
+        ],
+        "dismiss_stale_reviews_on_push": false,
+        "require_code_owner_review": false,
+        "require_last_push_approval": false,
+        "required_approving_review_count": 0,
+        "required_review_thread_resolution": false
+      }
+    },
+    {
+      "type": "code_scanning",
+      "parameters": {
+        "code_scanning_tools": [
+          {
+            "tool": "CodeQL",
+            "alerts_threshold": "none",
+            "security_alerts_threshold": "medium_or_higher"
+          }
+        ]
+      }
+    }
+  ]
+}
+JSON
+```
+
+Create `Protect release tags`:
+
+```bash
+gh api --method POST \
+  -H "X-GitHub-Api-Version: 2026-03-10" \
+  "repos/$REPO/rulesets" \
+  --input - <<'JSON'
+{
+  "name": "Protect release tags",
+  "target": "tag",
+  "enforcement": "active",
+  "bypass_actors": [],
+  "conditions": {
+    "ref_name": {
+      "include": [
+        "refs/tags/v*"
+      ],
+      "exclude": []
+    }
+  },
+  "rules": [
+    {
+      "type": "update",
+      "parameters": {
+        "update_allows_fetch_and_merge": false
+      }
+    },
+    {
+      "type": "deletion"
+    }
+  ]
+}
+JSON
+```
+
+List the recreated rulesets and inspect their IDs and configuration:
+
+```bash
+gh api \
+  -H "X-GitHub-Api-Version: 2026-03-10" \
+  "repos/$REPO/rulesets"
+```
+
+Verify the effective rules applying to `main`:
+
+```bash
+gh api \
+  -H "X-GitHub-Api-Version: 2026-03-10" \
+  "repos/$REPO/rules/branches/main"
+```
+
+The effective result for `main` must include `deletion`,
+`non_fast_forward`, `required_signatures`, `pull_request`, and
+`code_scanning`.
+
 ## Security-Sensitive Areas
 
 This project is intended to interact with network switches and certificate authority infrastructure. Security issues may
