@@ -24,6 +24,8 @@ Implemented:
   proof-of-possession signatures
 - Signing an existing CSR with an internal OPNsense CA
 - Strict validation and safe output of the issued public certificate
+- Pre-install cryptographic verification of issued certificates against the
+  configured CA bundle
 - Install-only activation of an already-issued certificate on a pending Aruba CSR
 - Mandatory post-install HTTPS chain, hostname, and exact-certificate verification
 - Explicit one-command renewal with collision-safe automatic certificate naming
@@ -308,9 +310,12 @@ switch. Literal `password` values are forbidden in TOML. Relative password-file
 paths are resolved relative to `config.toml`; absolute paths such as
 `/run/secrets/...` support container secret mounts.
 
-`verification.ca_file` is the public PEM certificate for the CA that issued the
-switch HTTPS certificate. It is required by `--install-certificate`, `--renew`,
-and `--renew-due`, and is loaded by Python's normal SSL trust machinery.
+`verification.ca_file` is a PEM bundle containing one or more public CA
+certificates trusted to issue switch HTTPS certificates. It is required by
+`--install-certificate`, `--renew`, and `--renew-due`. Before installation, the
+issued certificate is cryptographically path-validated against this bundle for
+the switch's configured host identity. After installation, the same file is
+loaded by Python's normal SSL trust machinery for live HTTPS verification.
 Relative paths are resolved relative to `config.toml`, not the process working
 directory. Do not put a CA private key or real infrastructure certificate in
 the repository.
@@ -603,9 +608,11 @@ python src/aruba_cert_renewer.py \
 
 The install stage reads one bounded ASCII PEM certificate, retrieves and
 validates the named pending CSR again, and validates the certificate against
-that CSR and the configured switch identity before entering configuration mode.
-It then requires the expected Aruba certificate-paste and replacement prompts;
-the replacement confirmation is never sent for an unexpected prompt.
+that CSR and the configured switch identity. It then cryptographically verifies
+the certificate's trust path against the complete `verification.ca_file` CA
+bundle before entering configuration mode. It requires the expected Aruba
+certificate-paste and replacement prompts; the replacement confirmation is
+never sent for an unexpected prompt.
 
 Installing a Web certificate replaces the switch's current Web certificate.
 The tool confirms that the named entry changed from `CSR` to an installed Web
@@ -619,6 +626,11 @@ CA and identity verification must succeed, and the live peer certificate's DER
 bytes must exactly match the supplied certificate. Transient connection,
 handshake, and old-certificate results are retried for a bounded window of about
 30 seconds.
+
+The pre-install check authenticates the certificate that is about to be sent to
+the switch. The post-install check remains a separate mandatory control because
+it authenticates the certificate the switch is actually serving and confirms
+that it exactly matches the installed certificate.
 
 If an error occurs after installation is attempted, the certificate may already
 be active. In particular, a failed live HTTPS check returns exit code `2` and

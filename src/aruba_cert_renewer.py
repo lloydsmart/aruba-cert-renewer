@@ -27,6 +27,7 @@ from cryptography.x509.oid import (
     NameOID,
     SignatureAlgorithmOID,
 )
+from cryptography.x509.verification import PolicyBuilder, Store, VerificationError
 from netmiko import ConnectHandler
 from netmiko.exceptions import (
     NetmikoAuthenticationException,
@@ -43,6 +44,7 @@ EXIT_WARNING = 1
 EXIT_ERROR = 2
 
 MAX_CERTIFICATE_INPUT_BYTES = 64 * 1024
+MAX_VERIFICATION_CA_FILE_BYTES = 1024 * 1024
 MAX_PASSWORD_FILE_BYTES = 16 * 1024
 MAX_ADDITIONAL_SANS = 100
 HTTPS_VERIFICATION_WINDOW_SECONDS = 30
@@ -1171,6 +1173,61 @@ def validate_issued_certificate(
     return certificate
 
 
+def verify_issued_certificate_trust(certificate, switch, verification_ca_file):
+    """Verify an issued server certificate against the configured CA bundle."""
+    with open_secure_file(
+        verification_ca_file,
+        source_name="verification.ca_file",
+    ) as ca_file:
+        ca_bytes = ca_file.read(MAX_VERIFICATION_CA_FILE_BYTES + 1)
+
+    if len(ca_bytes) > MAX_VERIFICATION_CA_FILE_BYTES:
+        raise ValueError(
+            "verification.ca_file exceeds "
+            f"{MAX_VERIFICATION_CA_FILE_BYTES} bytes: {verification_ca_file}"
+        )
+
+    if not ca_bytes:
+        raise ValueError(
+            "verification.ca_file does not contain any trusted certificates: "
+            f"{verification_ca_file}"
+        )
+
+    try:
+        trusted_certificates = x509.load_pem_x509_certificates(ca_bytes)
+    except ValueError as error:
+        raise ValueError(
+            "verification.ca_file does not contain valid PEM certificates: "
+            f"{verification_ca_file}"
+        ) from error
+
+    if not trusted_certificates:
+        raise ValueError(
+            "verification.ca_file does not contain any trusted certificates: "
+            f"{verification_ca_file}"
+        )
+
+    host_identity = parse_identity(switch["host"], "switch host")
+    if host_identity["kind"] == "dns":
+        expected_identity = x509.DNSName(host_identity["value"])
+    else:
+        expected_identity = x509.IPAddress(ipaddress.ip_address(host_identity["value"]))
+
+    verifier = (
+        PolicyBuilder()
+        .store(Store(trusted_certificates))
+        .build_server_verifier(expected_identity)
+    )
+
+    try:
+        verifier.verify(certificate, [])
+    except VerificationError as error:
+        raise ValueError(
+            "Issued certificate failed pre-install trust verification against "
+            f"verification.ca_file ({verification_ca_file}): {error}"
+        ) from error
+
+
 def read_certificate_input(certificate_input):
     try:
         with certificate_input.open("rb") as input_file:
@@ -1422,7 +1479,7 @@ def renew_certificate(
         ) from error
 
     print("Issued certificate validated.")
-    print("Installing signed certificate...")
+    print("Verifying issued certificate trust before installation...")
 
     try:
         certificate = install_pending_certificate(
@@ -1433,6 +1490,7 @@ def renew_certificate(
             certificate_pem,
             csr_settings,
             opnsense_settings["lifetime_days"],
+            verification_ca_file,
         )
     except CertificateInstallationAttemptError:
         raise
@@ -1791,6 +1849,7 @@ def install_pending_certificate(
     certificate_pem,
     csr_settings,
     lifetime_days,
+    verification_ca_file,
 ):
     certificate_name = validate_cli_identifier(
         certificate_name,
@@ -1822,6 +1881,11 @@ def install_pending_certificate(
                 csr,
                 switch,
                 lifetime_days,
+            )
+            verify_issued_certificate_trust(
+                certificate,
+                switch,
+                verification_ca_file,
             )
 
             install_signed_certificate(
@@ -2270,6 +2334,7 @@ def main():
                 certificate_pem,
                 csr_settings,
                 opnsense_settings["lifetime_days"],
+                verification_ca_file,
             )
 
         except CertificateInstallationAttemptError as error:
