@@ -222,15 +222,17 @@ password_file = "/run/secrets/aruba_example_switch_password"
 
 All bind-mounted source files needed at runtime must be readable by container
 UID `10001`, including `config.toml`, the dedicated `known_hosts` file, the
-public CA certificate, and credential or secret files. Credential files should
-also remain inaccessible to unrelated host users. For a typical root-managed
-deployment, set each source secret's ownership and mode before starting the
-container, for example:
+public CA certificate, and credential or secret files. The preferred
+root-managed credential-file ownership and mode are `root:10001` and `0440`:
 
 ```bash
-chown 10001:10001 secrets/opnsense_api_key
-chmod 0400 secrets/opnsense_api_key
+chown root:10001 secrets/opnsense_api_key
+chmod 0440 secrets/opnsense_api_key
 ```
+
+Alternatively, use owner `10001:10001` and mode `0400`. Apply the same pattern
+to the OPNsense key and secret and each Aruba password file. Keep all mounts
+read-only as shown in the Compose example.
 
 The Compose file is an example, not the final network deployment. A production
 network policy should allow only required outbound Aruba SSH (TCP/22), Aruba
@@ -315,6 +317,42 @@ the repository.
 
 `config.toml` is excluded from Git and should contain the real inventory. It
 must never contain OPNsense API credentials.
+
+### Security-Sensitive Local Files
+
+The application applies one fail-closed metadata policy to `config.toml`,
+`ssh.known_hosts_file`, `verification.ca_file`, every
+`switches.password_file`, and both OPNsense `*_FILE` credential sources. Each
+path must name a regular file whose owner UID is either root or the process's
+effective UID. Group-write and world-write permission bits are forbidden;
+owner-write and harmless read bits are allowed. The configured final path
+component must not be a symbolic link.
+
+For native execution, make the account running `aruba-cert-renewer` the owner
+and use mode `0600` for configuration and secrets:
+
+```bash
+chown "$(id -u):$(id -g)" config.toml secrets/aruba_switch_password
+chmod 0600 config.toml secrets/aruba_switch_password
+```
+
+Modes such as `0400`, `0440`, or `0640` are also accepted when ownership and
+actual read access satisfy the policy; public CA and `known_hosts` inputs can
+use these read-only/group-readable modes. A mode alone is not sufficient: for
+example, `0440` is rejected when an unrelated UID owns the file.
+
+The container runs as `10001:10001`. Use either owner `10001:10001` with mode
+`0400`, or preferably owner `root`, group `10001`, and mode `0440` where the
+host deployment model makes that convenient. Files must never be group- or
+world-writable. Read-only bind mounts remain required and complement rather
+than replace these application-level ownership, permission, regular-file, and
+symlink checks.
+
+The standard SSL and SSH libraries accept the CA and `known_hosts` inputs only
+as pathnames. The application validates each immediately before handing the
+path to those libraries, but cannot eliminate the final pathname-reopen race.
+Protect the containing deployment directories from modification by unrelated
+users as an additional operational control.
 
 ## SSH Host-Key Enrollment and Rotation
 

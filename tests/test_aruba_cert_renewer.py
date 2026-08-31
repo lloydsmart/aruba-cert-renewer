@@ -24,6 +24,7 @@ from netmiko.exceptions import (
 from paramiko.hostkeys import HostKeys
 
 import aruba_cert_renewer as checker
+from secure_file import SecureFileError
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 KNOWN_HOSTS_FILE = FIXTURES_DIR / "known_hosts"
@@ -47,6 +48,48 @@ def write_config_file(config_file, contents):
         '[ssh]\nknown_hosts_file = "known_hosts"\n\n' + contents,
         encoding="utf-8",
     )
+
+
+def test_load_config_accepts_secure_regular_file(tmp_path):
+    config_file = tmp_path / "config.toml"
+    config_file.write_text("[settings]\nwarning_days = 30\n", encoding="utf-8")
+    config_file.chmod(0o600)
+
+    assert checker.load_config(config_file) == {"settings": {"warning_days": 30}}
+
+
+@pytest.mark.parametrize(
+    ("mode", "message"),
+    [(0o620, "group-writable"), (0o602, "world-writable")],
+)
+def test_load_config_rejects_unsafe_write_permissions(tmp_path, mode, message):
+    config_file = tmp_path / "config.toml"
+    config_file.write_text("[settings]\nwarning_days = 30\n", encoding="utf-8")
+    config_file.chmod(mode)
+
+    with pytest.raises(ValueError, match=message):
+        checker.load_config(config_file)
+
+
+def test_load_config_rejects_symlink_and_non_regular_file(tmp_path):
+    target = tmp_path / "target.toml"
+    target.write_text("[settings]\nwarning_days = 30\n", encoding="utf-8")
+    link = tmp_path / "config.toml"
+    link.symlink_to(target)
+
+    with pytest.raises(ValueError, match="symbolic link"):
+        checker.load_config(link)
+    with pytest.raises(ValueError, match="not a regular file"):
+        checker.load_config(tmp_path)
+
+
+def test_load_config_still_reports_invalid_toml_after_metadata_validation(tmp_path):
+    config_file = tmp_path / "config.toml"
+    config_file.write_text("invalid = [", encoding="utf-8")
+    config_file.chmod(0o600)
+
+    with pytest.raises(ValueError, match="Invalid TOML in configuration file"):
+        checker.load_config(config_file)
 
 
 def make_config():
@@ -279,19 +322,45 @@ def test_validate_config_rejects_non_regular_known_hosts_file(tmp_path):
         checker.validate_config(config, tmp_path / "config.toml")
 
 
+@pytest.mark.parametrize(
+    ("mode", "message"),
+    [(0o620, "group-writable"), (0o602, "world-writable")],
+)
+def test_validate_config_rejects_writable_known_hosts_file(tmp_path, mode, message):
+    config = make_config()
+    known_hosts_file = tmp_path / "known_hosts"
+    known_hosts_file.write_text("switch.example.com ssh-rsa test\n", encoding="ascii")
+    known_hosts_file.chmod(mode)
+    config["ssh"]["known_hosts_file"] = str(known_hosts_file)
+
+    with pytest.raises(ValueError, match=message):
+        checker.validate_config(config, tmp_path / "config.toml")
+
+
+def test_validate_config_rejects_symlinked_known_hosts_file(tmp_path):
+    config = make_config()
+    target = tmp_path / "known_hosts.target"
+    target.write_text("switch.example.com ssh-rsa test\n", encoding="ascii")
+    link = tmp_path / "known_hosts"
+    link.symlink_to(target)
+    config["ssh"]["known_hosts_file"] = str(link)
+
+    with pytest.raises(ValueError, match="symbolic link"):
+        checker.validate_config(config, tmp_path / "config.toml")
+
+
 def test_validate_config_rejects_unreadable_known_hosts_file(monkeypatch, tmp_path):
     config = make_config()
     known_hosts_file = tmp_path / "known_hosts"
     known_hosts_file.write_text("switch.example.com ssh-rsa test\n", encoding="ascii")
     config["ssh"]["known_hosts_file"] = str(known_hosts_file)
-    original_open = Path.open
 
-    def deny_known_hosts_open(path, *args, **kwargs):
-        if path == known_hosts_file:
-            raise PermissionError("permission denied")
-        return original_open(path, *args, **kwargs)
+    def deny_known_hosts_open(*args, **kwargs):
+        raise SecureFileError(
+            f"ssh.known_hosts_file cannot be read: {known_hosts_file}"
+        )
 
-    monkeypatch.setattr(Path, "open", deny_known_hosts_open)
+    monkeypatch.setattr(checker, "open_secure_file", deny_known_hosts_open)
 
     with pytest.raises(ValueError, match="cannot be read"):
         checker.validate_config(config, tmp_path / "config.toml")
@@ -604,6 +673,31 @@ def test_read_password_file_rejects_missing_file_and_directory(tmp_path):
         checker.read_password_file(str(tmp_path), tmp_path / "config.toml")
 
 
+@pytest.mark.parametrize(
+    ("mode", "message"),
+    [(0o620, "group-writable"), (0o602, "world-writable")],
+)
+def test_read_password_file_rejects_unsafe_write_permissions(tmp_path, mode, message):
+    secret_file = tmp_path / "secret"
+    secret_file.write_bytes(b"credential-value")
+    secret_file.chmod(mode)
+
+    with pytest.raises(ValueError, match=message) as raised:
+        checker.read_password_file(str(secret_file), tmp_path / "config.toml")
+
+    assert "credential-value" not in str(raised.value)
+
+
+def test_read_password_file_rejects_symlink(tmp_path):
+    target = tmp_path / "target"
+    target.write_bytes(b"credential-value")
+    link = tmp_path / "secret"
+    link.symlink_to(target)
+
+    with pytest.raises(ValueError, match="symbolic link"):
+        checker.read_password_file(str(link), tmp_path / "config.toml")
+
+
 def test_device_parameters_require_dedicated_strict_known_hosts():
     switch = make_config()["switches"][0]
 
@@ -614,6 +708,17 @@ def test_device_parameters_require_dedicated_strict_known_hosts():
     assert device["system_host_keys"] is False
     assert device["alt_host_keys"] is True
     assert device["alt_key_file"] == str(KNOWN_HOSTS_FILE.resolve())
+
+
+def test_device_parameters_revalidate_known_hosts_before_path_reopen(tmp_path):
+    known_hosts_file = tmp_path / "known_hosts"
+    known_hosts_file.write_text("switch.example.com ssh-rsa test\n", encoding="ascii")
+    known_hosts_file.chmod(0o620)
+    switch = make_config()["switches"][0]
+    switch["_ssh_known_hosts_file"] = known_hosts_file
+
+    with pytest.raises(ValueError, match="group-writable"):
+        checker.get_device_parameters(switch, "username", "password")
 
 
 def test_unvalidated_switch_cannot_construct_device_parameters():
@@ -2795,6 +2900,37 @@ def test_get_verification_ca_file_rejects_missing_file(tmp_path):
         )
 
 
+@pytest.mark.parametrize(
+    ("mode", "message"),
+    [(0o620, "group-writable"), (0o602, "world-writable")],
+)
+def test_get_verification_ca_file_rejects_unsafe_write_permissions(
+    tmp_path, mode, message
+):
+    ca_file = tmp_path / "ca.pem"
+    ca_file.write_text("public CA placeholder", encoding="ascii")
+    ca_file.chmod(mode)
+
+    with pytest.raises(ValueError, match=message):
+        checker.get_verification_ca_file(
+            {"verification": {"ca_file": str(ca_file)}},
+            tmp_path / "config.toml",
+        )
+
+
+def test_get_verification_ca_file_rejects_symlink(tmp_path):
+    target = tmp_path / "ca.target.pem"
+    target.write_text("public CA placeholder", encoding="ascii")
+    link = tmp_path / "ca.pem"
+    link.symlink_to(target)
+
+    with pytest.raises(ValueError, match="symbolic link"):
+        checker.get_verification_ca_file(
+            {"verification": {"ca_file": str(link)}},
+            tmp_path / "config.toml",
+        )
+
+
 def test_invalid_install_config_fails_before_credentials(monkeypatch, tmp_path):
     config_file = tmp_path / "config.toml"
     certificate_file = tmp_path / "certificate.pem"
@@ -3363,7 +3499,17 @@ class FakeVerifyingSSLContext:
         return FakeTLSSocket(result)
 
 
-def test_verify_live_https_uses_verified_hostname_and_exact_der(monkeypatch):
+@pytest.fixture
+def secure_ca_file(tmp_path):
+    ca_file = tmp_path / "public-ca.pem"
+    ca_file.write_text("public CA placeholder", encoding="ascii")
+    ca_file.chmod(0o600)
+    return ca_file
+
+
+def test_verify_live_https_uses_verified_hostname_and_exact_der(
+    monkeypatch, secure_ca_file
+):
     _, _, certificate_pem = make_test_identity_and_certificate()
     certificate = x509.load_pem_x509_certificate(certificate_pem.encode("ascii"))
     expected_der = certificate.public_bytes(serialization.Encoding.DER)
@@ -3386,11 +3532,11 @@ def test_verify_live_https_uses_verified_hostname_and_exact_der(monkeypatch):
 
     checker.verify_live_https_certificate(
         make_config()["switches"][0],
-        Path("public-ca.pem"),
+        secure_ca_file,
         certificate,
     )
 
-    assert context_calls == ["public-ca.pem"]
+    assert context_calls == [str(secure_ca_file)]
     assert connection_calls == [(("switch.example.com", 443), 5)]
     assert context.wrap_calls == [(tcp_socket, "switch.example.com")]
     assert context.check_hostname is True
@@ -3398,7 +3544,9 @@ def test_verify_live_https_uses_verified_hostname_and_exact_der(monkeypatch):
 
 
 @pytest.mark.parametrize("host", ["192.0.2.10", "2001:db8::10"])
-def test_verify_live_https_uses_ip_host_for_connection_and_identity(monkeypatch, host):
+def test_verify_live_https_uses_ip_host_for_connection_and_identity(
+    monkeypatch, secure_ca_file, host
+):
     _, _, certificate_pem = make_test_identity_and_certificate()
     certificate = x509.load_pem_x509_certificate(certificate_pem.encode("ascii"))
     expected_der = certificate.public_bytes(serialization.Encoding.DER)
@@ -3417,7 +3565,7 @@ def test_verify_live_https_uses_ip_host_for_connection_and_identity(monkeypatch,
 
     checker.verify_live_https_certificate(
         {"host": host, "additional_sans": ["alias.example.com"]},
-        Path("public-ca.pem"),
+        secure_ca_file,
         certificate,
     )
 
@@ -3425,7 +3573,9 @@ def test_verify_live_https_uses_ip_host_for_connection_and_identity(monkeypatch,
     assert context.wrap_calls[0][1] == host
 
 
-def test_verify_live_https_retries_until_expected_certificate_appears(monkeypatch):
+def test_verify_live_https_retries_until_expected_certificate_appears(
+    monkeypatch, secure_ca_file
+):
     _, _, certificate_pem = make_test_identity_and_certificate()
     certificate = x509.load_pem_x509_certificate(certificate_pem.encode("ascii"))
     expected_der = certificate.public_bytes(serialization.Encoding.DER)
@@ -3448,7 +3598,7 @@ def test_verify_live_https_retries_until_expected_certificate_appears(monkeypatc
 
     checker.verify_live_https_certificate(
         make_config()["switches"][0],
-        Path("public-ca.pem"),
+        secure_ca_file,
         certificate,
         verification_window=30,
         retry_delay=2,
@@ -3466,7 +3616,7 @@ def test_verify_live_https_retries_until_expected_certificate_appears(monkeypatc
     ],
 )
 def test_verify_live_https_rejects_wrong_or_unverified_certificate(
-    monkeypatch, tls_result
+    monkeypatch, secure_ca_file, tls_result
 ):
     _, _, certificate_pem = make_test_identity_and_certificate()
     certificate = x509.load_pem_x509_certificate(certificate_pem.encode("ascii"))
@@ -3485,13 +3635,15 @@ def test_verify_live_https_rejects_wrong_or_unverified_certificate(
     with pytest.raises(ValueError, match="not verified"):
         checker.verify_live_https_certificate(
             make_config()["switches"][0],
-            Path("public-ca.pem"),
+            secure_ca_file,
             certificate,
             verification_window=0,
         )
 
 
-def test_verify_live_https_retries_transient_connection_failure(monkeypatch):
+def test_verify_live_https_retries_transient_connection_failure(
+    monkeypatch, secure_ca_file
+):
     _, _, certificate_pem = make_test_identity_and_certificate()
     certificate = x509.load_pem_x509_certificate(certificate_pem.encode("ascii"))
     expected_der = certificate.public_bytes(serialization.Encoding.DER)
@@ -3514,9 +3666,29 @@ def test_verify_live_https_retries_transient_connection_failure(monkeypatch):
 
     checker.verify_live_https_certificate(
         make_config()["switches"][0],
-        Path("public-ca.pem"),
+        secure_ca_file,
         certificate,
     )
+
+
+def test_verify_live_https_revalidates_ca_before_ssl_path_reopen(monkeypatch, tmp_path):
+    _, _, certificate_pem = make_test_identity_and_certificate()
+    certificate = x509.load_pem_x509_certificate(certificate_pem.encode("ascii"))
+    ca_file = tmp_path / "public-ca.pem"
+    ca_file.write_text("public CA placeholder", encoding="ascii")
+    ca_file.chmod(0o620)
+    monkeypatch.setattr(
+        checker.ssl,
+        "create_default_context",
+        lambda **kwargs: pytest.fail("Unsafe CA path must not reach SSL"),
+    )
+
+    with pytest.raises(ValueError, match="group-writable"):
+        checker.verify_live_https_certificate(
+            make_config()["switches"][0],
+            ca_file,
+            certificate,
+        )
 
 
 def make_renew_args(**overrides):

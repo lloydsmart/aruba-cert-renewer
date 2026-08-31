@@ -9,6 +9,7 @@ from urllib.response import addinfourl
 import pytest
 
 import opnsense_client
+from secure_file import SecureFileError
 
 BASE_URL = "https://opnsense.example.com:8443"
 CA_REF = "0123456789abc"
@@ -426,14 +427,58 @@ def test_secret_file_rejects_directory(monkeypatch, tmp_path, file_name):
 @pytest.mark.parametrize(
     "file_name", ["OPNSENSE_API_KEY_FILE", "OPNSENSE_API_SECRET_FILE"]
 )
+@pytest.mark.parametrize(
+    ("mode", "message"),
+    [(0o620, "group-writable"), (0o602, "world-writable")],
+)
+def test_secret_file_rejects_unsafe_write_permissions(
+    monkeypatch, tmp_path, file_name, mode, message
+):
+    secret_file = tmp_path / "credential"
+    secret_file.write_bytes(b"super-secret-credential")
+    secret_file.chmod(mode)
+    monkeypatch.setenv(file_name, str(secret_file))
+
+    with pytest.raises(opnsense_client.OPNsenseAPIError, match=message) as raised:
+        opnsense_client.OPNsenseClient(BASE_URL)
+
+    assert "super-secret-credential" not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    "file_name", ["OPNSENSE_API_KEY_FILE", "OPNSENSE_API_SECRET_FILE"]
+)
+def test_secret_file_rejects_symlink_without_exposing_path(
+    monkeypatch, tmp_path, file_name
+):
+    target = tmp_path / "super-secret-target"
+    target.write_bytes(b"credential")
+    link = tmp_path / "super-secret-link"
+    link.symlink_to(target)
+    monkeypatch.setenv(file_name, str(link))
+
+    with pytest.raises(
+        opnsense_client.OPNsenseAPIError,
+        match=rf"{file_name} is a symbolic link",
+    ) as raised:
+        opnsense_client.OPNsenseClient(BASE_URL)
+
+    assert "super-secret-link" not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    "file_name", ["OPNSENSE_API_KEY_FILE", "OPNSENSE_API_SECRET_FILE"]
+)
 def test_secret_file_rejects_non_regular_opened_file(monkeypatch, tmp_path, file_name):
     secret_file = tmp_path / "credential"
     secret_file.write_bytes(b"secret")
     monkeypatch.setenv(file_name, str(secret_file))
     monkeypatch.setattr(
-        opnsense_client.os,
-        "fstat",
-        lambda file_descriptor: type("StatResult", (), {"st_mode": 0})(),
+        opnsense_client,
+        "open_secure_file",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            SecureFileError(f"{file_name} is not a regular file")
+        ),
     )
 
     with pytest.raises(
@@ -452,9 +497,9 @@ def test_unreadable_secret_file_does_not_expose_underlying_error(
     monkeypatch.setenv(file_name, str(tmp_path / "credential"))
 
     def fail_open(*args, **kwargs):
-        raise PermissionError("super-secret-api-secret")
+        raise SecureFileError(f"{file_name} could not be read")
 
-    monkeypatch.setattr(opnsense_client, "open", fail_open, raising=False)
+    monkeypatch.setattr(opnsense_client, "open_secure_file", fail_open)
 
     with pytest.raises(
         opnsense_client.OPNsenseAPIError,

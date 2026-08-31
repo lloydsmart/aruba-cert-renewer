@@ -42,6 +42,44 @@ environment. These runtime controls reduce container privileges; they do not
 replace the application's credential, SSH host-key, TLS, certificate, or
 device-level safety checks.
 
+## Local Security-Sensitive File Integrity
+
+The application validates `config.toml`, the dedicated SSH `known_hosts` file,
+the public verification CA file, Aruba password files, and OPNsense `*_FILE`
+credentials through a shared fail-closed opener. The final path component must
+not be a symbolic link, the opened descriptor must identify a regular file,
+and the owner UID must be either root or the process effective UID. Files that
+are group-writable or world-writable are rejected. Owner-write and additional
+read bits are allowed when ownership and actual read access are appropriate.
+
+For native execution, owner `the invoking account` and mode `0600` are the
+recommended settings for configuration and secrets. Read-only modes such as
+`0400` and group-readable modes such as `0440` or `0640` are accepted for
+configuration and public trust inputs when the owner remains root or the
+effective UID and no group/other write bit is present. Mode `0440` alone does
+not establish trust when an unrelated UID owns the file.
+
+The container runs as UID/GID `10001:10001`. Credential files should use one
+of these concrete patterns:
+
+* owner `10001:10001`, mode `0400`; or
+* preferably owner `root:10001`, mode `0440` where host management permits it.
+
+The same trusted-owner/no-group-or-other-write policy applies to mounted
+configuration and trust files. All mounts should remain read-only. Mount
+read-only status complements the application's metadata validation and does
+not replace it.
+
+Where supported, the opener uses `O_NOFOLLOW` and validates metadata from the
+opened descriptor with `fstat`. Its portable fallback rejects a pre-open
+symlink and compares pre-open, post-open, and descriptor identities before
+reading. Parent-directory symlinks remain supported; only the configured final
+component is rejected. The SSL and SSH libraries subsequently reopen CA and
+`known_hosts` files by pathname, so the application revalidates immediately
+before each handoff but cannot eliminate that final library-level pathname
+race. Deployment directories must therefore be protected from unrelated
+writers.
+
 ## Container Publication
 
 Normal container CI has no package-write permission and never publishes an
