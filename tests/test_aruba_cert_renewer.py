@@ -32,9 +32,10 @@ KNOWN_HOSTS_FILE = FIXTURES_DIR / "known_hosts"
 def test_known_hosts_fixture_is_valid_openssh():
     host_keys = HostKeys()
     host_keys.load(str(KNOWN_HOSTS_FILE))
+    switch_keys = host_keys.lookup("switch.example.com")
 
-    assert "switch.example.com" in host_keys
-    assert "ssh-rsa" in host_keys["switch.example.com"]
+    assert switch_keys is not None
+    assert switch_keys["ssh-rsa"].get_name() == "ssh-rsa"
 
 
 def write_config_file(config_file, contents):
