@@ -8,6 +8,8 @@ on:
 permissions:
   contents: read
   packages: write
+  attestations: write
+  id-token: write
 
 jobs:
   publish:
@@ -74,7 +76,20 @@ jobs:
       - name: Build and smoke-test release candidate
         run: tests/container-smoke.sh "$CANDIDATE_IMAGE"
 
+      - name: Generate release SPDX JSON SBOM
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        with:
+          image: ${{ env.CANDIDATE_IMAGE }}
+          format: spdx-json
+          output-file: release-sbom.spdx.json
+          artifact-name: aruba-cert-renewer-${{ env.RELEASE_TAG }}-sbom.spdx.json
+          syft-version: v1.51.1
+          dependency-snapshot: false
+          upload-artifact: true
+          upload-release-assets: false
+
       - name: Tag and verify tested image
+        id: candidate
         env:
           COMMIT_SHA: ${{ steps.commit.outputs.sha }}
           PUBLISH_LATEST: ${{ steps.release.outputs.publish_latest }}
@@ -109,6 +124,8 @@ jobs:
             fi
           done
 
+          printf 'image_id=%s\n' "$tested_image_id" >>"$GITHUB_OUTPUT"
+
       - name: Log in to GHCR
         id: login
         env:
@@ -132,6 +149,56 @@ jobs:
           if [[ "$PUBLISH_LATEST" == 'true' ]]; then
             docker push "$IMAGE_NAME:latest"
           fi
+
+      - name: Resolve published image digest
+        id: published
+        env:
+          TESTED_IMAGE_ID: ${{ steps.candidate.outputs.image_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          published_manifest=$(docker buildx imagetools inspect \
+            "$IMAGE_NAME:$RELEASE_TAG" \
+            --format '{{.Manifest}}')
+          published_digest=$(awk '$1 == "Digest:" { print $2; exit }' \
+            <<<"$published_manifest")
+
+          if [[ ! "$published_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            printf 'Unexpected published image digest: %s\n' "$published_digest" >&2
+            exit 1
+          fi
+
+          docker buildx imagetools inspect \
+            "$IMAGE_NAME@$published_digest" >/dev/null
+
+          docker pull "$IMAGE_NAME@$published_digest" >/dev/null
+          published_image_id=$(docker image inspect --format '{{.Id}}' \
+            "$IMAGE_NAME@$published_digest")
+          if [[ "$published_image_id" != "$TESTED_IMAGE_ID" ]]; then
+            printf 'Published image ID mismatch: expected %s, got %s\n' \
+              "$TESTED_IMAGE_ID" "$published_image_id" >&2
+            exit 1
+          fi
+
+          printf 'digest=%s\n' "$published_digest" >>"$GITHUB_OUTPUT"
+
+      - name: Attest build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.published.outputs.digest }}
+          push-to-registry: true
+          create-storage-record: false
+
+      - name: Attest release SBOM
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.published.outputs.digest }}
+          sbom-path: release-sbom.spdx.json
+          push-to-registry: true
+          create-storage-record: false
 
       - name: Log out of GHCR
         if: ${{ always() && steps.login.outcome != 'skipped' }}

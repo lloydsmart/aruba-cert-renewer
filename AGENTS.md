@@ -155,7 +155,8 @@ and container impact.
 Install development dependencies with:
 
 ```bash
-python -m pip install -r requirements-dev.txt
+python -m pip install --require-hashes -r requirements.txt
+python -m pip install --require-hashes -r requirements-dev.txt
 ```
 
 For Python changes, run:

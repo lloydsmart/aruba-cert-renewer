@@ -69,12 +69,35 @@ The OPNsense client is restricted to these routes:
 Install the development dependencies in a virtual environment:
 
 ```bash
-python3 -m venv .venv
+python3.12 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements-dev.txt
+python -m pip install --require-hashes -r requirements.txt
+python -m pip install --require-hashes -r requirements-dev.txt
 ```
 
 No additional HTTP runtime dependency is needed.
+
+Direct dependencies are maintained in `requirements.in`,
+`requirements-dev.in`, and `requirements-tools.in`. Their corresponding
+`.txt` files are generated locks containing exact transitive versions and
+package hashes. The development lock is compiled with the runtime lock as a
+constraint and is installed alongside it.
+
+To regenerate the locks, create a clean Python 3.12 environment and install the
+pinned lock-generation tools from their own lock:
+
+```bash
+python3.12 -m venv .venv-locks
+source .venv-locks/bin/activate
+python -m pip install --require-hashes -r requirements-tools.txt
+./scripts/compile-requirements.sh
+git diff -- requirements.txt requirements-dev.txt requirements-tools.txt
+```
+
+A normal compilation preserves existing resolved versions and is suitable for
+checking lock freshness. For an intentional full dependency refresh, run
+`./scripts/compile-requirements.sh --upgrade`. Review all input and generated
+lock changes before committing them.
 
 ## Docker
 

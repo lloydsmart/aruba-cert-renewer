@@ -48,10 +48,54 @@ Normal container CI has no package-write permission and never publishes an
 image. Only the GitHub Release publishing workflow receives `packages: write`,
 and it authenticates with the repository-scoped `GITHUB_TOKEN`, not a personal
 access token, after the exact release image passes the full smoke tests. The SHA
-tag provides an exact source-commit audit reference.
+tag provides an exact source-commit audit reference. The release workflow also
+has only the additional `attestations: write` and `id-token: write` permissions
+needed to create attestations; it does not receive `contents: write` or
+artifact-metadata write access.
 
 Publication does not add real deployment configuration, CA material, or
 secrets to the image, and does not weaken the documented runtime hardening.
+
+## Container Build Supply Chain
+
+Container build inputs are immutable and reconstructable from each source
+commit. The Python base image uses a readable exact patch-level tag together
+with an immutable multi-platform OCI index digest. Runtime, development, and
+lock-generation dependencies are completely version-locked with SHA-256
+package hashes. Every committed lock is installed with pip hash verification.
+
+Human-maintained dependency inputs are separate from generated locks. The
+runtime input contains direct application dependencies, the development input
+contains only development tools and is compiled against the runtime lock, and
+the tools input pins both pip and pip-tools. The lock-compilation script requires
+Python 3.12 and those exact tool versions, suppresses environment-derived index
+configuration in generated output, preserves resolved versions normally, and
+supports an explicit full refresh. CI regenerates all locks with the pinned
+tools and fails if they change. Weekly Dependabot updates cover pip, Docker, and
+GitHub Actions inputs.
+
+Each release generates an SPDX JSON SBOM from the exact local image that already
+passed the container smoke tests. The workflow retains the SBOM as a
+release-specific workflow artifact, tags and publishes that same local image,
+resolves and validates its registry OCI manifest digest, and publishes both build
+provenance and SBOM attestations for the digest to GitHub and GHCR. It does not
+perform a second image build or automatically upload the SBOM as a GitHub
+Release asset. Attestation failure after publication fails visibly and does not
+trigger destructive rollback.
+
+To reconstruct and audit the immutable inputs associated with a source commit
+or release tag, check out that exact revision, inspect the digest-pinned `FROM`
+line and the three dependency inputs, install `requirements-tools.txt` in a
+clean Python 3.12 environment with `--require-hashes`, run
+`./scripts/compile-requirements.sh`, and require no lockfile diff. Then run
+`tests/container-smoke.sh` to build and verify the image from those inputs. For
+a published release, compare the source-SHA tag and published OCI digest with
+the workflow's SPDX artifact and provenance/SBOM attestations.
+
+These controls make build inputs immutable, reproducible, and auditable. They
+do not claim that independent Docker builds on different architectures,
+engines, filesystem implementations, or timestamps produce a byte-for-byte
+identical final image digest.
 
 ## Repository and Release Protection
 

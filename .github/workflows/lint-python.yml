@@ -7,6 +7,7 @@ on:
     paths:
       - '**/*.py'
       - 'pyproject.toml'
+      - 'requirements*.in'
       - 'requirements*.txt'
       - '.github/workflows/lint-python.yml'
 
@@ -16,6 +17,7 @@ on:
     paths:
       - '**/*.py'
       - 'pyproject.toml'
+      - 'requirements*.in'
       - 'requirements*.txt'
       - '.github/workflows/lint-python.yml'
 
@@ -36,10 +38,14 @@ jobs:
         with:
           python-version: '3.12'
           cache: pip
-          cache-dependency-path: requirements-dev.txt
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
 
       - name: Install dependencies
-        run: python -m pip install -r requirements-dev.txt
+        run: |
+          python -m pip install --require-hashes -r requirements.txt
+          python -m pip install --require-hashes -r requirements-dev.txt
 
       - name: Run Ruff
         run: ruff check .
