@@ -21,10 +21,32 @@ from netmiko.exceptions import (
     NetmikoAuthenticationException,
     NetmikoTimeoutException,
 )
+from paramiko.hostkeys import HostKeys
 
 import aruba_cert_renewer as checker
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
+KNOWN_HOSTS_FILE = FIXTURES_DIR / "known_hosts"
+
+
+def test_known_hosts_fixture_is_valid_openssh():
+    host_keys = HostKeys()
+    host_keys.load(str(KNOWN_HOSTS_FILE))
+    switch_keys = host_keys.lookup("switch.example.com")
+
+    assert switch_keys is not None
+    assert switch_keys["ssh-rsa"].get_name() == "ssh-rsa"
+
+
+def write_config_file(config_file, contents):
+    (config_file.parent / "known_hosts").write_text(
+        KNOWN_HOSTS_FILE.read_text(encoding="ascii"),
+        encoding="ascii",
+    )
+    config_file.write_text(
+        '[ssh]\nknown_hosts_file = "known_hosts"\n\n' + contents,
+        encoding="utf-8",
+    )
 
 
 def make_config():
@@ -32,11 +54,15 @@ def make_config():
         "settings": {
             "warning_days": 30,
         },
+        "ssh": {
+            "known_hosts_file": str(KNOWN_HOSTS_FILE),
+        },
         "switches": [
             {
                 "name": "EXAMPLE-SWITCH",
                 "host": "switch.example.com",
                 "additional_sans": ["192.0.2.10"],
+                "_ssh_known_hosts_file": KNOWN_HOSTS_FILE.resolve(),
             }
         ],
     }
@@ -189,6 +215,86 @@ def test_validate_config():
     assert warning_days == 30
     assert len(switches) == 1
     assert switches[0]["name"] == "EXAMPLE-SWITCH"
+    assert switches[0]["_ssh_known_hosts_file"] == KNOWN_HOSTS_FILE.resolve()
+
+
+def test_known_hosts_file_resolves_relative_to_config(tmp_path):
+    config_file = tmp_path / "deployment" / "config.toml"
+    known_hosts_file = config_file.parent / "ssh" / "known_hosts"
+    known_hosts_file.parent.mkdir(parents=True)
+    known_hosts_file.write_text("switch.example.com ssh-rsa test\n", encoding="ascii")
+    config = make_config()
+    config["ssh"]["known_hosts_file"] = "ssh/known_hosts"
+
+    _, switches = checker.validate_config(config, config_file)
+
+    assert switches[0]["_ssh_known_hosts_file"] == known_hosts_file.resolve()
+
+
+def test_known_hosts_file_accepts_absolute_path(tmp_path):
+    known_hosts_file = tmp_path / "dedicated_known_hosts"
+    known_hosts_file.write_text("switch.example.com ssh-rsa test\n", encoding="ascii")
+    config = make_config()
+    config["ssh"]["known_hosts_file"] = str(known_hosts_file)
+
+    _, switches = checker.validate_config(config, tmp_path / "elsewhere/config.toml")
+
+    assert switches[0]["_ssh_known_hosts_file"] == known_hosts_file.resolve()
+
+
+def test_validate_config_requires_ssh_section():
+    config = make_config()
+    del config["ssh"]
+
+    with pytest.raises(ValueError, match=r"\[ssh\].*required"):
+        checker.validate_config(config)
+
+
+@pytest.mark.parametrize("value", [None, "", "   ", 123])
+def test_validate_config_requires_known_hosts_file(value):
+    config = make_config()
+    if value is None:
+        del config["ssh"]["known_hosts_file"]
+    else:
+        config["ssh"]["known_hosts_file"] = value
+
+    with pytest.raises(ValueError, match="ssh.known_hosts_file must be configured"):
+        checker.validate_config(config)
+
+
+def test_validate_config_rejects_missing_known_hosts_file(tmp_path):
+    config = make_config()
+    config["ssh"]["known_hosts_file"] = "missing"
+
+    with pytest.raises(ValueError, match="ssh.known_hosts_file not found"):
+        checker.validate_config(config, tmp_path / "config.toml")
+
+
+def test_validate_config_rejects_non_regular_known_hosts_file(tmp_path):
+    config = make_config()
+    config["ssh"]["known_hosts_file"] = "known_hosts"
+    (tmp_path / "known_hosts").mkdir()
+
+    with pytest.raises(ValueError, match="not a regular file"):
+        checker.validate_config(config, tmp_path / "config.toml")
+
+
+def test_validate_config_rejects_unreadable_known_hosts_file(monkeypatch, tmp_path):
+    config = make_config()
+    known_hosts_file = tmp_path / "known_hosts"
+    known_hosts_file.write_text("switch.example.com ssh-rsa test\n", encoding="ascii")
+    config["ssh"]["known_hosts_file"] = str(known_hosts_file)
+    original_open = Path.open
+
+    def deny_known_hosts_open(path, *args, **kwargs):
+        if path == known_hosts_file:
+            raise PermissionError("permission denied")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", deny_known_hosts_open)
+
+    with pytest.raises(ValueError, match="cannot be read"):
+        checker.validate_config(config, tmp_path / "config.toml")
 
 
 @pytest.mark.parametrize(
@@ -498,6 +604,156 @@ def test_read_password_file_rejects_missing_file_and_directory(tmp_path):
         checker.read_password_file(str(tmp_path), tmp_path / "config.toml")
 
 
+def test_device_parameters_require_dedicated_strict_known_hosts():
+    switch = make_config()["switches"][0]
+
+    device = checker.get_device_parameters(switch, "username", "password")
+
+    assert device["host"] == "switch.example.com"
+    assert device["ssh_strict"] is True
+    assert device["system_host_keys"] is False
+    assert device["alt_host_keys"] is True
+    assert device["alt_key_file"] == str(KNOWN_HOSTS_FILE.resolve())
+
+
+def test_unvalidated_switch_cannot_construct_device_parameters():
+    switch = {"name": "EXAMPLE-SWITCH", "host": "switch.example.com"}
+
+    with pytest.raises(ValueError, match="known_hosts configuration was not validated"):
+        checker.get_device_parameters(switch, "username", "password")
+
+
+def test_extra_ssh_settings_cannot_disable_strict_verification():
+    config = make_config()
+    config["ssh"].update(
+        ssh_strict=False,
+        system_host_keys=True,
+        alt_host_keys=False,
+    )
+    _, switches = checker.validate_config(config)
+
+    device = checker.get_device_parameters(switches[0], "username", "password")
+
+    assert device["ssh_strict"] is True
+    assert device["system_host_keys"] is False
+    assert device["alt_host_keys"] is True
+
+
+@pytest.mark.parametrize(
+    "connection_path",
+    ["monitor", "preflight", "generate", "retrieve", "install"],
+)
+def test_every_aruba_connection_path_uses_common_device_parameters(
+    monkeypatch, connection_path
+):
+    calls = []
+
+    def stop_at_device_parameters(switch, username, password):
+        calls.append((switch, username, password))
+        raise RuntimeError("common device parameters reached")
+
+    monkeypatch.setattr(checker, "get_device_parameters", stop_at_device_parameters)
+    switch = make_config()["switches"][0]
+
+    with pytest.raises(RuntimeError, match="common device parameters reached"):
+        if connection_path == "monitor":
+            checker.check_switch(switch, "username", "password", 30)
+        elif connection_path == "preflight":
+            checker.renewal_preflight(switch, "username", "password")
+        elif connection_path == "generate":
+            checker.generate_csr(
+                switch,
+                "username",
+                "password",
+                "webcert2027",
+                make_csr_settings(),
+            )
+        elif connection_path == "retrieve":
+            checker.retrieve_csr(
+                switch,
+                "username",
+                "password",
+                "webcert2027",
+                make_csr_settings(),
+            )
+        else:
+            checker.install_pending_certificate(
+                switch,
+                "username",
+                "password",
+                "webcert2027",
+                "unused certificate",
+                make_csr_settings(),
+                397,
+            )
+
+    assert calls == [(switch, "username", "password")]
+
+
+class HostKeyFailureConnection:
+    def __enter__(self):
+        raise NetmikoTimeoutException("SSH host key rejected")
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        return False
+
+    def send_command(self, *args, **kwargs):
+        pytest.fail("No Aruba command may run after SSH host-key failure")
+
+
+def test_ssh_host_key_failure_runs_no_aruba_commands(monkeypatch):
+    monkeypatch.setattr(
+        checker,
+        "ConnectHandler",
+        lambda **kwargs: HostKeyFailureConnection(),
+    )
+
+    with pytest.raises(ValueError, match="SSH connection timed out"):
+        checker.retrieve_csr(
+            make_config()["switches"][0],
+            "username",
+            "password",
+            "webcert2027",
+            make_csr_settings(),
+        )
+
+
+@pytest.mark.parametrize("operation", ["sign", "renew"])
+def test_ssh_failure_does_not_reach_opnsense(monkeypatch, operation):
+    monkeypatch.setattr(
+        checker,
+        "ConnectHandler",
+        lambda **kwargs: HostKeyFailureConnection(),
+    )
+    monkeypatch.setattr(
+        checker,
+        "OPNsenseClient",
+        lambda *args, **kwargs: pytest.fail("OPNsense must not be contacted"),
+    )
+    switch = make_config()["switches"][0]
+
+    if operation == "sign":
+        with pytest.raises(ValueError, match="SSH connection timed out"):
+            checker.sign_pending_csr(
+                switch,
+                "username",
+                "password",
+                "webcert2027",
+                make_csr_settings(),
+                make_opnsense_settings(),
+            )
+    else:
+        with pytest.raises(checker.RenewalPreflightError, match="timed out"):
+            checker.renew_certificate(
+                switch,
+                "username",
+                "password",
+                make_csr_settings(),
+                make_opnsense_settings(),
+                Path("public-ca.pem"),
+            )
+
+
 @pytest.mark.parametrize(
     ("results", "expected"),
     [
@@ -603,7 +859,8 @@ def test_monitoring_resolves_credentials_for_each_switch(monkeypatch, tmp_path):
     (tmp_path / "a.secret").write_text("password-a\n", encoding="utf-8")
     (tmp_path / "b.secret").write_text("password-b\n", encoding="utf-8")
     config_file = tmp_path / "config.toml"
-    config_file.write_text(
+    write_config_file(
+        config_file,
         """
 [[switches]]
 name = "SWITCH-A"
@@ -617,7 +874,6 @@ host = "switch-b.example.com"
 username = "user-b"
 password_file = "b.secret"
 """.strip(),
-        encoding="utf-8",
     )
     calls = []
     monkeypatch.setattr(
@@ -643,7 +899,8 @@ def test_monitoring_reports_one_switch_credential_failure_and_continues(
 ):
     (tmp_path / "b.secret").write_text("password-b\n", encoding="utf-8")
     config_file = tmp_path / "config.toml"
-    config_file.write_text(
+    write_config_file(
+        config_file,
         """
 [[switches]]
 name = "SWITCH-A"
@@ -657,7 +914,6 @@ host = "switch-b.example.com"
 username = "user-b"
 password_file = "b.secret"
 """.strip(),
-        encoding="utf-8",
     )
     calls = []
     monkeypatch.setattr(
@@ -680,7 +936,8 @@ def test_unknown_switch_fails_before_credentials(
 ):
     config_file = tmp_path / "config.toml"
 
-    config_file.write_text(
+    write_config_file(
+        config_file,
         """
 [settings]
 warning_days = 30
@@ -690,7 +947,6 @@ name = "EXAMPLE-SWITCH"
 host = "switch.example.com"
 additional_sans = ["192.0.2.10"]
 """.strip(),
-        encoding="utf-8",
     )
 
     monkeypatch.setattr(
@@ -712,6 +968,37 @@ additional_sans = ["192.0.2.10"]
         checker,
         "get_switch_credentials",
         unexpected_credentials_request,
+    )
+
+    assert checker.main() == checker.EXIT_ERROR
+
+
+def test_missing_ssh_config_fails_before_credentials_or_connection(
+    monkeypatch, tmp_path
+):
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(
+        """
+[[switches]]
+name = "EXAMPLE-SWITCH"
+host = "switch.example.com"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        checker.sys,
+        "argv",
+        ["aruba_cert_renewer.py", "--config", str(config_file)],
+    )
+    monkeypatch.setattr(
+        checker,
+        "get_switch_credentials",
+        lambda *args: pytest.fail("Credentials should not be requested"),
+    )
+    monkeypatch.setattr(
+        checker,
+        "ConnectHandler",
+        lambda **kwargs: pytest.fail("SSH should not be attempted"),
     )
 
     assert checker.main() == checker.EXIT_ERROR
@@ -805,7 +1092,8 @@ def test_mutually_exclusive_csr_operations_fail_before_credentials(monkeypatch):
 def test_generate_csr_main_writes_validated_pem(monkeypatch, tmp_path):
     config_file = tmp_path / "config.toml"
     output_file = tmp_path / "request.pem"
-    config_file.write_text(
+    write_config_file(
+        config_file,
         """
 [settings]
 warning_days = 30
@@ -824,7 +1112,6 @@ name = "EXAMPLE-SWITCH"
 host = "switch.example.com"
 additional_sans = ["192.0.2.10"]
 """.strip(),
-        encoding="utf-8",
     )
     argv = [
         "aruba_cert_renewer.py",
@@ -856,7 +1143,8 @@ additional_sans = ["192.0.2.10"]
 def test_retrieve_csr_main_writes_validated_pem(monkeypatch, tmp_path):
     config_file = tmp_path / "config.toml"
     output_file = tmp_path / "request.pem"
-    config_file.write_text(
+    write_config_file(
+        config_file,
         """
 [csr]
 organization = "Example Organization"
@@ -872,7 +1160,6 @@ name = "EXAMPLE-SWITCH"
 host = "switch.example.com"
 additional_sans = ["192.0.2.10"]
 """.strip(),
-        encoding="utf-8",
     )
     monkeypatch.setattr(
         checker.sys,
@@ -951,7 +1238,8 @@ def test_existing_csr_output_fails_before_credentials_or_ssh(
 
 def test_generate_csr_config_validation_fails_before_credentials(monkeypatch, tmp_path):
     config_file = tmp_path / "config.toml"
-    config_file.write_text(
+    write_config_file(
+        config_file,
         """
 [csr]
 organization = "Example; reload"
@@ -967,7 +1255,6 @@ name = "EXAMPLE-SWITCH"
 host = "switch.example.com"
 additional_sans = ["192.0.2.10"]
 """.strip(),
-        encoding="utf-8",
     )
     monkeypatch.setattr(
         checker.sys,
@@ -2264,7 +2551,10 @@ def test_sign_pending_csr_retrieves_existing_csr_and_never_generates(monkeypatch
 
 
 def signing_config_text():
-    return """
+    return f"""
+[ssh]
+known_hosts_file = "{KNOWN_HOSTS_FILE.resolve()}"
+
 [csr]
 organization = "Example Organization"
 organizational_unit = "Infrastructure"

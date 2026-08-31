@@ -1,6 +1,9 @@
 [settings]
 warning_days = 30
 
+[ssh]
+known_hosts_file = "known_hosts"
+
 [csr]
 organization = "Example Organization"
 organizational_unit = "Infrastructure"

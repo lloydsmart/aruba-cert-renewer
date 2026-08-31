@@ -14,6 +14,7 @@ services:
       OPNSENSE_API_SECRET_FILE: /run/secrets/opnsense_api_secret
     volumes:
       - ./config.toml:/config/config.toml:ro
+      - ./known_hosts:/config/known_hosts:ro
       - ./internal-ca.crt.pem:/config/internal-ca.crt.pem:ro
       - ./secrets/opnsense_api_key:/run/secrets/opnsense_api_key:ro
       - ./secrets/opnsense_api_secret:/run/secrets/opnsense_api_secret:ro
