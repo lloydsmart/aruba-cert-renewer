@@ -224,6 +224,11 @@ Do not weaken CI checks or release safeguards merely to make a change pass.
 
 ## Git and change discipline
 
+Maintainers should use a feature or topic branch rather than committing directly
+to `main`. The repository provides `.githooks/pre-commit` and
+`scripts/setup-git-hooks.sh`; the setup script enables the repository-local
+protected-branch commit guard. Agents must not configure Git automatically.
+
 Unless explicitly requested:
 
 * Do not commit changes.

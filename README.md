@@ -99,6 +99,22 @@ checking lock freshness. For an intentional full dependency refresh, run
 `./scripts/compile-requirements.sh --upgrade`. Review all input and generated
 lock changes before committing them.
 
+## Optional Local Commit Guard
+
+Git deliberately does not enable repository-provided hooks automatically. After
+cloning, a maintainer can enable this repository's local guard for that clone:
+
+```bash
+./scripts/setup-git-hooks.sh
+```
+
+This sets `core.hooksPath=.githooks` in the clone's repository-local Git
+configuration. The tracked pre-commit hook rejects direct commits on `main` and
+`master`, catching branch-selection mistakes before a push reaches GitHub.
+GitHub repository protection remains authoritative; this hook is only a local
+convenience. Git's explicit `git commit --no-verify` bypass should be reserved
+for deliberate exceptional use.
+
 ## Docker
 
 The container is a finite, one-shot job. With no command override, it runs
