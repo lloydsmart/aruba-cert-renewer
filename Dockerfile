@@ -1,4 +1,4 @@
-FROM python:3.12.14-slim-bookworm@sha256:0f5b26b9518d002b6173fd61daad821fa340635ebfec5bba471013f9ca114579
+FROM python:3.14.7-slim-bookworm@sha256:416f0db2a2b561945630cef9877a7ea0581b27449eb9fd9df42f03e1b74b5b63
 
 LABEL org.opencontainers.image.source="https://github.com/lloydsmart/aruba-cert-renewer" \
       org.opencontainers.image.licenses="GPL-3.0-only"
