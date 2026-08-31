@@ -1,4 +1,4 @@
-FROM python:3.14.7-slim-bookworm@sha256:416f0db2a2b561945630cef9877a7ea0581b27449eb9fd9df42f03e1b74b5b63
+FROM python:3.14.7-slim-trixie@sha256:cae66f2ef0ec51a9891263eeee7f987dacf0a9879e8aa9353d5606e0530619a5
 
 LABEL org.opencontainers.image.source="https://github.com/lloydsmart/aruba-cert-renewer" \
       org.opencontainers.image.licenses="GPL-3.0-only"
@@ -13,7 +13,8 @@ COPY requirements.txt ./
 RUN python -m pip install \
     --no-cache-dir \
     --require-hashes \
-    -r requirements.txt
+    -r requirements.txt \
+    && python -m pip uninstall --yes pip
 
 RUN groupadd --gid 10001 aruba-cert-renewer \
     && useradd --uid 10001 \

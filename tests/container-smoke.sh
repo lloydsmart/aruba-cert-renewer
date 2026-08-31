@@ -27,6 +27,15 @@ docker run --rm \
     "$image" \
     --help >/dev/null
 
+docker run --rm \
+    --network none \
+    --read-only \
+    --entrypoint python \
+    "$image" \
+    -c 'import importlib.metadata as metadata, importlib.util as util; ' \
+    'assert util.find_spec("pip") is None; ' \
+    'assert not any((dist.metadata.get("Name") or "").lower() == "pip" for dist in metadata.distributions())'
+
 image_user=$(docker image inspect --format '{{.Config.User}}' "$image")
 exposed_ports=$(docker image inspect --format '{{json .Config.ExposedPorts}}' "$image")
 entrypoint=$(docker image inspect --format '{{json .Config.Entrypoint}}' "$image")
