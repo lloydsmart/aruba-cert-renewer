@@ -33,13 +33,14 @@ Drop all Linux capabilities and enable `no-new-privileges`. Do not use
 privileged mode, host networking, a Docker socket mount, published inbound
 ports, or broad host filesystem mounts.
 
-Mount only the required configuration, public CA, and credential files, each
-read-only, and ensure credential source files are readable by UID `10001` but
-not by unrelated host users. Restrict network egress to the Aruba SSH and HTTPS
+Mount only the required configuration, dedicated SSH `known_hosts`, public CA,
+and credential files, each read-only, and ensure they are readable by UID
+`10001` as appropriate while credential sources remain inaccessible to
+unrelated host users. Restrict network egress to the Aruba SSH and HTTPS
 services, the OPNsense HTTPS API, and supporting DNS/NTP required by the
 environment. These runtime controls reduce container privileges; they do not
-replace the application's credential, TLS, certificate, or device-level safety
-checks.
+replace the application's credential, SSH host-key, TLS, certificate, or
+device-level safety checks.
 
 ## Container Publication
 
@@ -108,6 +109,31 @@ The automation is limited to CA description lookup, CSR signing, and public-cert
 Aruba certificate private keys are generated and stored on the switch. They must not be exported to or retrieved from
 OPNsense. A pending CSR represents the valuable association with its switch-held private key and must not be cleared,
 replaced, regenerated, or deleted by the signing workflow.
+
+## Aruba SSH Host-Key Trust
+
+All Aruba SSH connections require strict host-key verification against the
+dedicated OpenSSH-format file configured by `ssh.known_hosts_file`. The
+application does not use the operator's normal `~/.ssh/known_hosts`, perform DNS
+resolution to replace the configured `switch.host` with an IP address, or offer
+any setting that disables verification. Unknown and changed host keys fail
+closed before authentication or command execution.
+
+The application never uses trust-on-first-use, `AutoAddPolicy`, `accept-new`,
+interactive acceptance, automatic replacement, or application-driven
+`ssh-keyscan`. Operators may collect a candidate key separately with
+`ssh-keyscan`, but that command does not authenticate its output. Before adding
+the entry, independently compare its fingerprint with
+`show crypto host-public-key fingerprint` on the ArubaOS-S switch over an
+already trusted management path or console. Compare it specifically with the
+switch's **SSHv2** host-key fingerprint labelled `host_ssh2.pub`.
+
+Legitimate rotation requires the operator to verify the new fingerprint,
+replace the relevant deployment `known_hosts` entry, and rerun the renewer.
+Monitoring and renewal remain failed while the presented key differs from the
+trusted entry. Native relative paths resolve beside the active `config.toml`;
+the container example mounts `./known_hosts` read-only at
+`/config/known_hosts`, beside `/config/config.toml`.
 
 ## Aruba Installation and Live Verification
 

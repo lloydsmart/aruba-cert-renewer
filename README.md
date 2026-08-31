@@ -15,6 +15,7 @@ ArubaOS-Switch devices such as the Aruba 2930M.
 Implemented:
 
 - SSH connectivity to ArubaOS-Switch using Netmiko
+- Mandatory strict SSH host-key verification using a dedicated trust file
 - Active Web certificate discovery and expiry reporting
 - Explicit CSR generation on one selected switch
 - Read-only retrieval of an existing pending CSR
@@ -154,6 +155,7 @@ Do not start the example until local configuration, public CA, and secret files
 have been created. The expected paths inside the container are:
 
 - `/config/config.toml`
+- `/config/known_hosts`
 - `/config/internal-ca.crt.pem`
 - `/run/secrets/opnsense_api_key`
 - `/run/secrets/opnsense_api_secret`
@@ -165,6 +167,9 @@ the public CA relative to `config.toml` and references the Aruba credential by
 its absolute mounted path:
 
 ```toml
+[ssh]
+known_hosts_file = "known_hosts"
+
 [verification]
 ca_file = "internal-ca.crt.pem"
 
@@ -176,10 +181,11 @@ password_file = "/run/secrets/aruba_example_switch_password"
 ```
 
 All bind-mounted source files needed at runtime must be readable by container
-UID `10001`, including `config.toml`, the public CA certificate, and credential
-or secret files. Credential files should also remain inaccessible to unrelated
-host users. For a typical root-managed deployment, set each source secret's
-ownership and mode before starting the container, for example:
+UID `10001`, including `config.toml`, the dedicated `known_hosts` file, the
+public CA certificate, and credential or secret files. Credential files should
+also remain inaccessible to unrelated host users. For a typical root-managed
+deployment, set each source secret's ownership and mode before starting the
+container, for example:
 
 ```bash
 chown 10001:10001 secrets/opnsense_api_key
@@ -204,6 +210,9 @@ Example:
 ```toml
 [settings]
 warning_days = 30
+
+[ssh]
+known_hosts_file = "known_hosts"
 
 [csr]
 organization = "Example Organization"
@@ -234,6 +243,16 @@ password_file = "/run/secrets/aruba_example_switch_password"
 `opnsense.ca` is the CA's human-readable description, not its refid. The tool
 resolves it through `ca_list` and requires exactly one match.
 
+`ssh.known_hosts_file` is required for every operation. It names the
+application's dedicated OpenSSH-format host-key trust file; the user's general
+`~/.ssh/known_hosts` is never used as a fallback. Relative paths are resolved
+from the directory containing the active `config.toml`, not from the current
+working directory, and absolute paths are supported. For a native deployment,
+place `known_hosts` alongside `config.toml` or configure an absolute path. The
+Compose example mounts the host's `./known_hosts` read-only at
+`/config/known_hosts`, so the relative value above resolves correctly from
+`/config/config.toml`.
+
 Each switch requires only `name` and `host`. The host may be a DNS hostname,
 IPv4 address, or IPv6 address. It is the SSH and live HTTPS connection target,
 the certificate Common Name, and the primary SAN; it is included automatically
@@ -256,6 +275,51 @@ the repository.
 
 `config.toml` is excluded from Git and should contain the real inventory. It
 must never contain OPNsense API credentials.
+
+## SSH Host-Key Enrollment and Rotation
+
+SSH host-key verification is mandatory because SSH credentials and switch
+commands must not be exposed to an unauthenticated or impersonated endpoint.
+Every connection checks the identity for exactly the configured `switch.host`
+against the dedicated `ssh.known_hosts_file`. An unknown key fails closed, and
+a changed key fails closed, before authentication or Aruba command execution.
+The application never learns, accepts, replaces, or rotates a host key
+automatically.
+
+For ArubaOS-S enrollment, collect a candidate key from a trusted administrative
+workstation. For a switch configured as `switch.example.com`, an example is:
+
+```bash
+ssh-keyscan -T 5 -t rsa switch.example.com > known_hosts.candidate
+ssh-keygen -E md5 -lf known_hosts.candidate
+```
+
+`ssh-keyscan` does **not** authenticate the key. Successful retrieval is not
+evidence that the candidate belongs to the switch. Independently inspect the
+switch over an already trusted management path or local console and run:
+
+```text
+show crypto host-public-key fingerprint
+```
+
+Compare the MD5 fingerprint printed by `ssh-keygen` with the switch's **SSHv2**
+host-key fingerprint, labelled `host_ssh2.pub` in the command output. Only after
+they match should the candidate entry be copied into the deployment
+`known_hosts` file under the exact hostname or IP literal configured as
+`switch.host`. Do not substitute a DNS-resolved IP address for a configured
+hostname.
+
+A legitimate host-key rotation is deliberately an operator action:
+
+1. Expect monitoring and renewal to fail when the switch presents the changed
+   key.
+2. Independently verify the new fingerprint through a trusted management path
+   or console.
+3. Replace only that switch's entry in the deployment `known_hosts` file.
+4. Rerun the renewer.
+
+There is no automatic rotation, `accept-new`, trust-on-first-use, or interactive
+host-key acceptance mode.
 
 ## Credentials
 

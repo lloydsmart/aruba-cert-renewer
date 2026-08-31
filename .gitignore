@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 .env
 config.toml
+/known_hosts
 secrets/
 .vscode/
 *.csr.pem

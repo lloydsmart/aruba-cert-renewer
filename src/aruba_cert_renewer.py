@@ -329,7 +329,58 @@ def get_certificate_identities(switch):
     }
 
 
-def validate_config(config):
+def get_ssh_known_hosts_file(config, config_file):
+    settings = config.get("ssh")
+
+    if not isinstance(settings, dict):
+        raise ValueError("An [ssh] configuration section is required")
+
+    configured_path = settings.get("known_hosts_file")
+    if not isinstance(configured_path, str) or not configured_path.strip():
+        raise ValueError("ssh.known_hosts_file must be configured")
+
+    if "\x00" in configured_path:
+        raise ValueError("ssh.known_hosts_file contains unsupported characters")
+
+    try:
+        known_hosts_file = Path(configured_path)
+        if not known_hosts_file.is_absolute():
+            known_hosts_file = config_file.resolve().parent / known_hosts_file
+        known_hosts_file = known_hosts_file.resolve()
+    except (OSError, RuntimeError) as error:
+        raise ValueError(
+            f"ssh.known_hosts_file cannot be resolved: {configured_path}: {error}"
+        ) from error
+
+    try:
+        file_status = known_hosts_file.stat()
+    except FileNotFoundError:
+        raise ValueError(
+            f"ssh.known_hosts_file not found: {known_hosts_file}"
+        ) from None
+    except OSError as error:
+        raise ValueError(
+            f"ssh.known_hosts_file cannot be read: {known_hosts_file}: {error}"
+        ) from error
+
+    if not stat.S_ISREG(file_status.st_mode):
+        raise ValueError(
+            f"ssh.known_hosts_file is not a regular file: {known_hosts_file}"
+        )
+
+    try:
+        with known_hosts_file.open("rb"):
+            pass
+    except OSError as error:
+        raise ValueError(
+            f"ssh.known_hosts_file cannot be read: {known_hosts_file}: {error}"
+        ) from error
+
+    return known_hosts_file
+
+
+def validate_config(config, config_file=DEFAULT_CONFIG_FILE):
+    known_hosts_file = get_ssh_known_hosts_file(config, config_file)
     settings = config.get("settings", {})
     warning_days = settings.get("warning_days", 30)
 
@@ -393,6 +444,7 @@ def validate_config(config):
             parse_identity(value, f"Switch entry {index} additional_sans item")["value"]
             for value in additional_sans
         ]
+        switch["_ssh_known_hosts_file"] = known_hosts_file
 
         username = switch.get("username")
         if username is not None:
@@ -1262,6 +1314,13 @@ def sign_pending_csr(
 
 
 def get_device_parameters(switch, username, password):
+    try:
+        known_hosts_file = switch["_ssh_known_hosts_file"]
+    except KeyError:
+        raise ValueError(
+            "SSH known_hosts configuration was not validated for this switch"
+        ) from None
+
     return {
         "device_type": "aruba_osswitch",
         "host": switch["host"],
@@ -1270,6 +1329,10 @@ def get_device_parameters(switch, username, password):
         "conn_timeout": 10,
         "banner_timeout": 15,
         "auth_timeout": 15,
+        "ssh_strict": True,
+        "system_host_keys": False,
+        "alt_host_keys": True,
+        "alt_key_file": str(known_hosts_file),
     }
 
 
@@ -2159,7 +2222,7 @@ def main():
     try:
         validate_cli_args(args)
         config = load_config(args.config)
-        warning_days, switches = validate_config(config)
+        warning_days, switches = validate_config(config, args.config)
         switches = select_switches(switches, args.switch_name)
         renew_due = getattr(args, "renew_due", False)
 
