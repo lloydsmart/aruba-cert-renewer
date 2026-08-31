@@ -60,6 +60,14 @@ and published release references. They prevent direct or destructive changes
 to `main`, require signed commits and CodeQL results for protected history, and
 make existing release tags immutable.
 
+External Actions referenced by GitHub Actions workflows use immutable
+references. Repository-backed Actions are pinned to full 40-character commit
+SHAs, with the intended release or version retained in a same-line comment.
+Docker-based Actions are pinned to immutable `sha256` image digests. Dependabot
+maintains supported repository-backed GitHub Action SHA pins; Docker-based
+`docker://` Action digests currently require manual maintenance. Release
+workflows must contain no mutable executable Action references.
+
 The active `Protect main` branch ruleset has no bypass actors and targets
 `~DEFAULT_BRANCH`, currently `main`. It applies these rules:
 
