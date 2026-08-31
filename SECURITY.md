@@ -110,10 +110,22 @@ setup, which remains the static source-code security scan:
 * pip-audit scans all four fully resolved, hash-locked dependency sets: runtime,
   development/test, lock-generation, and security-scanner tooling. It disables
   pip-based resolution and fails if a committed requirement lacks a hash.
-* Trivy scans OS and language/package vulnerabilities in the exact image archive
-  exported with `docker save` after smoke testing. HIGH or CRITICAL findings
-  fail the scan, including unfixed findings. Trivy receives the archive and a
-  narrow writable cache, but no Docker socket.
+* Trivy scans OS and language/package vulnerabilities twice in the exact image
+  archive exported with `docker save` after smoke testing. The reporting pass
+  shows every HIGH or CRITICAL finding, including `affected`, `fix_deferred`,
+  `will_not_fix`, and fixed/actionable findings. The enforcement pass fails when
+  a HIGH or CRITICAL finding has a known fixed version. Both passes use the same
+  archive and private cache. Trivy receives the archive and cache, but no Docker
+  socket.
+
+Unfixed distribution vulnerabilities remain visible in pull-request, release,
+and scheduled scans, but do not permanently fail the gate when Debian provides
+no remediation. This reporting-plus-enforcement policy avoids silently
+suppressing individual CVEs. When Debian makes a fixed package version available
+for a previously unfixed vulnerability, the enforcement pass automatically
+begins failing until the pinned base image is refreshed. HIGH or CRITICAL
+findings with an available fixed version block CI and release publication.
+Individual Trivy vulnerability suppressions remain disallowed by default.
 
 Secret and dependency scans run for every pull request and push to `main`, as
 well as weekly. Container CI smoke-tests one image and then scans that same

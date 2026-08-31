@@ -128,11 +128,12 @@ already-built local image for HIGH and CRITICAL vulnerabilities:
 
 GitHub CodeQL default setup remains the static source-code scan. Release images
 already receive an SPDX JSON SBOM plus build-provenance and SBOM attestations
-bound to the published digest. No Gitleaks or Trivy suppressions are enabled by
-default; the exact pip-audit accepted-risk exception is documented in
-`SECURITY.md`. GitHub native secret scanning and push protection are
-complementary repository settings that maintainers should verify or enable
-separately where supported.
+bound to the published digest. No Gitleaks or CVE-specific Trivy suppressions
+are enabled by default. Trivy reports every HIGH or CRITICAL finding and gates
+on findings with an available fixed version; the exact pip-audit accepted-risk
+exception is documented in `SECURITY.md`. GitHub native secret scanning and push
+protection are complementary repository settings that maintainers should verify
+or enable separately where supported.
 
 ## Optional Local Commit Guard
 

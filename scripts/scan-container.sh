@@ -33,6 +33,7 @@ trivy_tmp_directory="$temporary_directory/tmp"
 mkdir -- "$cache_directory" "$trivy_tmp_directory"
 docker save --output "$archive" "$image"
 
+printf '%s\n' 'Reporting all HIGH/CRITICAL vulnerabilities'
 docker run --rm \
     --read-only \
     --cap-drop ALL \
@@ -50,4 +51,25 @@ docker run --rm \
     --input /scan/image.tar \
     --scanners vuln \
     --severity HIGH,CRITICAL \
+    --exit-code 0
+
+printf '%s\n' 'Enforcing fixes for HIGH/CRITICAL vulnerabilities'
+docker run --rm \
+    --read-only \
+    --cap-drop ALL \
+    --security-opt no-new-privileges:true \
+    --user "$(id -u):$(id -g)" \
+    --env HOME=/tmp \
+    --env TMPDIR=/trivy-tmp \
+    --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m \
+    --mount "type=bind,src=$archive,dst=/scan/image.tar,readonly" \
+    --mount "type=bind,src=$cache_directory,dst=/cache" \
+    --mount "type=bind,src=$trivy_tmp_directory,dst=/trivy-tmp" \
+    "$trivy_image" \
+    --cache-dir /cache \
+    image \
+    --input /scan/image.tar \
+    --scanners vuln \
+    --severity HIGH,CRITICAL \
+    --ignore-unfixed \
     --exit-code 1
