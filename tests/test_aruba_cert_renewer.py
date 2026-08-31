@@ -790,6 +790,7 @@ def test_every_aruba_connection_path_uses_common_device_parameters(
                 "unused certificate",
                 make_csr_settings(),
                 397,
+                Path("public-ca.pem"),
             )
 
     assert calls == [(switch, "username", "password")]
@@ -2192,6 +2193,8 @@ def make_test_identity_and_certificate(
     lifetime_days=397,
     signature_hash=None,
     authority_cert_serial_number=None,
+    issuer_certificate=None,
+    issuer_signing_key=None,
 ):
     if not_before is None:
         not_before = datetime(2026, 1, 1, tzinfo=UTC) - timedelta(minutes=1)
@@ -2228,6 +2231,9 @@ def make_test_identity_and_certificate(
 
     issuer_subject = certificate_subject
     signing_key = certificate_key
+    if issuer_certificate is not None:
+        issuer_subject = issuer_certificate.subject
+        signing_key = issuer_signing_key
     if authority_cert_serial_number is not None:
         issuer_subject = x509.Name(
             [x509.NameAttribute(NameOID.COMMON_NAME, "Synthetic Test CA")]
@@ -2262,6 +2268,14 @@ def make_test_identity_and_certificate(
     if eku is not None:
         builder = builder.add_extension(x509.ExtendedKeyUsage(eku), critical=False)
 
+    if issuer_certificate is not None:
+        builder = builder.add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(
+                issuer_certificate.public_key()
+            ),
+            critical=False,
+        )
+
     if authority_cert_serial_number is not None:
         issuer_key_identifier = x509.SubjectKeyIdentifier.from_public_key(
             signing_key.public_key()
@@ -2281,6 +2295,141 @@ def make_test_identity_and_certificate(
         csr,
         certificate.public_bytes(serialization.Encoding.PEM).decode("ascii"),
     )
+
+
+def make_test_ca(common_name):
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common_name)])
+    now = datetime.now(UTC)
+    certificate = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(subject)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(days=1))
+        .not_valid_after(now + timedelta(days=3650))
+        .add_extension(
+            x509.BasicConstraints(ca=True, path_length=None),
+            critical=True,
+        )
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=False,
+                content_commitment=False,
+                key_encipherment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                key_cert_sign=True,
+                crl_sign=True,
+                encipher_only=False,
+                decipher_only=False,
+            ),
+            critical=True,
+        )
+        .add_extension(
+            x509.SubjectKeyIdentifier.from_public_key(key.public_key()),
+            critical=False,
+        )
+        .sign(key, hashes.SHA256())
+    )
+    return key, certificate
+
+
+def write_test_ca_bundle(path, *certificates):
+    path.write_bytes(
+        b"".join(
+            certificate.public_bytes(serialization.Encoding.PEM)
+            for certificate in certificates
+        )
+    )
+    path.chmod(0o600)
+    return path
+
+
+def test_verify_issued_certificate_trust_accepts_complete_ca_bundle(tmp_path):
+    trusted_key, trusted_ca = make_test_ca("Trusted Test CA")
+    _, unrelated_ca = make_test_ca("Unrelated Test CA")
+    _, csr, certificate_pem = make_test_identity_and_certificate(
+        not_before=datetime.now(UTC) - timedelta(minutes=1),
+        issuer_certificate=trusted_ca,
+        issuer_signing_key=trusted_key,
+    )
+    switch = make_config()["switches"][0]
+    certificate = checker.validate_issued_certificate(
+        certificate_pem,
+        csr,
+        switch,
+        397,
+    )
+    ca_file = write_test_ca_bundle(
+        tmp_path / "ca-bundle.pem",
+        unrelated_ca,
+        trusted_ca,
+    )
+
+    checker.verify_issued_certificate_trust(certificate, switch, ca_file)
+
+
+def test_verify_issued_certificate_trust_accepts_ip_host_identity(tmp_path):
+    trusted_key, trusted_ca = make_test_ca("Trusted Test CA")
+    _, csr, certificate_pem = make_test_identity_and_certificate(
+        common_name="192.0.2.10",
+        dns_names=(),
+        ip_addresses=("192.0.2.10",),
+        not_before=datetime.now(UTC) - timedelta(minutes=1),
+        issuer_certificate=trusted_ca,
+        issuer_signing_key=trusted_key,
+    )
+    switch = {"host": "192.0.2.10"}
+    certificate = checker.validate_issued_certificate(
+        certificate_pem,
+        csr,
+        switch,
+        397,
+    )
+    ca_file = write_test_ca_bundle(tmp_path / "ca.pem", trusted_ca)
+
+    checker.verify_issued_certificate_trust(certificate, switch, ca_file)
+
+
+@pytest.mark.parametrize(
+    ("contents", "message"),
+    [
+        (b"", "does not contain any trusted certificates"),
+        (b"not a certificate", "does not contain valid PEM certificates"),
+    ],
+)
+def test_verify_issued_certificate_trust_rejects_empty_or_malformed_bundle(
+    tmp_path, contents, message
+):
+    _, _, certificate_pem = make_test_identity_and_certificate()
+    certificate = x509.load_pem_x509_certificate(certificate_pem.encode("ascii"))
+    ca_file = tmp_path / "ca.pem"
+    ca_file.write_bytes(contents)
+    ca_file.chmod(0o600)
+
+    with pytest.raises(ValueError, match=message):
+        checker.verify_issued_certificate_trust(
+            certificate,
+            make_config()["switches"][0],
+            ca_file,
+        )
+
+
+def test_verify_issued_certificate_trust_rechecks_secure_file_metadata(tmp_path):
+    _, trusted_ca = make_test_ca("Trusted Test CA")
+    _, _, certificate_pem = make_test_identity_and_certificate()
+    certificate = x509.load_pem_x509_certificate(certificate_pem.encode("ascii"))
+    ca_file = write_test_ca_bundle(tmp_path / "ca.pem", trusted_ca)
+    ca_file.chmod(0o620)
+
+    with pytest.raises(SecureFileError, match="group-writable"):
+        checker.verify_issued_certificate_trust(
+            certificate,
+            make_config()["switches"][0],
+            ca_file,
+        )
 
 
 def test_get_opnsense_settings_validates_configuration():
@@ -3085,6 +3234,94 @@ class FakeInstallConnection:
         return output
 
 
+@pytest.fixture
+def accepted_preinstall_trust(monkeypatch):
+    monkeypatch.setattr(
+        checker,
+        "verify_issued_certificate_trust",
+        lambda *args: None,
+    )
+
+
+def test_wrong_ca_fails_before_any_installation_command(monkeypatch, tmp_path):
+    trusted_key, trusted_ca = make_test_ca("Trusted Test CA")
+    unexpected_key, unexpected_ca = make_test_ca("Unexpected Test CA")
+    csr_pem, csr, certificate_pem = make_test_identity_and_certificate(
+        not_before=datetime.now(UTC) - timedelta(minutes=1),
+        issuer_certificate=unexpected_ca,
+        issuer_signing_key=unexpected_key,
+    )
+    switch = make_config()["switches"][0]
+    certificate = checker.validate_issued_certificate(
+        certificate_pem,
+        csr,
+        switch,
+        397,
+    )
+    assert certificate.issuer == unexpected_ca.subject
+    assert checker._public_key_bytes(
+        trusted_key.public_key()
+    ) != checker._public_key_bytes(unexpected_key.public_key())
+
+    ca_file = write_test_ca_bundle(tmp_path / "ca.pem", trusted_ca)
+    connection = FakeInstallConnection(csr_pem)
+    monkeypatch.setattr(checker, "ConnectHandler", lambda **kwargs: connection)
+
+    with pytest.raises(ValueError, match="pre-install trust verification"):
+        checker.install_pending_certificate(
+            switch,
+            "username",
+            "password",
+            "webcert2027",
+            certificate_pem,
+            make_csr_settings(),
+            397,
+            ca_file,
+        )
+
+    assert not connection.entered_config_mode
+    assert all(command.startswith("show ") for command in connection.commands)
+
+
+def test_invalid_signature_with_trusted_issuer_name_fails_before_installation(
+    monkeypatch, tmp_path
+):
+    _, trusted_ca = make_test_ca("Trusted Test CA")
+    wrong_signing_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    csr_pem, csr, certificate_pem = make_test_identity_and_certificate(
+        not_before=datetime.now(UTC) - timedelta(minutes=1),
+        issuer_certificate=trusted_ca,
+        issuer_signing_key=wrong_signing_key,
+    )
+    switch = make_config()["switches"][0]
+    certificate = checker.validate_issued_certificate(
+        certificate_pem,
+        csr,
+        switch,
+        397,
+    )
+    assert certificate.issuer == trusted_ca.subject
+
+    ca_file = write_test_ca_bundle(tmp_path / "ca.pem", trusted_ca)
+    connection = FakeInstallConnection(csr_pem)
+    monkeypatch.setattr(checker, "ConnectHandler", lambda **kwargs: connection)
+
+    with pytest.raises(ValueError, match="pre-install trust verification"):
+        checker.install_pending_certificate(
+            switch,
+            "username",
+            "password",
+            "webcert2027",
+            certificate_pem,
+            make_csr_settings(),
+            397,
+            ca_file,
+        )
+
+    assert not connection.entered_config_mode
+    assert all(command.startswith("show ") for command in connection.commands)
+
+
 def test_fake_aruba_requires_blank_line_after_normally_terminated_pem():
     csr_pem, _, certificate_pem = make_test_identity_and_certificate()
     connection = FakeInstallConnection(csr_pem)
@@ -3102,7 +3339,7 @@ def test_fake_aruba_requires_blank_line_after_normally_terminated_pem():
 
 
 def test_install_pending_certificate_accepts_real_detail_shape_and_uses_guarded_interaction(
-    monkeypatch,
+    monkeypatch, accepted_preinstall_trust
 ):
     csr_pem, _, certificate_pem = make_test_identity_and_certificate(
         not_before=datetime.now(UTC) - timedelta(minutes=1)
@@ -3118,6 +3355,7 @@ def test_install_pending_certificate_accepts_real_detail_shape_and_uses_guarded_
         certificate_pem,
         make_csr_settings(),
         397,
+        Path("public-ca.pem"),
     )
 
     assert connection.entered_config_mode
@@ -3161,6 +3399,115 @@ def test_install_pending_certificate_accepts_real_detail_shape_and_uses_guarded_
         )
 
 
+def prepare_explicit_install(
+    monkeypatch, tmp_path, live_verifier, *, trusted_issuer=True
+):
+    trusted_key, trusted_ca = make_test_ca("Trusted Test CA")
+    issuer_key = trusted_key
+    issuer_certificate = trusted_ca
+    if not trusted_issuer:
+        issuer_key, issuer_certificate = make_test_ca("Unexpected Test CA")
+    csr_pem, _, certificate_pem = make_test_identity_and_certificate(
+        not_before=datetime.now(UTC) - timedelta(minutes=1),
+        issuer_certificate=issuer_certificate,
+        issuer_signing_key=issuer_key,
+    )
+    ca_file = write_test_ca_bundle(tmp_path / "public-ca.pem", trusted_ca)
+    certificate_file = tmp_path / "certificate.pem"
+    certificate_file.write_text(certificate_pem, encoding="ascii")
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(
+        signing_config_text() + f'\n\n[verification]\nca_file = "{ca_file}"\n',
+        encoding="utf-8",
+    )
+    connection = FakeInstallConnection(csr_pem)
+    monkeypatch.setattr(checker, "ConnectHandler", lambda **kwargs: connection)
+    monkeypatch.setattr(
+        checker,
+        "get_switch_credentials",
+        lambda *args: ("username", "password"),
+    )
+    monkeypatch.setattr(checker, "verify_live_https_certificate", live_verifier)
+    monkeypatch.setattr(
+        checker.sys,
+        "argv",
+        [
+            "aruba_cert_renewer.py",
+            "--config",
+            str(config_file),
+            "--install-certificate",
+            "--switch",
+            "EXAMPLE-SWITCH",
+            "--certificate-name",
+            "webcert2027",
+            "--certificate-input",
+            str(certificate_file),
+        ],
+    )
+    return connection, ca_file
+
+
+def test_explicit_install_trust_success_still_invokes_live_https(monkeypatch, tmp_path):
+    live_calls = []
+    connection, ca_file = prepare_explicit_install(
+        monkeypatch,
+        tmp_path,
+        lambda *args: live_calls.append(args),
+    )
+
+    assert checker.main() == checker.EXIT_OK
+    assert connection.entered_config_mode
+    assert "crypto pki install-signed-certificate" in connection.commands
+    assert len(live_calls) == 1
+    assert live_calls[0][0:2] == (make_config()["switches"][0], ca_file)
+
+
+def test_explicit_install_live_https_failure_remains_post_install(
+    monkeypatch, tmp_path, capsys
+):
+    live_calls = []
+
+    def fail_live_verification(*args):
+        live_calls.append(args)
+        raise ValueError("simulated live verification failure")
+
+    connection, _ = prepare_explicit_install(
+        monkeypatch,
+        tmp_path,
+        fail_live_verification,
+    )
+
+    assert checker.main() == checker.EXIT_ERROR
+    error_output = capsys.readouterr().err
+    assert connection.entered_config_mode
+    assert "y" in connection.commands
+    assert len(live_calls) == 1
+    assert "Post-install HTTPS verification failed" in error_output
+    assert "may already be active" in error_output
+    assert "Pre-install failure" not in error_output
+
+
+def test_explicit_install_wrong_ca_is_preinstall_and_skips_live_https(
+    monkeypatch, tmp_path, capsys
+):
+    live_calls = []
+    connection, _ = prepare_explicit_install(
+        monkeypatch,
+        tmp_path,
+        lambda *args: live_calls.append(args),
+        trusted_issuer=False,
+    )
+
+    assert checker.main() == checker.EXIT_ERROR
+    error_output = capsys.readouterr().err
+    assert not connection.entered_config_mode
+    assert all(command.startswith("show ") for command in connection.commands)
+    assert live_calls == []
+    assert "Pre-install failure; the switch has not been modified" in error_output
+    assert "pre-install trust verification" in error_output
+    assert "Post-install HTTPS verification failed" not in error_output
+
+
 @pytest.mark.parametrize(
     "expected_prompt",
     [checker.CERTIFICATE_PASTE_PROMPT, checker.CERTIFICATE_REPLACEMENT_PROMPT],
@@ -3178,7 +3525,9 @@ def test_expected_prompt_accepts_command_echo_and_trailing_whitespace(expected_p
         f"{checker.CERTIFICATE_PASTE_PROMPT}\nUnexpected follow-up text",
     ],
 )
-def test_bad_paste_prompt_never_sends_certificate(monkeypatch, paste_prompt):
+def test_bad_paste_prompt_never_sends_certificate(
+    monkeypatch, accepted_preinstall_trust, paste_prompt
+):
     csr_pem, _, certificate_pem = make_test_identity_and_certificate(
         not_before=datetime.now(UTC) - timedelta(minutes=1)
     )
@@ -3197,6 +3546,7 @@ def test_bad_paste_prompt_never_sends_certificate(monkeypatch, paste_prompt):
             certificate_pem,
             make_csr_settings(),
             397,
+            Path("public-ca.pem"),
         )
 
     assert connection.exited_config_mode
@@ -3214,7 +3564,7 @@ def test_bad_paste_prompt_never_sends_certificate(monkeypatch, paste_prompt):
     ],
 )
 def test_bad_replacement_prompt_never_sends_confirmation(
-    monkeypatch, replacement_prompt
+    monkeypatch, accepted_preinstall_trust, replacement_prompt
 ):
     csr_pem, _, certificate_pem = make_test_identity_and_certificate(
         not_before=datetime.now(UTC) - timedelta(minutes=1)
@@ -3237,6 +3587,7 @@ def test_bad_replacement_prompt_never_sends_confirmation(
             certificate_pem,
             make_csr_settings(),
             397,
+            Path("public-ca.pem"),
         )
 
     assert connection.exited_config_mode
@@ -3272,6 +3623,7 @@ def test_certificate_validation_failure_sends_no_configuration_command(
             certificate_pem,
             make_csr_settings(),
             397,
+            Path("public-ca.pem"),
         )
 
     assert not connection.entered_config_mode
@@ -3295,6 +3647,7 @@ def test_installed_certificate_name_is_rejected_before_config_mode(monkeypatch):
             certificate_pem,
             make_csr_settings(),
             397,
+            Path("public-ca.pem"),
         )
 
     assert not connection.entered_config_mode
@@ -3309,7 +3662,7 @@ def test_installed_certificate_name_is_rejected_before_config_mode(monkeypatch):
     ],
 )
 def test_post_install_summary_must_show_installed_web_certificate(
-    monkeypatch, post_summary, message
+    monkeypatch, accepted_preinstall_trust, post_summary, message
 ):
     csr_pem, _, certificate_pem = make_test_identity_and_certificate(
         not_before=datetime.now(UTC) - timedelta(minutes=1)
@@ -3326,6 +3679,7 @@ def test_post_install_summary_must_show_installed_web_certificate(
             certificate_pem,
             make_csr_settings(),
             397,
+            Path("public-ca.pem"),
         )
 
 
@@ -3337,7 +3691,7 @@ def test_post_install_summary_must_show_installed_web_certificate(
     ],
 )
 def test_post_install_detail_rejects_cli_errors_or_missing_success_marker(
-    monkeypatch, details_output
+    monkeypatch, accepted_preinstall_trust, details_output
 ):
     csr_pem, _, certificate_pem = make_test_identity_and_certificate(
         not_before=datetime.now(UTC) - timedelta(minutes=1)
@@ -3357,6 +3711,7 @@ def test_post_install_detail_rejects_cli_errors_or_missing_success_marker(
             certificate_pem,
             make_csr_settings(),
             397,
+            Path("public-ca.pem"),
         )
 
 
@@ -3366,7 +3721,7 @@ def test_post_install_detail_rejects_cli_errors_or_missing_success_marker(
     ids=["oserror", "valueerror"],
 )
 def test_context_exit_error_after_install_is_post_install_failure(
-    monkeypatch, context_exit_error
+    monkeypatch, accepted_preinstall_trust, context_exit_error
 ):
     csr_pem, _, certificate_pem = make_test_identity_and_certificate(
         not_before=datetime.now(UTC) - timedelta(minutes=1)
@@ -3386,6 +3741,7 @@ def test_context_exit_error_after_install_is_post_install_failure(
             certificate_pem,
             make_csr_settings(),
             397,
+            Path("public-ca.pem"),
         )
 
     assert "may already have changed the switch" in str(raised.value)
@@ -3394,7 +3750,7 @@ def test_context_exit_error_after_install_is_post_install_failure(
 
 
 def test_context_exit_oserror_cannot_reach_main_pre_install_path(
-    monkeypatch, tmp_path, capsys
+    monkeypatch, accepted_preinstall_trust, tmp_path, capsys
 ):
     config_file = tmp_path / "config.toml"
     certificate_file = tmp_path / "certificate.pem"
@@ -3463,6 +3819,7 @@ def test_pre_install_valueerror_and_oserror_remain_safe(monkeypatch, pre_install
             "not reached",
             make_csr_settings(),
             397,
+            Path("public-ca.pem"),
         )
 
     assert not isinstance(raised.value, checker.CertificateInstallationAttemptError)
@@ -4000,7 +4357,55 @@ def test_renew_certificate_composes_stages_in_order_without_files(monkeypatch):
             "webcert-20260829-01",
         )
     assert calls[3][1][4] == certificate_pem
+    assert calls[3][1][7] == ca_file
     assert calls[4][1] == (switch, ca_file, certificate)
+
+
+def test_renew_trust_failure_is_preinstall_and_skips_live_https(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        checker,
+        "renewal_preflight",
+        lambda *args, **kwargs: {
+            "active_certificate_name": "webcert2026",
+            "ta_profile": "webprofile2026",
+            "new_certificate_name": "webcert-20260829-01",
+        },
+    )
+    monkeypatch.setattr(checker, "generate_csr", lambda *args: "CSR")
+    monkeypatch.setattr(checker, "sign_pending_csr", lambda *args: "certificate")
+
+    def reject_untrusted_certificate(*args):
+        calls.append(("install", args))
+        raise ValueError("Issued certificate failed pre-install trust verification")
+
+    monkeypatch.setattr(
+        checker,
+        "install_pending_certificate",
+        reject_untrusted_certificate,
+    )
+    monkeypatch.setattr(
+        checker,
+        "verify_live_https_certificate",
+        lambda *args: calls.append(("https", args)),
+    )
+
+    ca_file = Path("public-ca.pem")
+    with pytest.raises(
+        checker.CertificatePreInstallationError,
+        match="pre-install trust verification",
+    ):
+        checker.renew_certificate(
+            make_config()["switches"][0],
+            "username",
+            "password",
+            make_csr_settings(),
+            make_opnsense_settings(),
+            ca_file,
+        )
+
+    assert [call[0] for call in calls] == ["install"]
+    assert calls[0][1][7] == ca_file
 
 
 @pytest.mark.parametrize(

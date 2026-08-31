@@ -403,9 +403,12 @@ the container example mounts `./known_hosts` read-only at
 ## Aruba Installation and Live Verification
 
 Certificate installation accepts only one bounded ASCII PEM certificate that has
-been validated against the currently pending Aruba CSR. The installer must never
-confirm an unexpected interactive prompt or issue save, reboot, delete, clear,
-or CSR-generation commands.
+been validated against the currently pending Aruba CSR. Before any installation
+command is sent, the certificate must also pass cryptographic server-certificate
+path and configured-host identity verification against a trust store containing
+every public CA certificate in the securely opened `verification.ca_file`
+bundle. The installer must never confirm an unexpected interactive prompt or
+issue save, reboot, delete, clear, or CSR-generation commands.
 
 After installation, a new TLS connection to the switch must verify all three of
 these properties before the operation succeeds:
@@ -415,9 +418,12 @@ these properties before the operation succeeds:
 * The served certificate is byte-for-byte the expected certificate in DER form.
 
 The configured CA file contains public certificate material only. It must be
-loaded by Python's normal SSL trust machinery. TLS hostname checking and
-certificate verification must never be disabled, including during bounded
-post-install retries.
+loaded securely for pre-install path verification and by Python's normal SSL
+trust machinery for live verification. TLS hostname checking and certificate
+verification must never be disabled, including during bounded post-install
+retries. The live check remains mandatory because it verifies what the switch
+actually serves, including exact certificate equality; pre-install path
+verification does not replace it.
 
 An installation or verification error after the Aruba installation command may
 mean that the new certificate is already active. The tool must report that state
