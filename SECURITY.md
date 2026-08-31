@@ -97,6 +97,59 @@ do not claim that independent Docker builds on different architectures,
 engines, filesystem implementations, or timestamps produce a byte-for-byte
 identical final image digest.
 
+## Automated Security Scanning
+
+The repository uses three pinned scanners in addition to GitHub CodeQL default
+setup, which remains the static source-code security scan:
+
+* Gitleaks scans all reachable Git history with the merge-aware options `--cc`,
+  `--full-history`, `--all`, and `--diff-filter=tuxdb`. Before Gitleaks runs,
+  the wrapper requires a reachable commit and independently runs the equivalent
+  host `git log -p -U0` operation. This prevents an underlying Git failure from
+  being mistaken for a clean Gitleaks result.
+* pip-audit scans all four fully resolved, hash-locked dependency sets: runtime,
+  development/test, lock-generation, and security-scanner tooling. It disables
+  pip-based resolution and fails if a committed requirement lacks a hash.
+* Trivy scans OS and language/package vulnerabilities in the exact image archive
+  exported with `docker save` after smoke testing. HIGH or CRITICAL findings
+  fail the scan, including unfixed findings. Trivy receives the archive and a
+  narrow writable cache, but no Docker socket.
+
+Secret and dependency scans run for every pull request and push to `main`, as
+well as weekly. Container CI smoke-tests one image and then scans that same
+image, with a weekly run to detect newly disclosed vulnerabilities. Release
+candidates are scanned after smoke testing and before registry login or
+publication. Scanner executables are immutable and version-pinned, while their
+vulnerability databases and resulting findings intentionally evolve.
+
+The only current scanner exception is the exact pip-audit advisory
+`PYSEC-2026-2858` for `paramiko 4.0.0` in the runtime lock. Its aliases are
+`CVE-2026-44405` and `GHSA-r374-rxx8-8654`; its current severity is Low, with a
+CVSS score of 3.4. The issue concerns Paramiko allowing RSA/SHA-1 signing and
+verification. This is a genuine finding, not a false positive, and the
+repository does not claim that it is currently mitigated.
+
+Paramiko 5 removes the affected SHA-1 behaviour, but Netmiko 4.7.0 currently
+requires Paramiko `>=3.5.0,<5.0` because Paramiko 5 caused significant upstream
+compatibility breakage. Forcing an unsupported major version solely to make the
+scanner green is not acceptable. `PYSEC-2026-2858` is therefore an explicit,
+temporary accepted risk. Issue #10 owns review of the actual SSH algorithms
+required for supported ArubaOS-Switch devices and is the appropriate place to
+determine whether SHA-1 SSH support can be disabled safely; this policy does not
+claim that Aruba compatibility currently requires SHA-1. Remove the exception
+as soon as a supported dependency or protocol-policy remediation is available.
+
+Any future exception must identify the exact finding, include a reviewable
+rationale, and remain as narrow as the scanner permits; scanner failure must
+not be bypassed globally. GitHub native secret scanning and push protection are
+independent complementary repository-level controls that should be verified or
+enabled separately where supported.
+
+Release SBOM handling is unchanged: the existing workflow generates SPDX JSON
+from the tested release candidate, retains it as a workflow artifact, and binds
+build-provenance and SBOM attestations to the published OCI digest. Security
+scanning neither adds a second SBOM system nor rebuilds the release image.
+
 ## Repository and Release Protection
 
 Repository rulesets protect the integrity and provenance of the default branch
