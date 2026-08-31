@@ -34,6 +34,7 @@ from netmiko.exceptions import (
 )
 
 from opnsense_client import OPNsenseClient, validate_base_url
+from secure_file import open_secure_file
 
 DEFAULT_CONFIG_FILE = Path(__file__).resolve().parent.parent / "config.toml"
 
@@ -259,17 +260,26 @@ def configure_logging(debug):
 
 
 def load_config(config_file):
-    try:
-        with config_file.open("rb") as file:
+    config_file = Path(config_file)
+    with open_secure_file(config_file, source_name="Configuration file") as file:
+        try:
             return tomllib.load(file)
+        except tomllib.TOMLDecodeError as error:
+            raise ValueError(
+                f"Invalid TOML in configuration file {config_file}: {error}"
+            ) from error
+        except OSError:
+            raise ValueError(
+                f"Configuration file cannot be read: {config_file}"
+            ) from None
 
-    except FileNotFoundError:
-        raise ValueError(f"Configuration file not found: {config_file}") from None
 
-    except tomllib.TOMLDecodeError as error:
-        raise ValueError(
-            f"Invalid TOML in configuration file {config_file}: {error}"
-        ) from error
+def resolve_config_relative_path(configured_path, config_file):
+    path = Path(configured_path)
+    if not path.is_absolute():
+        config_directory = Path(config_file).parent.resolve()
+        path = config_directory / path
+    return Path(os.path.abspath(path))
 
 
 def parse_identity(value, field_name="identity"):
@@ -342,39 +352,12 @@ def get_ssh_known_hosts_file(config, config_file):
     if "\x00" in configured_path:
         raise ValueError("ssh.known_hosts_file contains unsupported characters")
 
-    try:
-        known_hosts_file = Path(configured_path)
-        if not known_hosts_file.is_absolute():
-            known_hosts_file = config_file.resolve().parent / known_hosts_file
-        known_hosts_file = known_hosts_file.resolve()
-    except (OSError, RuntimeError) as error:
-        raise ValueError(
-            f"ssh.known_hosts_file cannot be resolved: {configured_path}: {error}"
-        ) from error
-
-    try:
-        file_status = known_hosts_file.stat()
-    except FileNotFoundError:
-        raise ValueError(
-            f"ssh.known_hosts_file not found: {known_hosts_file}"
-        ) from None
-    except OSError as error:
-        raise ValueError(
-            f"ssh.known_hosts_file cannot be read: {known_hosts_file}: {error}"
-        ) from error
-
-    if not stat.S_ISREG(file_status.st_mode):
-        raise ValueError(
-            f"ssh.known_hosts_file is not a regular file: {known_hosts_file}"
-        )
-
-    try:
-        with known_hosts_file.open("rb"):
-            pass
-    except OSError as error:
-        raise ValueError(
-            f"ssh.known_hosts_file cannot be read: {known_hosts_file}: {error}"
-        ) from error
+    known_hosts_file = resolve_config_relative_path(configured_path, config_file)
+    with open_secure_file(
+        known_hosts_file,
+        source_name="ssh.known_hosts_file",
+    ):
+        pass
 
     return known_hosts_file
 
@@ -503,27 +486,18 @@ def validate_ssh_username(username, field_name="SSH username"):
 
 
 def read_password_file(configured_path, config_file):
-    password_file = Path(configured_path)
-    if not password_file.is_absolute():
-        password_file = config_file.resolve().parent / password_file
+    password_file = resolve_config_relative_path(configured_path, config_file)
 
-    try:
-        with password_file.open("rb") as file:
-            if not stat.S_ISREG(os.fstat(file.fileno()).st_mode):
-                raise ValueError(
-                    f"switches.password_file is not a regular file: {password_file}"
-                )
+    with open_secure_file(
+        password_file,
+        source_name="switches.password_file",
+    ) as file:
+        try:
             password_bytes = file.read(MAX_PASSWORD_FILE_BYTES + 1)
-    except FileNotFoundError:
-        raise ValueError(f"switches.password_file not found: {password_file}") from None
-    except IsADirectoryError:
-        raise ValueError(
-            f"switches.password_file is not a regular file: {password_file}"
-        ) from None
-    except OSError as error:
-        raise ValueError(
-            f"switches.password_file cannot be read: {password_file}: {error}"
-        ) from error
+        except OSError:
+            raise ValueError(
+                f"switches.password_file cannot be read: {password_file}"
+            ) from None
 
     if len(password_bytes) > MAX_PASSWORD_FILE_BYTES:
         raise ValueError(
@@ -788,27 +762,9 @@ def get_verification_ca_file(config, config_file):
     if "\x00" in configured_path:
         raise ValueError("verification.ca_file contains unsupported characters")
 
-    ca_file = Path(configured_path)
-    if not ca_file.is_absolute():
-        ca_file = config_file.resolve().parent / ca_file
-
-    try:
-        with ca_file.open("rb") as file:
-            if not stat.S_ISREG(os.fstat(file.fileno()).st_mode):
-                raise ValueError(
-                    f"verification.ca_file is not a regular file: {ca_file}"
-                )
-
-    except FileNotFoundError:
-        raise ValueError(f"verification.ca_file not found: {ca_file}") from None
-    except IsADirectoryError:
-        raise ValueError(
-            f"verification.ca_file is not a regular file: {ca_file}"
-        ) from None
-    except OSError as error:
-        raise ValueError(
-            f"verification.ca_file cannot be read: {ca_file}: {error}"
-        ) from error
+    ca_file = resolve_config_relative_path(configured_path, config_file)
+    with open_secure_file(ca_file, source_name="verification.ca_file"):
+        pass
 
     try:
         ssl.create_default_context(cafile=str(ca_file))
@@ -1321,6 +1277,12 @@ def get_device_parameters(switch, username, password):
             "SSH known_hosts configuration was not validated for this switch"
         ) from None
 
+    with open_secure_file(
+        known_hosts_file,
+        source_name="ssh.known_hosts_file",
+    ):
+        pass
+
     return {
         "device_type": "aruba_osswitch",
         "host": switch["host"],
@@ -1366,9 +1328,8 @@ class LiveHTTPSVerificationError(ValueError):
 
 def renewal_preflight(switch, username, password, *, now=None):
     """Read switch certificate state and select a safe renewal name."""
-    device = get_device_parameters(switch, username, password)
-
     try:
+        device = get_device_parameters(switch, username, password)
         with ConnectHandler(**device) as connection:
             summary_output = connection.send_command(
                 "show crypto pki local-certificate summary"
@@ -1917,6 +1878,8 @@ def verify_live_https_certificate(
 ):
     host = validate_switch_signing_identity(switch)["common_name"]
     expected_der = expected_certificate.public_bytes(serialization.Encoding.DER)
+    with open_secure_file(ca_file, source_name="verification.ca_file"):
+        pass
     context = ssl.create_default_context(cafile=str(ca_file))
 
     if not context.check_hostname or context.verify_mode != ssl.CERT_REQUIRED:
@@ -2432,7 +2395,19 @@ def main():
             results.append("error")
             continue
 
-        results.append(check_switch(switch, username, password, warning_days))
+        try:
+            status = check_switch(switch, username, password, warning_days)
+        except ValueError as error:
+            print()
+            print(switch["name"])
+            print("-" * len(switch["name"]))
+            print(f"Host:             {switch['host']}")
+            print("Status:           ERROR")
+            print(f"Reason:           {error}")
+            results.append("error")
+            continue
+
+        results.append(status)
 
     print_summary(results)
 

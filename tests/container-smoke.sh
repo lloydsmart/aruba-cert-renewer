@@ -44,11 +44,19 @@ docker run --rm \
     "$image" \
     -c 'test -z "$(find /config /run/secrets -mindepth 1 -print -quit)" && test ! -w /app/src/aruba_cert_renewer.py'
 
-printf '%s\n' 'synthetic-api-key' >"$temporary_directory/opnsense_api_key"
-printf '%s\n' 'synthetic-api-secret' >"$temporary_directory/opnsense_api_secret"
-chmod 0444 \
-    "$temporary_directory/opnsense_api_key" \
-    "$temporary_directory/opnsense_api_secret"
+docker run --rm \
+    --network none \
+    --user 0:0 \
+    --mount "type=bind,src=$temporary_directory,dst=/staging" \
+    --entrypoint /bin/sh \
+    "$image" \
+    -c 'printf "%s\n" synthetic-api-key >/staging/opnsense_api_key
+        printf "%s\n" synthetic-api-secret >/staging/opnsense_api_secret
+        chown 0:10001 /staging/opnsense_api_key /staging/opnsense_api_secret
+        chmod 0440 /staging/opnsense_api_key /staging/opnsense_api_secret'
+
+[[ "$(stat -c '%u:%g %a' "$temporary_directory/opnsense_api_key")" == "0:10001 440" ]]
+[[ "$(stat -c '%u:%g %a' "$temporary_directory/opnsense_api_secret")" == "0:10001 440" ]]
 
 docker run --rm \
     --network none \

@@ -5,7 +5,6 @@ import json
 import os
 import re
 import ssl
-import stat
 import unicodedata
 import uuid
 from urllib.error import HTTPError, URLError
@@ -16,6 +15,8 @@ from urllib.request import (
     Request,
     build_opener,
 )
+
+from secure_file import SecureFileError, open_secure_file
 
 CA_LIST_PATH = "/api/trust/cert/ca_list"
 CERT_ADD_PATH = "/api/trust/cert/add"
@@ -82,15 +83,15 @@ def _read_secret_file(configured_path, source_name):
         raise OPNsenseAPIError(f"{source_name} must be a non-empty safe path")
 
     try:
-        with open(configured_path, "rb") as secret_file:
-            if not stat.S_ISREG(os.fstat(secret_file.fileno()).st_mode):
-                raise OPNsenseAPIError(f"{source_name} is not a regular file")
+        with open_secure_file(
+            configured_path,
+            source_name=source_name,
+            disclose_path=False,
+        ) as secret_file:
             secret_bytes = secret_file.read(MAX_SECRET_FILE_BYTES + 1)
-    except OPNsenseAPIError:
-        raise
-    except IsADirectoryError:
-        raise OPNsenseAPIError(f"{source_name} is not a regular file") from None
-    except (OSError, ValueError):
+    except SecureFileError as error:
+        raise OPNsenseAPIError(str(error)) from None
+    except OSError:
         raise OPNsenseAPIError(f"{source_name} could not be read") from None
 
     if len(secret_bytes) > MAX_SECRET_FILE_BYTES:
