@@ -29,7 +29,8 @@ trap cleanup EXIT
 
 archive="$temporary_directory/image.tar"
 cache_directory="$temporary_directory/cache"
-mkdir -- "$cache_directory"
+trivy_tmp_directory="$temporary_directory/tmp"
+mkdir -- "$cache_directory" "$trivy_tmp_directory"
 docker save --output "$archive" "$image"
 
 docker run --rm \
@@ -38,9 +39,11 @@ docker run --rm \
     --security-opt no-new-privileges:true \
     --user "$(id -u):$(id -g)" \
     --env HOME=/tmp \
+    --env TMPDIR=/trivy-tmp \
     --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m \
     --mount "type=bind,src=$archive,dst=/scan/image.tar,readonly" \
     --mount "type=bind,src=$cache_directory,dst=/cache" \
+    --mount "type=bind,src=$trivy_tmp_directory,dst=/trivy-tmp" \
     "$trivy_image" \
     --cache-dir /cache \
     image \
