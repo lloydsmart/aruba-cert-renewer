@@ -1,6 +1,6 @@
 services:
   aruba-cert-renewer:
-    image: ghcr.io/lloydsmart/aruba-cert-renewer:latest
+    image: ${ARUBA_CERT_RENEWER_IMAGE:?Set ARUBA_CERT_RENEWER_IMAGE to a reviewed release image}
     restart: "no"
     read_only: true
     cap_drop:

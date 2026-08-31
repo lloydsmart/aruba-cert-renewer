@@ -72,6 +72,15 @@ docker run --rm \
     "$image" \
     -c 'import sys; sys.path.insert(0, "/app/src"); from opnsense_client import OPNsenseClient; OPNsenseClient("https://opnsense.example.com")'
 
-docker compose -f "$repository_root/compose.example.yaml" config --quiet
+if env -u ARUBA_CERT_RENEWER_IMAGE \
+    docker compose --env-file /dev/null \
+        -f "$repository_root/compose.example.yaml" config --quiet >/dev/null 2>&1; then
+    printf '%s\n' "Compose example accepted a missing ARUBA_CERT_RENEWER_IMAGE" >&2
+    exit 1
+fi
+
+ARUBA_CERT_RENEWER_IMAGE="$image" \
+    docker compose --env-file /dev/null \
+        -f "$repository_root/compose.example.yaml" config --quiet
 
 printf '%s\n' "Container smoke tests passed for $image"

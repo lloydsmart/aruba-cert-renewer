@@ -132,11 +132,19 @@ Build the local image with:
 docker build -t aruba-cert-renewer:local .
 ```
 
-For a normal deployment, pull the most recently published stable release:
+Production deployments must explicitly select a reviewed release image. Prefer
+the published OCI manifest digest because it fixes the exact container object
+that will run. Store the selection in the deployment's persistent `.env` file
+or equivalent managed configuration, replacing the placeholder with the digest
+for the intended release:
 
-```bash
-docker pull ghcr.io/lloydsmart/aruba-cert-renewer:latest
+```dotenv
+ARUBA_CERT_RENEWER_IMAGE=ghcr.io/lloydsmart/aruba-cert-renewer@sha256:<release-digest>
 ```
+
+The `.env` file is ignored by this repository. A release version can instead be
+selected with `ghcr.io/lloydsmart/aruba-cert-renewer:vX.Y.Z`, but version tags
+provide a readable audit identity rather than intrinsic immutability.
 
 Container CI and container publishing are deliberately separate. During normal
 development, a relevant pull request or push to `main` builds the container,
@@ -153,14 +161,54 @@ successful stable release publishes:
 
 ```text
 ghcr.io/lloydsmart/aruba-cert-renewer:vX.Y.Z
-ghcr.io/lloydsmart/aruba-cert-renewer:sha-<commit>
+ghcr.io/lloydsmart/aruba-cert-renewer:sha-<full-source-commit>
 ghcr.io/lloydsmart/aruba-cert-renewer:latest
 ```
 
-The `vX.Y.Z` tag identifies the human release, the `sha-...` tag identifies its
-exact source commit for audit purposes, and `latest` identifies the newest
-successfully published stable release. A GitHub prerelease such as
-`v1.2.3-rc.1` publishes its version and SHA tags but does not move `latest`.
+The workflow also resolves the published OCI manifest digest and uses it for
+the release's provenance and SBOM attestations. Release publication therefore
+ties together these identities:
+
+```text
+GitHub release/tag
+        ↓
+source commit
+        ↓
+sha-<full-source-commit> registry tag
+        ↓
+tested published OCI image
+        ↓
+OCI sha256 manifest digest
+```
+
+Each reference serves a different purpose:
+
+- `ghcr.io/lloydsmart/aruba-cert-renewer@sha256:<digest>` addresses the exact
+  published OCI manifest. It is content-addressed, provides the strongest
+  deployment immutability, and is the preferred production reference.
+- `ghcr.io/lloydsmart/aruba-cert-renewer:vX.Y.Z` identifies the human-readable
+  GitHub release and its source tag. It improves operational auditability, but
+  remains a registry tag and is not intrinsically content-addressed or
+  immutable.
+- `ghcr.io/lloydsmart/aruba-cert-renewer:sha-<full-source-commit>` identifies
+  the exact source commit used for publication and makes source tracing easier.
+  It also remains a mutable registry tag rather than a content-addressed
+  reference.
+- `ghcr.io/lloydsmart/aruba-cert-renewer:latest` is a convenience pointer to
+  the newest successfully published stable release. It intentionally moves
+  when a newer stable release is published, so it is useful for discovery or
+  testing but is not the recommended unattended production reference.
+
+Of these reference types, only the OCI digest is intrinsically content-addressed
+and immutable. Version and source-commit tags improve auditability without
+providing that registry-level property.
+
+A GitHub prerelease such as `v1.2.3-rc.1` publishes its version and SHA tags but
+does not move `latest`. The version and source-commit tags remain useful
+human-readable and auditable references even when production pins the digest.
+No single reference proves every link in the publication chain: the version
+names the selected release, the SHA tag exposes its source correlation, and the
+digest fixes the container object deployed.
 
 The release workflow has not by itself demonstrated that a package is already
 available. Its first successful publication may create a GHCR package whose
@@ -168,9 +216,30 @@ visibility must then be checked and, for the intended deployment, manually set
 to public in GitHub. The workflow does not administer package visibility and
 does not use a personal access token.
 
-Unraid is intended to consume `latest` once the package is public. Whether
-Unraid automatically pulls a changed image and recreates or restarts the
-container is a separate operational policy.
+Unraid and other unattended deployments should select a reviewed release
+explicitly, preferably by OCI digest, rather than follow `latest`. Package
+visibility and the platform's pull/recreate policy remain separate operational
+concerns.
+
+Treat an image upgrade as a reviewed configuration change:
+
+1. Review and select the new GitHub release and its source commit.
+2. Identify the OCI manifest digest that corresponds to that published release.
+3. Update `ARUBA_CERT_RENEWER_IMAGE` in the persistent deployment configuration.
+4. Pull the selected image and recreate or rerun the one-shot container through
+   the external scheduler or deployment platform.
+
+For a manual Compose run after the configuration and secrets are ready, the
+last step can be performed with:
+
+```bash
+docker compose pull
+docker compose run --rm aruba-cert-renewer
+```
+
+Because this container exits after one renewal pass, these commands do not
+provide production scheduling. Updating the image is explicit and is not an
+automatic consequence of a mutable tag moving.
 
 The image runs as UID/GID `10001:10001`. A hardened, network-isolated help
 check requires no deployment files:
@@ -190,8 +259,14 @@ docker run --rm \
 mounts and runtime restrictions. Validate its syntax with:
 
 ```bash
-docker compose -f compose.example.yaml config
+ARUBA_CERT_RENEWER_IMAGE='ghcr.io/lloydsmart/aruba-cert-renewer:vX.Y.Z' \
+  docker compose -f compose.example.yaml config
 ```
+
+The version above is a syntax-validation placeholder, not a real release or the
+preferred production reference. Omitting `ARUBA_CERT_RENEWER_IMAGE`
+intentionally fails validation so copying the example cannot silently select an
+image.
 
 Do not start the example until local configuration, public CA, and secret files
 have been created. The expected paths inside the container are:
