@@ -191,14 +191,45 @@ as soon as a supported dependency or protocol-policy remediation is available.
 
 Any future exception must identify the exact finding, include a reviewable
 rationale, and remain as narrow as the scanner permits; scanner failure must
-not be bypassed globally. GitHub native secret scanning and push protection are
-independent complementary repository-level controls that should be verified or
-enabled separately where supported.
+not be bypassed globally.
 
 Release SBOM handling is unchanged: the existing workflow generates SPDX JSON
 from the tested release candidate, retains it as a workflow artifact, and binds
 build-provenance and SBOM attestations to the published OCI digest. Security
 scanning neither adds a second SBOM system nor rebuilds the release image.
+
+### Reconstructing GitHub-Native Security Settings
+
+The settings in this checklist are repository-level GitHub state rather than
+controls implemented in tracked files. The Dependabot version-update
+configuration is the exception: it is reconstructed from the tracked
+`.github/dependabot.yml` file. After a repository migration or recreation,
+verify:
+
+* Private vulnerability reporting: enabled.
+* Dependency graph: enabled.
+* Automatic dependency submission: enabled.
+* Dependabot alerts: enabled.
+* Dependabot malware alerts: enabled.
+* Dependabot security updates: enabled.
+* Grouped security updates: enabled.
+* Dependabot version updates: configured through `.github/dependabot.yml`.
+* CodeQL analysis: default setup enabled.
+* Copilot Autofix for CodeQL: enabled.
+* AI findings (Preview): disabled intentionally. This feature is not part of
+  the repository's required security control set. It previously caused a
+  failing `ghas-code-scanning-agentic` pull-request check when GitHub attempted
+  to use an unsupported model.
+* Secret Protection / secret scanning: enabled.
+* Push protection: enabled.
+
+These native features complement rather than replace the existing controls.
+Gitleaks remains the full reachable-history secret scan, pip-audit remains the
+committed dependency-lock audit, Trivy remains the tested-container-image
+scanner, and CodeQL remains the native SAST and code-scanning control.
+Dependabot version updates remain defined in `.github/dependabot.yml`.
+The separately documented repository rulesets continue to protect `main` and
+release tags.
 
 ## Repository and Release Protection
 
