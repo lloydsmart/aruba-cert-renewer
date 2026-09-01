@@ -40,11 +40,13 @@ image_user=$(docker image inspect --format '{{.Config.User}}' "$image")
 exposed_ports=$(docker image inspect --format '{{json .Config.ExposedPorts}}' "$image")
 entrypoint=$(docker image inspect --format '{{json .Config.Entrypoint}}' "$image")
 default_command=$(docker image inspect --format '{{json .Config.Cmd}}' "$image")
+unraid_icon=$(docker image inspect --format '{{index .Config.Labels "net.unraid.docker.icon"}}' "$image")
 
 [[ "$image_user" == "10001:10001" ]]
 [[ "$exposed_ports" == "null" || "$exposed_ports" == "{}" ]]
 [[ "$entrypoint" == '["python","/app/src/aruba_cert_renewer.py"]' ]]
 [[ "$default_command" == '["--config","/config/config.toml","--renew-due"]' ]]
+[[ "$unraid_icon" == "https://raw.githubusercontent.com/lloydsmart/aruba-cert-renewer/main/assets/icon.png" ]]
 
 docker run --rm \
     --network none \
