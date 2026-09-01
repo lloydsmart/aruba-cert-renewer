@@ -75,3 +75,9 @@ python -m piptools compile \
     --allow-unsafe \
     --output-file=requirements-tools.txt \
     requirements-tools.in
+
+python -m piptools compile \
+    "${compile_options[@]}" \
+    --allow-unsafe \
+    --output-file=requirements-security.txt \
+    requirements-security.in

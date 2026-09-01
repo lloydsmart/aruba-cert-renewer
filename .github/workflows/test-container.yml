@@ -3,6 +3,9 @@ name: Container tests
 on:
   workflow_dispatch:
 
+  schedule:
+    - cron: '47 5 * * 3'
+
   push:
     branches:
       - main
@@ -14,6 +17,7 @@ on:
       - 'requirements.in'
       - 'requirements.txt'
       - 'src/**'
+      - 'scripts/scan-container.sh'
       - 'tests/container-smoke.sh'
       - '.github/workflows/test-container.yml'
 
@@ -28,6 +32,7 @@ on:
       - 'requirements.in'
       - 'requirements.txt'
       - 'src/**'
+      - 'scripts/scan-container.sh'
       - 'tests/container-smoke.sh'
       - '.github/workflows/test-container.yml'
 
@@ -38,10 +43,15 @@ jobs:
   test:
     name: Container smoke tests
     runs-on: ubuntu-latest
+    env:
+      TEST_IMAGE: aruba-cert-renewer:test
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Build and test container
-        run: tests/container-smoke.sh
+        run: tests/container-smoke.sh "$TEST_IMAGE"
+
+      - name: Scan tested container for vulnerabilities
+        run: ./scripts/scan-container.sh "$TEST_IMAGE"

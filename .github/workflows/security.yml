@@ -1,0 +1,56 @@
+name: Security scanning
+
+on:
+  workflow_dispatch:
+
+  push:
+    branches:
+      - main
+
+  pull_request:
+    branches:
+      - main
+
+  schedule:
+    - cron: '23 4 * * 2'
+
+permissions:
+  contents: read
+
+jobs:
+  secrets:
+    name: Full-history secret scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout complete repository history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Scan complete reachable history
+        run: ./scripts/scan-secrets.sh
+
+  dependencies:
+    name: Python dependency vulnerability scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements-security.txt
+
+      - name: Install security scanner dependencies
+        run: python -m pip install --require-hashes -r requirements-security.txt
+
+      - name: Audit committed dependency locks
+        run: ./scripts/scan-dependencies.sh

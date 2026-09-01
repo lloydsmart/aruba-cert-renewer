@@ -76,6 +76,9 @@ jobs:
       - name: Build and smoke-test release candidate
         run: tests/container-smoke.sh "$CANDIDATE_IMAGE"
 
+      - name: Scan release candidate for vulnerabilities
+        run: ./scripts/scan-container.sh "$CANDIDATE_IMAGE"
+
       - name: Generate release SPDX JSON SBOM
         uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:

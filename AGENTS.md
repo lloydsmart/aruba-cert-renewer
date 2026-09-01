@@ -174,6 +174,12 @@ Security-sensitive changes should normally test both:
 * The intended successful behaviour.
 * The relevant rejection or fail-closed behaviour.
 
+Use `scripts/scan-secrets.sh`, `scripts/scan-dependencies.sh`, and
+`scripts/scan-container.sh` for repository security scans. Scanner versions are
+intentionally pinned. Fix findings where practical or require explicit review;
+do not add broad suppressions, ignored vulnerability classes, or allow-failure
+behaviour. Do not change GitHub security settings without an explicit request.
+
 Tests must not require real Aruba switches, a real OPNsense instance, live
 credentials, or access to private infrastructure unless explicitly requested.
 

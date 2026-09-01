@@ -108,10 +108,10 @@ python -m pip install --require-hashes -r requirements-dev.txt
 No additional HTTP runtime dependency is needed.
 
 Direct dependencies are maintained in `requirements.in`,
-`requirements-dev.in`, and `requirements-tools.in`. Their corresponding
-`.txt` files are generated locks containing exact transitive versions and
-package hashes. The development lock is compiled with the runtime lock as a
-constraint and is installed alongside it.
+`requirements-dev.in`, `requirements-tools.in`, and `requirements-security.in`.
+Their corresponding `.txt` files are generated locks containing exact
+transitive versions and package hashes. The development lock is compiled with
+the runtime lock as a constraint and is installed alongside it.
 
 To regenerate the locks, create a clean Python 3.12 environment and install the
 pinned lock-generation tools from their own lock:
@@ -121,13 +121,49 @@ python3.12 -m venv .venv-locks
 source .venv-locks/bin/activate
 python -m pip install --require-hashes -r requirements-tools.txt
 ./scripts/compile-requirements.sh
-git diff -- requirements.txt requirements-dev.txt requirements-tools.txt
+git diff -- requirements.txt requirements-dev.txt requirements-tools.txt \
+  requirements-security.txt
 ```
 
 A normal compilation preserves existing resolved versions and is suitable for
 checking lock freshness. For an intentional full dependency refresh, run
 `./scripts/compile-requirements.sh --upgrade`. Review all input and generated
 lock changes before committing them.
+
+## Automated Security Scanning
+
+CI scans complete reachable Git history for secrets on every pull request and
+push to `main`, and repeats the scan weekly. Run the same merge-aware,
+full-history Gitleaks scan locally with:
+
+```bash
+./scripts/scan-secrets.sh
+```
+
+The dependency audit covers the committed runtime, development,
+lock-generation, and security-scanner locks. Install the pinned scanner in a
+Python 3.12 environment and run:
+
+```bash
+python -m pip install --require-hashes -r requirements-security.txt
+./scripts/scan-dependencies.sh
+```
+
+Container CI scans the exact image produced by the smoke test. To scan an
+already-built local image for HIGH and CRITICAL vulnerabilities:
+
+```bash
+./scripts/scan-container.sh aruba-cert-renewer:local
+```
+
+GitHub CodeQL default setup remains the static source-code scan. Release images
+already receive an SPDX JSON SBOM plus build-provenance and SBOM attestations
+bound to the published digest. No Gitleaks or CVE-specific Trivy suppressions
+are enabled by default. Trivy reports every HIGH or CRITICAL finding and gates
+on findings with an available fixed version; the exact pip-audit accepted-risk
+exception is documented in `SECURITY.md`. GitHub native secret scanning and push
+protection are complementary repository settings that maintainers should verify
+or enable separately where supported.
 
 ## Optional Local Commit Guard
 

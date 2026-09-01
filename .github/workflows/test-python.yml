@@ -80,4 +80,5 @@ jobs:
           git diff --exit-code -- \
             requirements.txt \
             requirements-dev.txt \
-            requirements-tools.txt
+            requirements-tools.txt \
+            requirements-security.txt
