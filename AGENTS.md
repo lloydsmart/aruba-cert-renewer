@@ -143,6 +143,10 @@ Do not overwrite existing CSR or certificate output files.
 
 The application targets Python 3.12 or later.
 
+The full pytest suite runs in CI on Python 3.12 and Python 3.14. Python 3.14
+represents the production application runtime family, while dependency lock
+generation remains intentionally fixed to Python 3.12.
+
 Runtime dependencies are deliberately small. Do not add a dependency when the
 Python standard library or an existing dependency provides an adequate and
 secure implementation.
