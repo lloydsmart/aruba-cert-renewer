@@ -1,5 +1,6 @@
 import base64
 import json
+import ssl
 from email.message import Message
 from io import BytesIO
 from urllib.error import HTTPError, URLError
@@ -582,7 +583,24 @@ def test_basic_authentication_and_tls_context_are_used(monkeypatch):
     assert captured["request"].get_header("Authorization") == f"Basic {expected}"
     assert captured["request"].full_url == BASE_URL + opnsense_client.CA_LIST_PATH
     assert captured["ssl_context"].check_hostname
-    assert captured["ssl_context"].verify_mode.name == "CERT_REQUIRED"
+    assert captured["ssl_context"].verify_mode == ssl.CERT_REQUIRED
+    assert captured["ssl_context"].minimum_version == ssl.TLSVersion.TLSv1_2
+    assert captured["ssl_context"].maximum_version == ssl.TLSVersion.MAXIMUM_SUPPORTED
+
+
+def test_opnsense_client_uses_shared_tls_context_policy(monkeypatch):
+    context = object()
+    calls = []
+    monkeypatch.setattr(
+        opnsense_client,
+        "create_client_tls_context",
+        lambda: calls.append(True) or context,
+    )
+
+    client = opnsense_client.OPNsenseClient(BASE_URL)
+
+    assert calls == [True]
+    assert client._ssl_context is context
 
 
 def test_sign_csr_sends_nested_model_payload(monkeypatch):

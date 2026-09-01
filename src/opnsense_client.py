@@ -4,7 +4,6 @@ import base64
 import json
 import os
 import re
-import ssl
 import unicodedata
 import uuid
 from urllib.error import HTTPError, URLError
@@ -17,6 +16,7 @@ from urllib.request import (
 )
 
 from secure_file import SecureFileError, open_secure_file
+from tls_policy import create_client_tls_context
 
 CA_LIST_PATH = "/api/trust/cert/ca_list"
 CERT_ADD_PATH = "/api/trust/cert/add"
@@ -137,7 +137,7 @@ class OPNsenseClient:
         self.base_url = validate_base_url(base_url)
         self.timeout = timeout
         self._authorization = self._load_authorization()
-        self._ssl_context = ssl.create_default_context()
+        self._ssl_context = create_client_tls_context()
 
     @staticmethod
     def _load_authorization():

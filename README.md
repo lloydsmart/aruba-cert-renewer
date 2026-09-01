@@ -62,6 +62,34 @@ The OPNsense client is restricted to these routes:
 > expose stored private-key material through that endpoint. This project also
 > never requests the `prv` or `pkcs12` download types.
 
+## Transport and Terminal-Output Policy
+
+All OPNsense API and Aruba live-verification HTTPS clients require TLS 1.2 or
+newer. TLS 1.3 remains available when both endpoints support it. CA certificate
+verification and normal DNS hostname or IP-address verification are mandatory;
+the Aruba live check additionally requires exact DER equality with the expected
+certificate.
+
+Supported ArubaOS-S WC.16.11 devices have been verified to offer modern,
+mutually supported SSH algorithms. The application therefore disables CBC and
+3DES ciphers, MD5 and SHA-1 MACs, SHA-1 key exchange, and the SHA-1 `ssh-rsa`
+signature algorithm. AES-CTR, HMAC-SHA2, ECDH-SHA2 and SHA-256 key exchange,
+and RSA-SHA2 host-key signatures remain available. RSA host keys remain
+supported; only their legacy SHA-1 signature algorithm is prohibited. DSA and
+Aruba-specific X.509 SSH algorithms are not required or enabled by the
+application.
+
+Some legacy ArubaOS-S WC.16.11 firmware emits RSA/SHA-1 PKCS#10 CSR
+self-signatures. SHA-1 is accepted only inside CSR proof-of-possession
+verification and should be removed when supported devices no longer require
+it. Issued HTTPS certificates must use SHA-256 or stronger, and SSH SHA-1
+algorithms remain independently disabled.
+
+Operator-facing configured, device-derived, and error text visibly escapes C0
+and C1 terminal controls. The same boundary is applied after debug log records
+are formatted, preventing ANSI/control-sequence injection and forged log lines.
+Deliberately emitted validated PEM CSR output remains unchanged.
+
 ## Requirements
 
 - Python 3.12 or later

@@ -1,5 +1,6 @@
 import base64
 import ipaddress
+import logging
 import re
 import warnings
 from datetime import UTC, date, datetime, timedelta
@@ -710,6 +711,73 @@ def test_device_parameters_require_dedicated_strict_known_hosts():
     assert device["alt_key_file"] == str(KNOWN_HOSTS_FILE.resolve())
 
 
+def test_device_parameters_disable_only_required_legacy_ssh_algorithms():
+    switch = make_config()["switches"][0]
+    expected = {
+        category: list(algorithms)
+        for category, algorithms in checker.SSH_DISABLED_ALGORITHMS.items()
+    }
+    canonical_snapshot = {
+        category: tuple(algorithms)
+        for category, algorithms in checker.SSH_DISABLED_ALGORITHMS.items()
+    }
+
+    first_disabled = checker.get_device_parameters(switch, "username", "password")[
+        "disabled_algorithms"
+    ]
+    second_disabled = checker.get_device_parameters(switch, "username", "password")[
+        "disabled_algorithms"
+    ]
+
+    assert first_disabled == expected
+    assert isinstance(first_disabled, dict)
+    assert first_disabled is not checker.SSH_DISABLED_ALGORITHMS
+    assert first_disabled is not second_disabled
+    for category in expected:
+        assert isinstance(first_disabled[category], list)
+        assert first_disabled[category] is not second_disabled[category]
+
+    assert set(first_disabled["ciphers"]) == {
+        "aes128-cbc",
+        "aes192-cbc",
+        "aes256-cbc",
+        "3des-cbc",
+    }
+    assert set(first_disabled["macs"]) == {
+        "hmac-sha1",
+        "hmac-sha1-96",
+        "hmac-md5",
+        "hmac-md5-96",
+    }
+    assert set(first_disabled["kex"]) == {
+        "diffie-hellman-group-exchange-sha1",
+        "diffie-hellman-group14-sha1",
+        "diffie-hellman-group1-sha1",
+    }
+    assert first_disabled["keys"] == ["ssh-rsa"]
+    assert first_disabled["pubkeys"] == ["ssh-rsa"]
+
+    all_disabled = {
+        algorithm for values in first_disabled.values() for algorithm in values
+    }
+    assert "rsa-sha2-256" not in all_disabled
+    assert "rsa-sha2-512" not in all_disabled
+    assert "aes256-ctr" not in all_disabled
+    assert "hmac-sha2-256" not in all_disabled
+    assert "ecdh-sha2-nistp256" not in all_disabled
+    assert "diffie-hellman-group-exchange-sha256" not in all_disabled
+
+    first_disabled["ciphers"].append("test-only-cipher")
+    first_disabled["keys"].clear()
+    first_disabled["test-only-category"] = ["test-only-algorithm"]
+
+    assert second_disabled == expected
+    assert {
+        category: tuple(algorithms)
+        for category, algorithms in checker.SSH_DISABLED_ALGORITHMS.items()
+    } == canonical_snapshot
+
+
 def test_device_parameters_revalidate_known_hosts_before_path_reopen(tmp_path):
     known_hosts_file = tmp_path / "known_hosts"
     known_hosts_file.write_text("switch.example.com ssh-rsa test\n", encoding="ascii")
@@ -959,6 +1027,86 @@ def test_check_switch_rejects_pending_web_csr(monkeypatch):
     )
 
     assert result == "error"
+
+
+def test_operator_output_escapes_configured_and_device_controls(monkeypatch, capsys):
+    expiration = date.today() + timedelta(days=365)
+    connection = FakeConnection(
+        version_output="Software revision : WC.16.11.0015",
+        certificate_output=make_certificate_summary(
+            expiration,
+            name="webcert\x1b[31mFAKE",
+            profile="profile\x7fFAKE",
+        ),
+    )
+    monkeypatch.setattr(checker, "ConnectHandler", lambda **kwargs: connection)
+    switch = make_config()["switches"][0]
+    switch["name"] = "SWITCH\x1b[2JFAKE"
+
+    assert checker.check_switch(switch, "username", "password", 30) == "ok"
+
+    output = capsys.readouterr().out
+    assert "\x1b" not in output
+    assert "\x7f" not in output
+    assert r"SWITCH\x1b[2JFAKE" in output
+    assert r"webcert\x1b[31mFAKE" in output
+    assert r"profile\x7fFAKE" in output
+    display_name = r"SWITCH\x1b[2JFAKE"
+    assert f"{display_name}\n{'-' * len(display_name)}\n" in output
+
+
+def test_operator_error_output_stays_on_one_safe_logical_line(monkeypatch, capsys):
+    class FailingConnection:
+        def __enter__(self):
+            raise RuntimeError("bad\nStatus: OK\x1b[31m")
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
+    monkeypatch.setattr(checker, "ConnectHandler", lambda **kwargs: FailingConnection())
+
+    assert (
+        checker.check_switch(make_config()["switches"][0], "username", "password", 30)
+        == "error"
+    )
+
+    output = capsys.readouterr().out
+    assert "bad\nStatus: OK\x1b[31m" not in output
+    assert r"Reason:           bad\nStatus: OK\x1b[31m" in output
+
+
+def test_terminal_sanitizer_preserves_printable_unicode_and_escapes_c0_c1():
+    assert checker.sanitize_terminal_text("Normal café 日本語") == "Normal café 日本語"
+    assert checker.sanitize_terminal_text("a\0\t\n\r\x1b\x7f\x80\x9fb") == (
+        r"a\x00\t\n\r\x1b\x7f\x80\x9fb"
+    )
+
+
+def test_debug_log_formatter_escapes_controls_after_formatting():
+    formatter = checker.SanitizingFormatter("%(levelname)s %(name)s: %(message)s")
+    record = logging.LogRecord(
+        "netmiko",
+        logging.DEBUG,
+        __file__,
+        1,
+        "remote %s",
+        ("value\x1b[2J\nforged",),
+        None,
+    )
+
+    formatted = formatter.format(record)
+
+    assert "\x1b" not in formatted
+    assert "\n" not in formatted
+    assert formatted == r"DEBUG netmiko: remote value\x1b[2J\nforged"
+
+
+def test_deliberate_pem_csr_stdout_is_not_sanitized(capsys):
+    csr_pem = make_test_csr()
+
+    checker.write_or_print_csr(csr_pem, None)
+
+    assert capsys.readouterr().out == csr_pem
 
 
 def test_monitoring_resolves_credentials_for_each_switch(monkeypatch, tmp_path):
@@ -3027,8 +3175,8 @@ def test_get_verification_ca_file_resolves_relative_to_config(monkeypatch, tmp_p
     calls = []
 
     monkeypatch.setattr(
-        checker.ssl,
-        "create_default_context",
+        checker,
+        "create_client_tls_context",
         lambda *, cafile: calls.append(cafile) or object(),
     )
 
@@ -3843,6 +3991,8 @@ class FakeTLSSocket:
 class FakeVerifyingSSLContext:
     check_hostname = True
     verify_mode = checker.ssl.CERT_REQUIRED
+    minimum_version = checker.ssl.TLSVersion.TLSv1_2
+    maximum_version = checker.ssl.TLSVersion.MAXIMUM_SUPPORTED
 
     def __init__(self, tls_results):
         self.tls_results = iter(tls_results)
@@ -3875,8 +4025,8 @@ def test_verify_live_https_uses_verified_hostname_and_exact_der(
     context_calls = []
     connection_calls = []
     monkeypatch.setattr(
-        checker.ssl,
-        "create_default_context",
+        checker,
+        "create_client_tls_context",
         lambda *, cafile: context_calls.append(cafile) or context,
     )
     monkeypatch.setattr(
@@ -3898,6 +4048,8 @@ def test_verify_live_https_uses_verified_hostname_and_exact_der(
     assert context.wrap_calls == [(tcp_socket, "switch.example.com")]
     assert context.check_hostname is True
     assert context.verify_mode == checker.ssl.CERT_REQUIRED
+    assert context.minimum_version == checker.ssl.TLSVersion.TLSv1_2
+    assert context.maximum_version == checker.ssl.TLSVersion.MAXIMUM_SUPPORTED
 
 
 @pytest.mark.parametrize("host", ["192.0.2.10", "2001:db8::10"])
