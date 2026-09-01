@@ -15,6 +15,7 @@ import tomllib
 import warnings
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from types import MappingProxyType
 
 from cryptography import x509
 from cryptography.exceptions import InvalidSignature, UnsupportedAlgorithm
@@ -35,7 +36,9 @@ from netmiko.exceptions import (
 )
 
 from opnsense_client import OPNsenseClient, validate_base_url
+from output_policy import SanitizingFormatter, sanitize_terminal_text
 from secure_file import open_secure_file
+from tls_policy import create_client_tls_context
 
 DEFAULT_CONFIG_FILE = Path(__file__).resolve().parent.parent / "config.toml"
 
@@ -54,6 +57,30 @@ HTTPS_SOCKET_TIMEOUT_SECONDS = 5
 CERTIFICATE_PASTE_PROMPT = "Paste the certificate here and enter:"
 CERTIFICATE_REPLACEMENT_PROMPT = (
     "This certificate will replace an existing local certificate. Continue (y/n)?"
+)
+
+SSH_DISABLED_ALGORITHMS = MappingProxyType(
+    {
+        "ciphers": (
+            "aes128-cbc",
+            "aes192-cbc",
+            "aes256-cbc",
+            "3des-cbc",
+        ),
+        "macs": (
+            "hmac-sha1",
+            "hmac-sha1-96",
+            "hmac-md5",
+            "hmac-md5-96",
+        ),
+        "kex": (
+            "diffie-hellman-group-exchange-sha1",
+            "diffie-hellman-group14-sha1",
+            "diffie-hellman-group1-sha1",
+        ),
+        "keys": ("ssh-rsa",),
+        "pubkeys": ("ssh-rsa",),
+    }
 )
 
 
@@ -249,9 +276,14 @@ def configure_logging(debug):
     if not debug:
         return
 
+    handler = logging.StreamHandler()
+    handler.setFormatter(
+        SanitizingFormatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    )
     logging.basicConfig(
         level=logging.DEBUG,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=[handler],
+        force=True,
     )
 
     logging.getLogger("netmiko").setLevel(logging.DEBUG)
@@ -259,6 +291,20 @@ def configure_logging(debug):
     # Paramiko's DEBUG output is extremely verbose and is usually not useful
     # when troubleshooting Netmiko command handling.
     logging.getLogger("paramiko").setLevel(logging.WARNING)
+
+
+def print_terminal(value="", *, file=None):
+    """Print one operator-facing line after escaping terminal controls."""
+    print(sanitize_terminal_text(value), file=file)
+
+
+def print_switch_heading(switch):
+    """Print a safe switch heading whose underline matches displayed text."""
+    display_name = sanitize_terminal_text(switch["name"])
+    print_terminal()
+    print_terminal(display_name)
+    print_terminal("-" * len(display_name))
+    print_terminal(f"Host:             {switch['host']}")
 
 
 def load_config(config_file):
@@ -530,9 +576,10 @@ def read_password_file(configured_path, config_file):
 
 
 def get_switch_credentials(switch, config_file):
+    display_name = sanitize_terminal_text(switch["name"])
     username = switch.get("username") or os.environ.get("ARUBA_SSH_USERNAME")
     if not username:
-        username = input(f"SSH username for {switch['name']}: ")
+        username = input(f"SSH username for {display_name}: ")
     username = validate_ssh_username(username)
 
     if "password_file" in switch:
@@ -540,7 +587,7 @@ def get_switch_credentials(switch, config_file):
     else:
         password = os.environ.get("ARUBA_SSH_PASSWORD")
         if not password:
-            password = getpass.getpass(f"SSH password for {switch['name']}: ")
+            password = getpass.getpass(f"SSH password for {display_name}: ")
 
     if not password:
         raise ValueError(f"SSH password for {switch['name']} cannot be empty")
@@ -769,7 +816,7 @@ def get_verification_ca_file(config, config_file):
         pass
 
     try:
-        ssl.create_default_context(cafile=str(ca_file))
+        create_client_tls_context(cafile=str(ca_file))
     except (OSError, ssl.SSLError) as error:
         raise ValueError(
             f"verification.ca_file cannot be loaded as a CA file: {ca_file}: {error}"
@@ -1352,6 +1399,10 @@ def get_device_parameters(switch, username, password):
         "system_host_keys": False,
         "alt_host_keys": True,
         "alt_key_file": str(known_hosts_file),
+        "disabled_algorithms": {
+            category: list(algorithms)
+            for category, algorithms in SSH_DISABLED_ALGORITHMS.items()
+        },
     }
 
 
@@ -1444,8 +1495,10 @@ def renew_certificate(
     )
     certificate_name = preflight["new_certificate_name"]
 
-    print(f"Current active Web certificate: {preflight['active_certificate_name']}")
-    print(f"Selected renewal certificate name: {certificate_name}")
+    print_terminal(
+        f"Current active Web certificate: {preflight['active_certificate_name']}"
+    )
+    print_terminal(f"Selected renewal certificate name: {certificate_name}")
 
     try:
         generate_csr(
@@ -1460,8 +1513,8 @@ def renew_certificate(
     except (ValueError, OSError) as error:
         raise CSRGenerationPreAttemptError(str(error)) from error
 
-    print("CSR generated and validated.")
-    print("Signing CSR with OPNsense...")
+    print_terminal("CSR generated and validated.")
+    print_terminal("Signing CSR with OPNsense...")
 
     try:
         certificate_pem = sign_pending_csr(
@@ -1478,8 +1531,8 @@ def renew_certificate(
             "staged commands for diagnosis or recovery"
         ) from error
 
-    print("Issued certificate validated.")
-    print("Verifying issued certificate trust before installation...")
+    print_terminal("Issued certificate validated.")
+    print_terminal("Verifying issued certificate trust before installation...")
 
     try:
         certificate = install_pending_certificate(
@@ -1500,8 +1553,8 @@ def renew_certificate(
             "staged commands for diagnosis or recovery"
         ) from error
 
-    print("Certificate installed and Aruba state verified.")
-    print("Verifying live HTTPS...")
+    print_terminal("Certificate installed and Aruba state verified.")
+    print_terminal("Verifying live HTTPS...")
 
     try:
         verify_live_https_certificate(
@@ -1512,10 +1565,10 @@ def renew_certificate(
     except (ValueError, OSError, ssl.SSLError) as error:
         raise LiveHTTPSVerificationError(str(error)) from error
 
-    print("Live HTTPS certificate chain and hostname verified.")
-    print("Live HTTPS certificate matches the installed certificate.")
-    print("Renewal completed successfully.")
-    print(f"Active Web certificate: {certificate_name}")
+    print_terminal("Live HTTPS certificate chain and hostname verified.")
+    print_terminal("Live HTTPS certificate matches the installed certificate.")
+    print_terminal("Renewal completed successfully.")
+    print_terminal(f"Active Web certificate: {certificate_name}")
     return certificate_name
 
 
@@ -1570,10 +1623,12 @@ def generate_csr(
                 csr_settings,
             )
 
-            print(f"Current active Web certificate: {active_certificate['name']}")
-            print(f"Discovered TA profile: {active_certificate['profile']}")
-            print(f"Requested new certificate name: {certificate_name}")
-            print("Generating CSR...")
+            print_terminal(
+                f"Current active Web certificate: {active_certificate['name']}"
+            )
+            print_terminal(f"Discovered TA profile: {active_certificate['profile']}")
+            print_terminal(f"Requested new certificate name: {certificate_name}")
+            print_terminal("Generating CSR...")
 
             connection.config_mode()
 
@@ -1944,7 +1999,7 @@ def verify_live_https_certificate(
     expected_der = expected_certificate.public_bytes(serialization.Encoding.DER)
     with open_secure_file(ca_file, source_name="verification.ca_file"):
         pass
-    context = ssl.create_default_context(cafile=str(ca_file))
+    context = create_client_tls_context(cafile=str(ca_file))
 
     if not context.check_hostname or context.verify_mode != ssl.CERT_REQUIRED:
         raise ValueError("TLS verification context is not securely configured")
@@ -1989,10 +2044,7 @@ def verify_live_https_certificate(
 def check_switch(switch, username, password, warning_days):
     device = get_device_parameters(switch, username, password)
 
-    print()
-    print(switch["name"])
-    print("-" * len(switch["name"]))
-    print(f"Host:             {switch['host']}")
+    print_switch_heading(switch)
 
     try:
         with ConnectHandler(**device) as connection:
@@ -2002,68 +2054,68 @@ def check_switch(switch, username, password, warning_days):
             )
 
     except NetmikoAuthenticationException:
-        print("Status:           ERROR")
-        print("Reason:           SSH authentication failed")
+        print_terminal("Status:           ERROR")
+        print_terminal("Reason:           SSH authentication failed")
         return "error"
 
     except NetmikoTimeoutException:
-        print("Status:           ERROR")
-        print("Reason:           SSH connection timed out")
+        print_terminal("Status:           ERROR")
+        print_terminal("Reason:           SSH connection timed out")
         return "error"
 
     except Exception as error:
-        print("Status:           ERROR")
-        print(f"Reason:           {error}")
+        print_terminal("Status:           ERROR")
+        print_terminal(f"Reason:           {error}")
         return "error"
 
-    print(f"AOS-S version:    {parse_aos_version(version_output)}")
+    print_terminal(f"AOS-S version:    {parse_aos_version(version_output)}")
 
     try:
         certificate = get_active_web_certificate(parse_web_certificates(cert_output))
 
     except ValueError as error:
-        print("Status:           ERROR")
-        print(f"Reason:           {error}")
+        print_terminal("Status:           ERROR")
+        print_terminal(f"Reason:           {error}")
         return "error"
 
     days_remaining = (certificate["expiration"] - date.today()).days
 
-    print(f"Certificate:      {certificate['name']}")
-    print(f"TA profile:       {certificate['profile']}")
-    print(f"Expires:          {certificate['expiration'].isoformat()}")
-    print(f"Days remaining:   {days_remaining}")
+    print_terminal(f"Certificate:      {certificate['name']}")
+    print_terminal(f"TA profile:       {certificate['profile']}")
+    print_terminal(f"Expires:          {certificate['expiration'].isoformat()}")
+    print_terminal(f"Days remaining:   {days_remaining}")
 
     if days_remaining < 0:
-        print("Status:           EXPIRED")
+        print_terminal("Status:           EXPIRED")
         return "expired"
 
     if days_remaining <= warning_days:
-        print("Status:           RENEWAL DUE")
+        print_terminal("Status:           RENEWAL DUE")
         return "renewal_due"
 
-    print("Status:           OK")
+    print_terminal("Status:           OK")
     return "ok"
 
 
 def print_summary(results):
-    print()
-    print("Summary")
-    print("-------")
-    print(f"Switches checked: {len(results)}")
-    print(f"OK:               {results.count('ok')}")
-    print(f"Renewal due:      {results.count('renewal_due')}")
-    print(f"Expired:          {results.count('expired')}")
-    print(f"Errors:           {results.count('error')}")
+    print_terminal()
+    print_terminal("Summary")
+    print_terminal("-------")
+    print_terminal(f"Switches checked: {len(results)}")
+    print_terminal(f"OK:               {results.count('ok')}")
+    print_terminal(f"Renewal due:      {results.count('renewal_due')}")
+    print_terminal(f"Expired:          {results.count('expired')}")
+    print_terminal(f"Errors:           {results.count('error')}")
 
 
 def print_renewal_summary(results):
-    print()
-    print("Renewal summary")
-    print("---------------")
-    print(f"Switches processed: {len(results)}")
-    print(f"Healthy:             {results.count('healthy')}")
-    print(f"Renewed:             {results.count('renewed')}")
-    print(f"Errors:              {results.count('error')}")
+    print_terminal()
+    print_terminal("Renewal summary")
+    print_terminal("---------------")
+    print_terminal(f"Switches processed: {len(results)}")
+    print_terminal(f"Healthy:             {results.count('healthy')}")
+    print_terminal(f"Renewed:             {results.count('renewed')}")
+    print_terminal(f"Errors:              {results.count('error')}")
 
 
 def get_exit_code(results):
@@ -2079,50 +2131,50 @@ def get_exit_code(results):
 def report_renewal_failure(error):
     """Print the established explicit-renewal safety message for an error."""
     if isinstance(error, RenewalPreflightError):
-        print(
+        print_terminal(
             "Error: Renewal preflight failed; no renewal change was "
             f"attempted: {error}",
             file=sys.stderr,
         )
     elif isinstance(error, CSRGenerationPreAttemptError):
-        print(
+        print_terminal(
             "Error: CSR generation failed before CSR creation was attempted; "
             f"no pending CSR was created: {error}",
             file=sys.stderr,
         )
     elif isinstance(error, CSRGenerationError):
-        print(f"Error: {error}", file=sys.stderr)
-        print(
+        print_terminal(f"Error: {error}", file=sys.stderr)
+        print_terminal(
             "CSR creation was attempted. No automatic cleanup was attempted; "
             "use the explicit staged commands for diagnosis or recovery.",
             file=sys.stderr,
         )
     elif isinstance(error, CSRSigningError):
-        print(f"Error: CSR signing failed: {error}", file=sys.stderr)
-        print(
+        print_terminal(f"Error: CSR signing failed: {error}", file=sys.stderr)
+        print_terminal(
             "No certificate installation or automatic OPNsense cleanup was attempted.",
             file=sys.stderr,
         )
     elif isinstance(error, CertificatePreInstallationError):
-        print(
+        print_terminal(
             f"Error: Certificate installation did not begin: {error}",
             file=sys.stderr,
         )
-        print("No automatic rollback was attempted.", file=sys.stderr)
+        print_terminal("No automatic rollback was attempted.", file=sys.stderr)
     elif isinstance(error, CertificateInstallationAttemptError):
-        print(f"Error: Post-install failure: {error}", file=sys.stderr)
-        print(
+        print_terminal(f"Error: Post-install failure: {error}", file=sys.stderr)
+        print_terminal(
             "No automatic rollback was attempted; inspect the switch manually.",
             file=sys.stderr,
         )
     elif isinstance(error, LiveHTTPSVerificationError):
-        print(
+        print_terminal(
             "Error: Post-install HTTPS verification failed. The certificate "
             "may already be active and requires manual investigation: "
             f"{error}",
             file=sys.stderr,
         )
-        print("No automatic rollback was attempted.", file=sys.stderr)
+        print_terminal("No automatic rollback was attempted.", file=sys.stderr)
 
 
 RENEWAL_FAILURE_TYPES = (
@@ -2152,45 +2204,41 @@ def renew_due_certificates(
             try:
                 username, password = get_switch_credentials(switch, config_file)
             except ValueError as error:
-                print()
-                print(switch["name"])
-                print("-" * len(switch["name"]))
-                print(f"Host:             {switch['host']}")
-                print("Status:           ERROR")
-                print(f"Reason:           {error}")
-                print("Action:           No renewal attempted")
+                print_switch_heading(switch)
+                print_terminal("Status:           ERROR")
+                print_terminal(f"Reason:           {error}")
+                print_terminal("Action:           No renewal attempted")
                 results.append("error")
                 continue
             except Exception:
-                print()
-                print(switch["name"])
-                print("-" * len(switch["name"]))
-                print(f"Host:             {switch['host']}")
-                print("Status:           ERROR")
-                print("Reason:           Unexpected credential resolution failure")
-                print("Action:           No renewal attempted")
+                print_switch_heading(switch)
+                print_terminal("Status:           ERROR")
+                print_terminal(
+                    "Reason:           Unexpected credential resolution failure"
+                )
+                print_terminal("Action:           No renewal attempted")
                 results.append("error")
                 continue
 
             try:
                 status = check_switch(switch, username, password, warning_days)
             except Exception as error:
-                print("Status:           ERROR")
-                print(f"Reason:           {error}")
-                print("Action:           No renewal attempted")
+                print_terminal("Status:           ERROR")
+                print_terminal(f"Reason:           {error}")
+                print_terminal("Action:           No renewal attempted")
                 results.append("error")
                 continue
             if status == "ok":
-                print("Action:           No renewal required")
+                print_terminal("Action:           No renewal required")
                 results.append("healthy")
                 continue
 
             if status not in {"renewal_due", "expired"}:
-                print("Action:           No renewal attempted")
+                print_terminal("Action:           No renewal attempted")
                 results.append("error")
                 continue
 
-            print("Action:           Renewing certificate")
+            print_terminal("Action:           Renewing certificate")
             try:
                 renew_certificate(
                     switch,
@@ -2204,12 +2252,12 @@ def renew_due_certificates(
                 report_renewal_failure(error)
                 results.append("error")
             except Exception as error:
-                print(
+                print_terminal(
                     "Error: Unexpected renewal failure "
                     f"({type(error).__name__}). Renewal state may be uncertain.",
                     file=sys.stderr,
                 )
-                print(
+                print_terminal(
                     "No automatic retry, cleanup, or rollback was attempted; "
                     "inspect the switch and use the explicit staged commands "
                     "if necessary.",
@@ -2230,7 +2278,7 @@ def write_or_print_csr(csr_pem, output_path):
         with output_path.open("x", encoding="ascii") as output_file:
             output_file.write(csr_pem)
 
-        print(f"CSR written to {output_path}")
+        print_terminal(f"CSR written to {output_path}")
     else:
         print(csr_pem, end="")
 
@@ -2239,7 +2287,7 @@ def write_certificate(certificate_pem, output_path):
     with output_path.open("x", encoding="ascii") as output_file:
         output_file.write(certificate_pem)
 
-    print(f"Certificate written to {output_path}")
+    print_terminal(f"Certificate written to {output_path}")
 
 
 def main():
@@ -2275,7 +2323,7 @@ def main():
             certificate_pem = read_certificate_input(args.certificate_input)
 
     except ValueError as error:
-        print(f"Error: {error}", file=sys.stderr)
+        print_terminal(f"Error: {error}", file=sys.stderr)
         return EXIT_ERROR
 
     explicit_operation = any(
@@ -2291,7 +2339,7 @@ def main():
         try:
             username, password = get_switch_credentials(switches[0], args.config)
         except ValueError as error:
-            print(f"Error: {error}", file=sys.stderr)
+            print_terminal(f"Error: {error}", file=sys.stderr)
             return EXIT_ERROR
 
     if renew_due:
@@ -2338,23 +2386,25 @@ def main():
             )
 
         except CertificateInstallationAttemptError as error:
-            print(f"Error: Post-install failure: {error}", file=sys.stderr)
-            print(
+            print_terminal(f"Error: Post-install failure: {error}", file=sys.stderr)
+            print_terminal(
                 "No automatic rollback was attempted; inspect the switch manually.",
                 file=sys.stderr,
             )
             return EXIT_ERROR
 
         except (ValueError, OSError) as error:
-            print(
+            print_terminal(
                 "Error: Pre-install failure; the switch has not been modified: "
                 f"{error}",
                 file=sys.stderr,
             )
             return EXIT_ERROR
 
-        print(f"Certificate validated against pending CSR for {switch['name']}.")
-        print(f"Signed certificate installed on {switch['name']}.")
+        print_terminal(
+            f"Certificate validated against pending CSR for {switch['name']}."
+        )
+        print_terminal(f"Signed certificate installed on {switch['name']}.")
 
         try:
             verify_live_https_certificate(
@@ -2363,18 +2413,18 @@ def main():
                 certificate,
             )
         except (ValueError, OSError, ssl.SSLError) as error:
-            print(
+            print_terminal(
                 "Error: Post-install HTTPS verification failed. The certificate "
                 "may already be active and requires manual investigation: "
                 f"{error}",
                 file=sys.stderr,
             )
-            print("No automatic rollback was attempted.", file=sys.stderr)
+            print_terminal("No automatic rollback was attempted.", file=sys.stderr)
             return EXIT_ERROR
 
-        print("Live HTTPS certificate chain and hostname verified.")
-        print("Live HTTPS certificate matches the installed certificate.")
-        print("Certificate installation verified successfully.")
+        print_terminal("Live HTTPS certificate chain and hostname verified.")
+        print_terminal("Live HTTPS certificate matches the installed certificate.")
+        print_terminal("Certificate installation verified successfully.")
         return EXIT_OK
 
     if args.sign_csr:
@@ -2390,15 +2440,15 @@ def main():
                 opnsense_settings,
             )
             write_certificate(certificate_pem, args.certificate_output)
-            print(
+            print_terminal(
                 f"Pending CSR signed and issued certificate validated for "
                 f"{switch['name']}."
             )
-            print("The certificate has not been installed on the switch.")
+            print_terminal("The certificate has not been installed on the switch.")
             return EXIT_OK
 
         except (ValueError, OSError) as error:
-            print(f"Error: {error}", file=sys.stderr)
+            print_terminal(f"Error: {error}", file=sys.stderr)
             return EXIT_ERROR
 
     if args.generate_csr or args.retrieve_csr:
@@ -2413,7 +2463,7 @@ def main():
                     args.certificate_name,
                     csr_settings,
                 )
-                print(f"CSR generated and validated for {switch['name']}.")
+                print_terminal(f"CSR generated and validated for {switch['name']}.")
             else:
                 csr_pem = retrieve_csr(
                     switch,
@@ -2422,7 +2472,9 @@ def main():
                     args.certificate_name,
                     csr_settings,
                 )
-                print(f"Pending CSR retrieved and validated for {switch['name']}.")
+                print_terminal(
+                    f"Pending CSR retrieved and validated for {switch['name']}."
+                )
 
             try:
                 write_or_print_csr(csr_pem, args.csr_output)
@@ -2443,7 +2495,7 @@ def main():
             return EXIT_OK
 
         except ValueError as error:
-            print(f"Error: {error}", file=sys.stderr)
+            print_terminal(f"Error: {error}", file=sys.stderr)
             return EXIT_ERROR
 
     results = []
@@ -2451,24 +2503,18 @@ def main():
         try:
             username, password = get_switch_credentials(switch, args.config)
         except ValueError as error:
-            print()
-            print(switch["name"])
-            print("-" * len(switch["name"]))
-            print(f"Host:             {switch['host']}")
-            print("Status:           ERROR")
-            print(f"Reason:           {error}")
+            print_switch_heading(switch)
+            print_terminal("Status:           ERROR")
+            print_terminal(f"Reason:           {error}")
             results.append("error")
             continue
 
         try:
             status = check_switch(switch, username, password, warning_days)
         except ValueError as error:
-            print()
-            print(switch["name"])
-            print("-" * len(switch["name"]))
-            print(f"Host:             {switch['host']}")
-            print("Status:           ERROR")
-            print(f"Reason:           {error}")
+            print_switch_heading(switch)
+            print_terminal("Status:           ERROR")
+            print_terminal(f"Reason:           {error}")
             results.append("error")
             continue
 

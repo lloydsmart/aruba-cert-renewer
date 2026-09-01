@@ -375,6 +375,33 @@ Aruba certificate private keys are generated and stored on the switch. They must
 OPNsense. A pending CSR represents the valuable association with its switch-held private key and must not be cleared,
 replaced, regenerated, or deleted by the signing workflow.
 
+## Transport Algorithms and Terminal Output
+
+Every client TLS context uses a shared policy requiring TLS 1.2 or newer for
+OPNsense API requests and Aruba live HTTPS verification. TLS 1.3 remains
+available. CA certificate verification and normal DNS hostname or IP identity
+verification are mandatory, and the live Aruba check also requires exact DER
+equality with the expected certificate.
+
+Supported ArubaOS-S WC.16.11 devices provide AES-CTR, HMAC-SHA2, ECDH-SHA2 or
+SHA-256 key exchange, and RSA-SHA2 host-key signatures. The SSH client therefore
+explicitly disables CBC and 3DES ciphers, MD5 and SHA-1 MACs, SHA-1 key
+exchange, and the SHA-1 `ssh-rsa` signature algorithm. An RSA host key remains
+supported through RSA-SHA2. The application does not re-enable DSA or implement
+the Aruba-specific X.509 SSH algorithms advertised by some switches.
+
+Legacy ArubaOS-S WC.16.11 firmware may generate an RSA/SHA-1 PKCS#10 CSR
+self-signature. SHA-1 is accepted only in the narrowly scoped CSR
+proof-of-possession verification path. Issued HTTPS certificates must use
+SHA-256 or stronger, and SSH SHA-1 algorithms are independently prohibited.
+This exception should be removed when supported switches no longer require it.
+
+Operator-facing dynamic text visibly escapes all C0 and C1 control characters
+before reaching stdout or stderr. Debug log messages receive the same treatment
+after formatting, so endpoint-controlled ANSI sequences and embedded line breaks
+cannot alter terminal state or forge log lines. Validated PEM CSR output that is
+deliberately written to stdout is not passed through this display transformation.
+
 ## Aruba SSH Host-Key Trust
 
 All Aruba SSH connections require strict host-key verification against the
