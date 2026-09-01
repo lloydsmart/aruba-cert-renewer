@@ -83,13 +83,26 @@ writers.
 ## Container Publication
 
 Normal container CI has no package-write permission and never publishes an
-image. Only the GitHub Release publishing workflow receives `packages: write`,
-and it authenticates with the repository-scoped `GITHUB_TOKEN`, not a personal
-access token, after the exact release image passes the full smoke tests. The SHA
-tag provides an exact source-commit audit reference. The release workflow also
-has only the additional `attestations: write` and `id-token: write` permissions
-needed to create attestations; it does not receive `contents: write` or
-artifact-metadata write access.
+image. The release workflow defaults to `contents: read`. Its verification job
+inherits only that read permission and receives no package, attestation, or
+OIDC write privileges. It validates the release tag and main ancestry, builds
+one candidate, and smoke-tests, scans, and generates an SPDX JSON SBOM from
+that exact image.
+
+Only the publication job receives `packages: write`, `attestations: write`, and
+`id-token: write`, alongside `contents: read`. It does not receive
+`contents: write`, `actions: write`, `artifact-metadata: write`,
+`security-events: write`, or other write permissions. It authenticates with
+the repository-scoped `GITHUB_TOKEN`, not a personal access token, only after
+the verified candidate has been imported and checked.
+
+The unprivileged job exports the tested image with `docker save`, records an
+explicit SHA-256 archive checksum and Docker image ID, and transfers those
+values and the generated SBOM through an integrity-checked workflow artifact.
+The privileged job does not check out, rebuild, or execute repository source.
+It verifies the artifact digest, archive checksum, recorded image ID, loaded
+image ID, and every release tag before registry authentication. The SHA tag
+continues to provide an exact source-commit audit reference.
 
 Publication does not add real deployment configuration, CA material, or
 secrets to the image, and does not weaken the documented runtime hardening.
@@ -113,13 +126,16 @@ tools and fails if they change. Weekly Dependabot updates cover pip, Docker, and
 GitHub Actions inputs.
 
 Each release generates an SPDX JSON SBOM from the exact local image that already
-passed the container smoke tests. The workflow retains the SBOM as a
-release-specific workflow artifact, tags and publishes that same local image,
-resolves and validates its registry OCI manifest digest, and publishes both build
-provenance and SBOM attestations for the digest to GitHub and GHCR. It does not
-perform a second image build or automatically upload the SBOM as a GitHub
-Release asset. Attestation failure after publication fails visibly and does not
-trigger destructive rollback.
+passed the container smoke tests and Trivy scan. The unprivileged verification
+job retains the SBOM as a release-specific workflow artifact and transfers it
+with the exported candidate across the publication boundary. The privileged
+job integrity-checks and imports that candidate without rebuilding it, then
+tags and publishes the loaded image. It resolves and validates the registry OCI
+manifest digest and publishes both build-provenance and SBOM attestations for
+that digest to GitHub and GHCR, using the transferred SBOM rather than
+generating another one. It does not automatically upload the SBOM as a GitHub
+Release asset. Attestation failure after publication fails visibly and does
+not trigger destructive rollback.
 
 To reconstruct and audit the immutable inputs associated with a source commit
 or release tag, check out that exact revision, inspect the digest-pinned `FROM`
@@ -168,9 +184,10 @@ Individual Trivy vulnerability suppressions remain disallowed by default.
 Secret and dependency scans run for every pull request and push to `main`, as
 well as weekly. Container CI smoke-tests one image and then scans that same
 image, with a weekly run to detect newly disclosed vulnerabilities. Release
-candidates are scanned after smoke testing and before registry login or
-publication. Scanner executables are immutable and version-pinned, while their
-vulnerability databases and resulting findings intentionally evolve.
+candidates are scanned after smoke testing in the unprivileged verification
+job, before artifact handoff, registry login, or publication. Scanner
+executables are immutable and version-pinned, while their vulnerability
+databases and resulting findings intentionally evolve.
 
 The only current scanner exception is the exact pip-audit advisory
 `PYSEC-2026-2858` for `paramiko 4.0.0` in the runtime lock. Its aliases are
@@ -193,10 +210,11 @@ Any future exception must identify the exact finding, include a reviewable
 rationale, and remain as narrow as the scanner permits; scanner failure must
 not be bypassed globally.
 
-Release SBOM handling is unchanged: the existing workflow generates SPDX JSON
-from the tested release candidate, retains it as a workflow artifact, and binds
-build-provenance and SBOM attestations to the published OCI digest. Security
-scanning neither adds a second SBOM system nor rebuilds the release image.
+The release workflow generates SPDX JSON from the tested release candidate,
+retains it as a standalone workflow artifact, and transfers the same SBOM to
+the publication job. Build-provenance and SBOM attestations remain bound to the
+published OCI digest. Security scanning neither adds a second SBOM system nor
+rebuilds the release image.
 
 ### Reconstructing GitHub-Native Security Settings
 

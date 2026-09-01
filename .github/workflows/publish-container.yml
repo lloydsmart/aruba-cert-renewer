@@ -7,17 +7,19 @@ on:
 
 permissions:
   contents: read
-  packages: write
-  attestations: write
-  id-token: write
 
 jobs:
-  publish:
-    name: Test and publish release container
+  verify:
+    name: Build and verify release container
     runs-on: ubuntu-latest
+    outputs:
+      artifact_name: ${{ steps.release.outputs.artifact_name }}
+      commit_sha: ${{ steps.commit.outputs.sha }}
+      image_id: ${{ steps.candidate.outputs.image_id }}
+      publish_latest: ${{ steps.release.outputs.publish_latest }}
+      release_tag: ${{ steps.release.outputs.release_tag }}
     env:
       CANDIDATE_IMAGE: aruba-cert-renewer:release-candidate
-      IMAGE_NAME: ghcr.io/lloydsmart/aruba-cert-renewer
       IS_GITHUB_PRERELEASE: ${{ github.event.release.prerelease }}
       RELEASE_TAG: ${{ github.event.release.tag_name }}
 
@@ -39,7 +41,13 @@ jobs:
           if [[ "$IS_GITHUB_PRERELEASE" == 'true' || "$RELEASE_TAG" == *-* ]]; then
             publish_latest=false
           fi
-          printf 'publish_latest=%s\n' "$publish_latest" >>"$GITHUB_OUTPUT"
+
+          {
+            printf 'artifact_name=aruba-cert-renewer-%s-candidate\n' \
+              "$RELEASE_TAG"
+            printf 'publish_latest=%s\n' "$publish_latest"
+            printf 'release_tag=%s\n' "$RELEASE_TAG"
+          } >>"$GITHUB_OUTPUT"
 
       - name: Checkout exact release tag
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -91,20 +99,203 @@ jobs:
           upload-artifact: true
           upload-release-assets: false
 
-      - name: Tag and verify tested image
+      - name: Export verified release candidate
         id: candidate
-        env:
-          COMMIT_SHA: ${{ steps.commit.outputs.sha }}
-          PUBLISH_LATEST: ${{ steps.release.outputs.publish_latest }}
         shell: bash
         run: |
           set -euo pipefail
 
-          tested_image_id=$(docker image inspect --format '{{.Id}}' "$CANDIDATE_IMAGE")
+          tested_image_id=$(docker image inspect --format '{{.Id}}' \
+            "$CANDIDATE_IMAGE")
           if [[ ! "$tested_image_id" =~ ^sha256:[0-9a-f]{64}$ ]]; then
             printf 'Unexpected tested image ID: %s\n' "$tested_image_id" >&2
             exit 1
           fi
+
+          if [[ ! -s release-sbom.spdx.json ]]; then
+            printf '%s\n' 'The generated release SBOM is missing or empty.' >&2
+            exit 1
+          fi
+
+          handoff_directory="$RUNNER_TEMP/release-candidate"
+          mkdir -- "$handoff_directory"
+
+          docker image save \
+            --output "$handoff_directory/release-candidate.tar" \
+            "$CANDIDATE_IMAGE"
+
+          (
+            cd "$handoff_directory"
+            sha256sum release-candidate.tar \
+              >release-candidate.tar.sha256
+          )
+
+          printf '%s\n' "$tested_image_id" \
+            >"$handoff_directory/tested-image-id.txt"
+          cp -- release-sbom.spdx.json \
+            "$handoff_directory/release-sbom.spdx.json"
+
+          printf 'image_id=%s\n' "$tested_image_id" >>"$GITHUB_OUTPUT"
+
+      - name: Upload verified release candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.release.outputs.artifact_name }}
+          path: ${{ runner.temp }}/release-candidate
+          if-no-files-found: error
+          compression-level: 0
+
+  publish:
+    name: Publish verified release container
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+    env:
+      CANDIDATE_ARTIFACT_NAME: ${{ needs.verify.outputs.artifact_name }}
+      COMMIT_SHA: ${{ needs.verify.outputs.commit_sha }}
+      IMAGE_NAME: ghcr.io/lloydsmart/aruba-cert-renewer
+      IS_GITHUB_PRERELEASE: ${{ github.event.release.prerelease }}
+      PUBLISH_LATEST: ${{ needs.verify.outputs.publish_latest }}
+      RELEASE_TAG: ${{ github.event.release.tag_name }}
+      TESTED_IMAGE_ID: ${{ needs.verify.outputs.image_id }}
+      VERIFIED_RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
+
+    steps:
+      - name: Validate verified release metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tag_pattern='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$'
+          if [[ ! "$RELEASE_TAG" =~ $tag_pattern ]]; then
+            printf '%s\n' 'The release event contains an invalid tag.' >&2
+            exit 1
+          fi
+
+          if [[ "$VERIFIED_RELEASE_TAG" != "$RELEASE_TAG" ]]; then
+            printf '%s\n' 'The verified release tag does not match the release event.' >&2
+            exit 1
+          fi
+
+          expected_artifact_name="aruba-cert-renewer-${RELEASE_TAG}-candidate"
+          if [[ "$CANDIDATE_ARTIFACT_NAME" != "$expected_artifact_name" ]]; then
+            printf '%s\n' 'The candidate artifact name is invalid.' >&2
+            exit 1
+          fi
+
+          if [[ ! "$COMMIT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            printf '%s\n' 'The verified release commit is invalid.' >&2
+            exit 1
+          fi
+
+          if [[ ! "$TESTED_IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            printf '%s\n' 'The verified image ID is invalid.' >&2
+            exit 1
+          fi
+
+          if [[ "$PUBLISH_LATEST" != 'true' &&
+                "$PUBLISH_LATEST" != 'false' ]]; then
+            printf '%s\n' 'The publish_latest value is invalid.' >&2
+            exit 1
+          fi
+
+          if [[ "$IS_GITHUB_PRERELEASE" != 'true' &&
+                "$IS_GITHUB_PRERELEASE" != 'false' ]]; then
+            printf '%s\n' 'The release prerelease value is invalid.' >&2
+            exit 1
+          fi
+
+          expected_publish_latest=true
+          if [[ "$IS_GITHUB_PRERELEASE" == 'true' ||
+                "$RELEASE_TAG" == *-* ]]; then
+            expected_publish_latest=false
+          fi
+
+          if [[ "$PUBLISH_LATEST" != "$expected_publish_latest" ]]; then
+            printf '%s\n' 'The publish_latest value is inconsistent with the release.' >&2
+            exit 1
+          fi
+
+      - name: Download verified release candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.verify.outputs.artifact_name }}
+          path: ${{ runner.temp }}/release-candidate
+          digest-mismatch: error
+
+      - name: Verify and load release candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          handoff_directory="$RUNNER_TEMP/release-candidate"
+          image_archive="$handoff_directory/release-candidate.tar"
+          archive_checksum="$handoff_directory/release-candidate.tar.sha256"
+          image_id_metadata="$handoff_directory/tested-image-id.txt"
+          release_sbom="$handoff_directory/release-sbom.spdx.json"
+
+          for artifact_file in \
+            "$image_archive" \
+            "$archive_checksum" \
+            "$image_id_metadata" \
+            "$release_sbom"; do
+            if [[ ! -f "$artifact_file" || -L "$artifact_file" ]]; then
+              printf '%s\n' 'The candidate artifact contains a missing or invalid file.' >&2
+              exit 1
+            fi
+          done
+
+          if [[ ! -s "$image_archive" || ! -s "$release_sbom" ]]; then
+            printf '%s\n' 'The candidate image archive or SBOM is empty.' >&2
+            exit 1
+          fi
+
+          checksum_metadata=$(<"$archive_checksum")
+          if [[ ! "$checksum_metadata" =~ ^[0-9a-f]{64}[[:space:]][[:space:]]release-candidate\.tar$ ]]; then
+            printf '%s\n' 'The candidate archive checksum metadata is invalid.' >&2
+            exit 1
+          fi
+
+          (
+            cd "$handoff_directory"
+            sha256sum --check --strict release-candidate.tar.sha256
+          )
+
+          mapfile -t recorded_image_ids <"$image_id_metadata"
+          if (( ${#recorded_image_ids[@]} != 1 )); then
+            printf '%s\n' 'The candidate image-ID metadata must contain exactly one line.' >&2
+            exit 1
+          fi
+
+          recorded_image_id=${recorded_image_ids[0]}
+          if [[ ! "$recorded_image_id" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            printf '%s\n' 'The candidate image-ID metadata is invalid.' >&2
+            exit 1
+          fi
+
+          if [[ "$recorded_image_id" != "$TESTED_IMAGE_ID" ]]; then
+            printf '%s\n' 'The candidate image ID does not match the verification output.' >&2
+            exit 1
+          fi
+
+          docker image load --input "$image_archive"
+
+          loaded_image_id=$(docker image inspect --format '{{.Id}}' \
+            "$recorded_image_id")
+          if [[ "$loaded_image_id" != "$TESTED_IMAGE_ID" ]]; then
+            printf 'Loaded image ID mismatch: expected %s, got %s\n' \
+              "$TESTED_IMAGE_ID" "$loaded_image_id" >&2
+            exit 1
+          fi
+
+      - name: Tag and verify loaded tested image
+        shell: bash
+        run: |
+          set -euo pipefail
 
           release_references=(
             "$IMAGE_NAME:$RELEASE_TAG"
@@ -115,19 +306,18 @@ jobs:
           fi
 
           for reference in "${release_references[@]}"; do
-            docker image tag "$tested_image_id" "$reference"
+            docker image tag "$TESTED_IMAGE_ID" "$reference"
           done
 
           for reference in "${release_references[@]}"; do
-            tagged_image_id=$(docker image inspect --format '{{.Id}}' "$reference")
-            if [[ "$tagged_image_id" != "$tested_image_id" ]]; then
+            tagged_image_id=$(docker image inspect --format '{{.Id}}' \
+              "$reference")
+            if [[ "$tagged_image_id" != "$TESTED_IMAGE_ID" ]]; then
               printf 'Image ID mismatch for %s: expected %s, got %s\n' \
-                "$reference" "$tested_image_id" "$tagged_image_id" >&2
+                "$reference" "$TESTED_IMAGE_ID" "$tagged_image_id" >&2
               exit 1
             fi
           done
-
-          printf 'image_id=%s\n' "$tested_image_id" >>"$GITHUB_OUTPUT"
 
       - name: Log in to GHCR
         id: login
@@ -141,9 +331,6 @@ jobs:
             --password-stdin
 
       - name: Publish tested image
-        env:
-          COMMIT_SHA: ${{ steps.commit.outputs.sha }}
-          PUBLISH_LATEST: ${{ steps.release.outputs.publish_latest }}
         run: |
           set -euo pipefail
 
@@ -155,8 +342,6 @@ jobs:
 
       - name: Resolve published image digest
         id: published
-        env:
-          TESTED_IMAGE_ID: ${{ steps.candidate.outputs.image_id }}
         shell: bash
         run: |
           set -euo pipefail
@@ -199,7 +384,7 @@ jobs:
         with:
           subject-name: ${{ env.IMAGE_NAME }}
           subject-digest: ${{ steps.published.outputs.digest }}
-          sbom-path: release-sbom.spdx.json
+          sbom-path: ${{ runner.temp }}/release-candidate/release-sbom.spdx.json
           push-to-registry: true
           create-storage-record: false
 
