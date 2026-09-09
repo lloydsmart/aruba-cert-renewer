@@ -3,7 +3,7 @@ import ipaddress
 import logging
 import re
 import warnings
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1107,6 +1107,52 @@ def test_deliberate_pem_csr_stdout_is_not_sanitized(capsys):
     checker.write_or_print_csr(csr_pem, None)
 
     assert capsys.readouterr().out == csr_pem
+
+
+def test_format_run_timestamp_requires_timezone_aware_time():
+    with pytest.raises(ValueError, match="timezone-aware"):
+        checker.format_run_timestamp(datetime(2026, 9, 9, 22, 30, 3))
+
+
+def test_monitoring_prints_distinct_local_start_and_completion_times(
+    monkeypatch, capsys
+):
+    local_timezone = timezone(timedelta(hours=1), "BST")
+    times = iter(
+        (
+            datetime(2026, 9, 9, 22, 30, 3, tzinfo=local_timezone),
+            datetime(2026, 9, 9, 22, 30, 5, tzinfo=local_timezone),
+        )
+    )
+    monkeypatch.setattr(checker, "get_local_time", lambda: next(times))
+    monkeypatch.setattr(checker.sys, "argv", ["aruba_cert_renewer.py"])
+    monkeypatch.setattr(checker, "load_config", lambda config_file: make_config())
+    monkeypatch.setattr(
+        checker,
+        "get_switch_credentials",
+        lambda switch, config_file: ("username", "password"),
+    )
+
+    def check(switch, *args):
+        checker.print_switch_heading(switch)
+        checker.print_terminal("Status:           OK")
+        return "ok"
+
+    monkeypatch.setattr(checker, "check_switch", check)
+
+    assert checker.main() == checker.EXIT_OK
+
+    output = capsys.readouterr().out
+    assert output.startswith(
+        "Aruba certificate check\n"
+        "=======================\n"
+        "Check started:    2026-09-09 22:30:03 BST\n"
+    )
+    assert output.index("Check started:") < output.index("EXAMPLE-SWITCH")
+    assert "Switches checked: 1" in output
+    assert "OK:               1" in output
+    assert "Errors:           0" in output
+    assert output.endswith("Check completed:  2026-09-09 22:30:05 BST\n")
 
 
 def test_monitoring_resolves_credentials_for_each_switch(monkeypatch, tmp_path):
@@ -5037,6 +5083,58 @@ def test_renew_due_orchestrates_and_summarizes_switches(
     assert f"Healthy:             {healthy}" in output
     assert f"Renewed:             {renewed}" in output
     assert f"Errors:              {errors}" in output
+
+
+def test_renew_due_prints_start_before_switches_and_completion_in_summary(
+    monkeypatch, capsys
+):
+    local_timezone = timezone(timedelta(hours=1), "BST")
+    times = iter(
+        (
+            datetime(2026, 9, 9, 22, 30, 3, tzinfo=local_timezone),
+            datetime(2026, 9, 9, 22, 30, 8, tzinfo=local_timezone),
+        )
+    )
+    monkeypatch.setattr(checker, "get_local_time", lambda: next(times))
+    monkeypatch.setattr(
+        checker,
+        "get_switch_credentials",
+        lambda switch, config_file: ("username", "password"),
+    )
+
+    def check(switch, *args):
+        checker.print_switch_heading(switch)
+        return "ok"
+
+    monkeypatch.setattr(checker, "check_switch", check)
+    monkeypatch.setattr(
+        checker,
+        "renew_certificate",
+        lambda *args: pytest.fail("A healthy certificate must not be renewed"),
+    )
+
+    result = checker.renew_due_certificates(
+        make_multi_switch_config()["switches"][:1],
+        Path("config.toml"),
+        30,
+        make_csr_settings(),
+        make_opnsense_settings(),
+        Path("public-ca.pem"),
+    )
+
+    assert result == checker.EXIT_OK
+    output = capsys.readouterr().out
+    assert output.startswith(
+        "Aruba certificate renewal check\n"
+        "===============================\n"
+        "Check started:    2026-09-09 22:30:03 BST\n"
+    )
+    assert output.index("Check started:") < output.index("SWITCH-A")
+    assert "Switches processed: 1" in output
+    assert "Healthy:             1" in output
+    assert "Renewed:             0" in output
+    assert "Errors:              0" in output
+    assert output.endswith("Check completed:     2026-09-09 22:30:08 BST\n")
 
 
 def test_renew_due_credential_failure_does_not_stop_later_switch(monkeypatch, capsys):
