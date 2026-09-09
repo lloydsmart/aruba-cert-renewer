@@ -626,6 +626,10 @@ python src/aruba_cert_renewer.py
 Use `--switch NAME` for one switch, `--config FILE` for another configuration
 file, and `--debug` for detailed Netmiko connection logging.
 
+Monitoring and `--renew-due` output records the local, timezone-aware start and
+completion times of the actual check. Retained one-shot container logs therefore
+show when the reported certificate state was observed, even when viewed later.
+
 ### Renew a Certificate Now
 
 Run the complete, explicitly requested renewal for one switch:

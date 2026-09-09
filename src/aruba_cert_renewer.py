@@ -298,6 +298,24 @@ def print_terminal(value="", *, file=None):
     print(sanitize_terminal_text(value), file=file)
 
 
+def get_local_time():
+    """Return the current timezone-aware local wall-clock time."""
+    return datetime.now(UTC).astimezone()
+
+
+def format_run_timestamp(value):
+    """Format a timezone-aware time for operator-facing run output."""
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("Run timestamp must be timezone-aware")
+    return value.strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+def print_run_start(title, started_at):
+    print_terminal(title)
+    print_terminal("=" * len(title))
+    print_terminal(f"Check started:    {format_run_timestamp(started_at)}")
+
+
 def print_switch_heading(switch):
     """Print a safe switch heading whose underline matches displayed text."""
     display_name = sanitize_terminal_text(switch["name"])
@@ -2097,7 +2115,7 @@ def check_switch(switch, username, password, warning_days):
     return "ok"
 
 
-def print_summary(results):
+def print_summary(results, completed_at):
     print_terminal()
     print_terminal("Summary")
     print_terminal("-------")
@@ -2106,9 +2124,11 @@ def print_summary(results):
     print_terminal(f"Renewal due:      {results.count('renewal_due')}")
     print_terminal(f"Expired:          {results.count('expired')}")
     print_terminal(f"Errors:           {results.count('error')}")
+    print_terminal()
+    print_terminal(f"Check completed:  {format_run_timestamp(completed_at)}")
 
 
-def print_renewal_summary(results):
+def print_renewal_summary(results, completed_at):
     print_terminal()
     print_terminal("Renewal summary")
     print_terminal("---------------")
@@ -2116,6 +2136,8 @@ def print_renewal_summary(results):
     print_terminal(f"Healthy:             {results.count('healthy')}")
     print_terminal(f"Renewed:             {results.count('renewed')}")
     print_terminal(f"Errors:              {results.count('error')}")
+    print_terminal()
+    print_terminal(f"Check completed:     {format_run_timestamp(completed_at)}")
 
 
 def get_exit_code(results):
@@ -2196,6 +2218,7 @@ def renew_due_certificates(
     opnsense_settings,
     verification_ca_file,
 ):
+    print_run_start("Aruba certificate renewal check", get_local_time())
     results = []
 
     for switch in switches:
@@ -2269,7 +2292,7 @@ def renew_due_certificates(
         finally:
             username = password = None
 
-    print_renewal_summary(results)
+    print_renewal_summary(results, get_local_time())
     return EXIT_ERROR if "error" in results else EXIT_OK
 
 
@@ -2498,6 +2521,7 @@ def main():
             print_terminal(f"Error: {error}", file=sys.stderr)
             return EXIT_ERROR
 
+    print_run_start("Aruba certificate check", get_local_time())
     results = []
     for switch in switches:
         try:
@@ -2520,7 +2544,7 @@ def main():
 
         results.append(status)
 
-    print_summary(results)
+    print_summary(results, get_local_time())
 
     return get_exit_code(results)
 
