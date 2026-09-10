@@ -332,6 +332,31 @@ preferred production reference. Omitting `ARUBA_CERT_RENEWER_IMAGE`
 intentionally fails validation so copying the example cannot silently select an
 image.
 
+On Linux hosts, including Unraid, the Compose example mounts
+`/etc/localtime:/etc/localtime:ro`. This read-only timezone database file lets
+timezone-aware operator timestamps use the host's configured local timezone.
+On a UK host, this means BST during daylight-saving time and GMT during winter.
+The mount alone is sufficient for the image's local-time conversion; no `TZ`
+environment variable or additional `tzdata` installation is required.
+Without the mount, a container may legitimately use UTC. UTC output is not an
+application error.
+
+In the Unraid container template, add this path mapping:
+
+```text
+Name:           Host timezone
+Container Path: /etc/localtime
+Host Path:      /etc/localtime
+Access Mode:    Read Only
+```
+
+The source must be a readable timezone database file on the Docker host.
+On non-Linux hosts or Docker Desktop, the path may be unavailable or refer to
+the Docker VM's timezone rather than the desktop host's timezone. Omit the
+mapping to accept the container's default timezone, or bind an appropriate
+timezone database file read-only at `/etc/localtime`. Recreate the container
+after changing the host's configured timezone so it picks up the current file.
+
 Do not start the example until local configuration, public CA, and secret files
 have been created. The expected paths inside the container are:
 
