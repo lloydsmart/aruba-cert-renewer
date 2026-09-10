@@ -94,4 +94,26 @@ ARUBA_CERT_RENEWER_IMAGE="$image" \
     docker compose --env-file /dev/null \
         -f "$repository_root/compose.example.yaml" config --quiet
 
+ARUBA_CERT_RENEWER_IMAGE="$image" \
+    docker compose --env-file /dev/null \
+        -f "$repository_root/compose.example.yaml" config --format json |
+    docker run --rm -i \
+        --network none \
+        --read-only \
+        --cap-drop ALL \
+        --security-opt no-new-privileges:true \
+        --entrypoint python \
+        "$image" -c '
+import json
+import sys
+
+volumes = json.load(sys.stdin)["services"]["aruba-cert-renewer"]["volumes"]
+timezone_mounts = [mount for mount in volumes if mount["target"] == "/etc/localtime"]
+assert len(timezone_mounts) == 1, "Expected one host timezone mount"
+mount = timezone_mounts[0]
+assert mount["type"] == "bind", "Host timezone must be a bind mount"
+assert mount["source"] == "/etc/localtime", "Host timezone must come from /etc/localtime"
+assert mount.get("read_only") is True, "Host timezone mount must be read-only"
+'
+
 printf '%s\n' "Container smoke tests passed for $image"
