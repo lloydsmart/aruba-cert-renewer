@@ -204,6 +204,23 @@ The production image intentionally:
 
 Do not weaken these properties without explicit justification.
 
+For Dockerfile or Compose changes, reproduce the independent container lint
+jobs locally without building the application image:
+
+```bash
+# Official Hadolint v2.15.1; keep this digest aligned with lint-container.yml.
+HADOLINT_IMAGE='ghcr.io/hadolint/hadolint:v2.15.1'
+HADOLINT_DIGEST='sha256:32dac94127fd60b7b7e3fbfc65e1383b9b5e25c9bfd7b8536de7a539fe68a12d'
+docker run --rm -i --network none \
+  "$HADOLINT_IMAGE@$HADOLINT_DIGEST" hadolint - < Dockerfile
+ARUBA_CERT_RENEWER_IMAGE=aruba-cert-renewer:test \
+  docker compose --env-file /dev/null -f compose.example.yaml config --quiet
+```
+
+Compose validation needs no real configuration or secrets and does not depend
+on the host's timezone. It validates the read-only `/etc/localtime` mapping as
+configuration without starting a container.
+
 For changes affecting `src/`, `Dockerfile`, runtime dependencies, Compose
 configuration, or container behaviour, run:
 

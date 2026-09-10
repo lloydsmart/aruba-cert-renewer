@@ -1,0 +1,49 @@
+name: Container lint
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'Dockerfile'
+      - 'compose.example.yaml'
+      - '.github/workflows/lint-container.yml'
+
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'Dockerfile'
+      - 'compose.example.yaml'
+      - '.github/workflows/lint-container.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  hadolint:
+    name: Hadolint
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Lint Dockerfile
+        uses: docker://ghcr.io/hadolint/hadolint:v2.15.1@sha256:32dac94127fd60b7b7e3fbfc65e1383b9b5e25c9bfd7b8536de7a539fe68a12d # v2.15.1
+        with:
+          entrypoint: hadolint
+          args: Dockerfile
+
+  compose:
+    name: Docker Compose config
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Validate Compose configuration
+        env:
+          ARUBA_CERT_RENEWER_IMAGE: aruba-cert-renewer:test
+        run: docker compose --env-file /dev/null -f compose.example.yaml config --quiet
