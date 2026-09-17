@@ -154,15 +154,23 @@ Container CI scans the exact image produced by the smoke test. To scan an
 already-built local image for HIGH and CRITICAL vulnerabilities:
 
 ```bash
-./scripts/scan-container.sh aruba-cert-renewer:local
+upstream=$(awk '$1 == "FROM" { print $2 }' Dockerfile)
+docker pull "$upstream"
+./scripts/scan-container.sh aruba-cert-renewer:local "$upstream"
 ```
 
 GitHub CodeQL default setup remains the static source-code scan. Release images
 already receive an SPDX JSON SBOM plus build-provenance and SBOM attestations
 bound to the published digest. No Gitleaks or CVE-specific Trivy suppressions
-are enabled by default. Trivy reports every HIGH or CRITICAL finding and gates
-on findings with an available fixed version; the exact pip-audit accepted-risk
-exception is documented in `SECURITY.md`. GitHub native secret scanning and push
+are enabled by default. The [common image policy](docs/container-image-policy.md)
+blocks introduced HIGH/CRITICAL findings even without a fix and fixable inherited
+findings without an exact, reviewed, unexpired exception. Its initial registry is
+empty. The current Perl security update leaves unfixed `CVE-2026-9538` in
+`perl-base 5.40.1-6+deb13u1`; the pinned upstream has `5.40.1-6`. Exact-version
+comparison conservatively classifies this as introduced and blocks the gate,
+even though the CVE appears in both versions. It needs base alignment or a
+separate classification review; inherited exceptions cannot waive it.
+The separate pip-audit accepted risk is documented in `SECURITY.md`. GitHub native secret scanning and push
 protection are complementary repository settings that maintainers should verify
 or enable separately where supported.
 
