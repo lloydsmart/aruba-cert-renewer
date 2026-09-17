@@ -2,10 +2,10 @@ FROM python:3.14.7-slim-trixie@sha256:cad9a2c871761c413caa6fdd6441c783451e740a48
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends --only-upgrade \
-        gzip \
-        libpcre2-8-0 \
-        libsqlite3-0 \
-        perl-base \
+        gzip=1.13-1+deb13u1 \
+        libpcre2-8-0=10.46-1~deb13u2 \
+        libsqlite3-0=3.46.1-7+deb13u2 \
+        perl-base=5.40.1-6+deb13u1 \
     && rm -rf /var/lib/apt/lists/*
 
 LABEL org.opencontainers.image.source="https://github.com/lloydsmart/aruba-cert-renewer" \
