@@ -806,6 +806,11 @@ be active. In particular, a failed live HTTPS check returns exit code `2` and
 requires manual investigation. The tool does not automatically restore, delete,
 regenerate, reboot, or otherwise roll back certificate state.
 
+Failure to exit switch configuration mode after certificate confirmation also
+reports that installation may already have changed the switch. If installation
+fails first and leaving configuration mode fails as well, the original
+installation error remains the reported cause. Neither failure retries the import.
+
 ### Staged Renewal Workflow
 
 For debugging, recovery, or separately managed artifacts, the staged workflow
