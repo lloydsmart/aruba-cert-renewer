@@ -8,9 +8,11 @@ RUN apt-get update \
         perl-base=5.40.1-6+deb13u1 \
     && rm -rf /var/lib/apt/lists/*
 
+ARG UNRAID_ICON_REF=main
+
 LABEL org.opencontainers.image.source="https://github.com/lloydsmart/aruba-cert-renewer" \
       org.opencontainers.image.licenses="GPL-3.0-only" \
-      net.unraid.docker.icon="https://raw.githubusercontent.com/lloydsmart/aruba-cert-renewer/main/assets/icon.png"
+      net.unraid.docker.icon="https://raw.githubusercontent.com/lloydsmart/aruba-cert-renewer/${UNRAID_ICON_REF}/assets/icon.png"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \

@@ -3,6 +3,7 @@
 set -euo pipefail
 
 image=${1:-aruba-cert-renewer:test}
+unraid_icon_ref=${ARUBA_CERT_RENEWER_ICON_REF:-main}
 repository_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 temporary_directory=$(mktemp -d "${TMPDIR:-/tmp}/aruba-cert-renewer-smoke.XXXXXX")
 
@@ -11,7 +12,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-docker build --tag "$image" "$repository_root"
+docker build \
+    --build-arg "UNRAID_ICON_REF=$unraid_icon_ref" \
+    --tag "$image" \
+    "$repository_root"
 
 docker run --rm \
     --network none \
@@ -41,12 +45,13 @@ exposed_ports=$(docker image inspect --format '{{json .Config.ExposedPorts}}' "$
 entrypoint=$(docker image inspect --format '{{json .Config.Entrypoint}}' "$image")
 default_command=$(docker image inspect --format '{{json .Config.Cmd}}' "$image")
 unraid_icon=$(docker image inspect --format '{{index .Config.Labels "net.unraid.docker.icon"}}' "$image")
+expected_unraid_icon="https://raw.githubusercontent.com/lloydsmart/aruba-cert-renewer/${unraid_icon_ref}/assets/icon.png"
 
 [[ "$image_user" == "10001:10001" ]]
 [[ "$exposed_ports" == "null" || "$exposed_ports" == "{}" ]]
 [[ "$entrypoint" == '["python","/app/src/aruba_cert_renewer.py"]' ]]
 [[ "$default_command" == '["--config","/config/config.toml","--renew-due"]' ]]
-[[ "$unraid_icon" == "https://raw.githubusercontent.com/lloydsmart/aruba-cert-renewer/main/assets/icon.png" ]]
+[[ "$unraid_icon" == "$expected_unraid_icon" ]]
 
 docker run --rm \
     --network none \

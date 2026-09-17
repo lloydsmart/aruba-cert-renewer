@@ -82,6 +82,8 @@ jobs:
           printf 'sha=%s\n' "$commit_sha" >>"$GITHUB_OUTPUT"
 
       - name: Build and smoke-test release candidate
+        env:
+          ARUBA_CERT_RENEWER_ICON_REF: ${{ steps.commit.outputs.sha }}
         run: tests/container-smoke.sh "$CANDIDATE_IMAGE"
 
       - name: Scan release candidate for vulnerabilities
