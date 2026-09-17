@@ -852,3 +852,12 @@ certificate.
 
 This project is licensed under the GNU General Public License v3.0. See
 [LICENSE](LICENSE).
+
+## Pull Request CI
+
+Every pull request now receives the stable `Required CI gate`, combining the
+Python matrix and lock freshness, lint, security scans, and applicable container
+validation. Only explicitly recognized documentation-only edits may skip
+containers. Failed, cancelled, missing, or unexpectedly skipped work blocks the
+gate. Requiring that check in Aruba's repository protection is a separate,
+pending settings change. See the [common CI gate policy](docs/ci-gate-policy.md).

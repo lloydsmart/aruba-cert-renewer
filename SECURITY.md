@@ -570,3 +570,14 @@ clearly and must not attempt automatic rollback or other recovery changes.
 This includes failure to leave configuration mode after certificate confirmation.
 A cleanup failure must not hide an earlier installation failure or replace an
 interruption with a misleading success result.
+
+## Common PR Gate
+
+The [common CI gate](docs/ci-gate-policy.md) checks explicit success from every
+mandatory workflow and its internal jobs, including full-history secret and
+dependency scans. It fails on cancellation, unexpected skips, malformed results,
+or absent evidence. Only documented changes can skip container validation;
+workflow and policy changes run the full graph. The gate has read-only
+permissions and no publication privileges. Repository settings must separately
+require its stable check name; this workflow change does not modify protection.
+Human review remains necessary because PR code can also change its own gate.

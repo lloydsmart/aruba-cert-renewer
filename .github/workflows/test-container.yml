@@ -1,6 +1,12 @@
 name: Container tests
 
 on:
+  workflow_call:
+    outputs:
+      passed:
+        description: Every required internal job succeeded
+        value: ${{ jobs.ci_result.outputs.passed }}
+
   workflow_dispatch:
 
   schedule:
@@ -51,12 +57,15 @@ jobs:
   test:
     name: Container smoke tests
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     env:
       TEST_IMAGE: aruba-cert-renewer:test
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Resolve and pull exact upstream image
         run: |
@@ -76,3 +85,21 @@ jobs:
 
       - name: Scan tested container for vulnerabilities
         run: ./scripts/scan-container.sh "$TEST_IMAGE" "$CONTAINER_UPSTREAM"
+
+  ci_result:
+    name: Workflow result
+    needs: [test]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      passed: ${{ steps.check.outputs.passed }}
+
+    steps:
+      - name: Confirm all internal checks succeeded
+        id: check
+        env:
+          PASSED: ${{ needs.test.result == 'success' }}
+        run: |
+          test "$PASSED" = 'true'
+          printf 'passed=true\n' >>"$GITHUB_OUTPUT"
