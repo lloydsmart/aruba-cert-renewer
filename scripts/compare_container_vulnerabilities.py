@@ -6,9 +6,11 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import subprocess
 import sys
 from dataclasses import dataclass, fields, replace
 from datetime import UTC, date, datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -49,11 +51,18 @@ class Finding:
 
 
 @dataclass(frozen=True)
+class PackageUpgrade:
+    upstream: Finding
+    derivative: Finding
+
+
+@dataclass(frozen=True)
 class Comparison:
     introduced: tuple[Finding, ...]
     inherited: tuple[Finding, ...]
     removed: tuple[Finding, ...]
     accepted: tuple[ImageException, ...] = ()
+    package_upgrades: tuple[PackageUpgrade, ...] = ()
 
     @property
     def unexcepted_fixable(self) -> tuple[Finding, ...]:
@@ -399,6 +408,56 @@ def _finding_sort_key(finding: Finding) -> tuple[Any, ...]:
     )
 
 
+def _debian_upgrade_scope(identity: FindingIdentity) -> FindingIdentity | None:
+    # Only canonical Debian OS package IDs may match across versions. Retain
+    # every other identity field, including CVE, distribution and package path.
+    if (
+        identity.result_class != "os-pkgs"
+        or identity.result_type != "debian"
+        or not identity.target.startswith("os:debian/")
+        or identity.package_id
+        != f"{identity.package_name}@{identity.installed_version}"
+    ):
+        return None
+    return replace(identity, package_id="", installed_version="")
+
+
+@lru_cache(maxsize=256)
+def _debian_version_increased(derivative: str, upstream: str) -> bool:
+    # Use Debian's comparator, not lexical or Python/semantic version ordering.
+    for version in (derivative, upstream):
+        if len(version) > 256 or not re.fullmatch(
+            r"(?:[0-9]+:)?[0-9][A-Za-z0-9.+:~\-]*", version
+        ):
+            raise InvalidReportError("invalid Debian package version for comparison")
+    try:
+        completed = subprocess.run(
+            ["/usr/bin/dpkg", "--compare-versions", derivative, "gt", upstream],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            env={"LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise InvalidReportError("Debian version comparison is unavailable") from error
+    if completed.returncode not in (0, 1) or completed.stderr:
+        raise InvalidReportError("Debian version comparison failed closed")
+    return completed.returncode == 0
+
+
+def _upgrade_candidates(
+    identities: set[FindingIdentity],
+) -> dict[FindingIdentity, list[FindingIdentity]]:
+    groups: dict[FindingIdentity, list[FindingIdentity]] = {}
+    for identity in sorted(identities):
+        scope = _debian_upgrade_scope(identity)
+        if scope is not None:
+            groups.setdefault(scope, []).append(identity)
+    return groups
+
+
 def compare_reports(
     derivative_report: dict[str, Any], upstream_report: dict[str, Any]
 ) -> Comparison:
@@ -410,22 +469,51 @@ def compare_reports(
     if any(derivative[key] != upstream[key] for key in derivative_keys & upstream_keys):
         raise InvalidReportError("shared finding metadata differs between scan reports")
 
+    introduced_keys = derivative_keys - upstream_keys
+    inherited_keys = derivative_keys & upstream_keys
+    removed_keys = upstream_keys - derivative_keys
+    derivative_groups = _upgrade_candidates(derivative_keys)
+    upstream_groups = _upgrade_candidates(upstream_keys)
+    package_upgrades = []
+    for scope in sorted(derivative_groups.keys() & upstream_groups.keys()):
+        current = derivative_groups[scope]
+        previous = upstream_groups[scope]
+        # Multiple versions make attribution ambiguous, including an exact
+        # inherited copy beside a newly added version. Keep those introduced.
+        if len(current) != 1 or len(previous) != 1:
+            continue
+        new_key, old_key = current[0], previous[0]
+        if new_key not in introduced_keys or old_key not in removed_keys:
+            continue
+        new, old = derivative[new_key], upstream[old_key]
+        if (new.severity, new.fixed_version) != (old.severity, old.fixed_version):
+            continue
+        if not _debian_version_increased(
+            new_key.installed_version, old_key.installed_version
+        ):
+            continue
+        introduced_keys.remove(new_key)
+        removed_keys.remove(old_key)
+        inherited_keys.add(new_key)
+        package_upgrades.append(PackageUpgrade(upstream=old, derivative=new))
+
     return Comparison(
+        package_upgrades=tuple(package_upgrades),
         introduced=tuple(
             sorted(
-                (derivative[key] for key in derivative_keys - upstream_keys),
+                (derivative[key] for key in introduced_keys),
                 key=_finding_sort_key,
             )
         ),
         inherited=tuple(
             sorted(
-                (derivative[key] for key in derivative_keys & upstream_keys),
+                (derivative[key] for key in inherited_keys),
                 key=_finding_sort_key,
             )
         ),
         removed=tuple(
             sorted(
-                (upstream[key] for key in upstream_keys - derivative_keys),
+                (upstream[key] for key in removed_keys),
                 key=_finding_sort_key,
             )
         ),
@@ -476,6 +564,16 @@ def render_comparison(comparison: Comparison) -> str:
         lines.append(f"{heading}: {len(findings)}")
         lines.extend(_format_finding(finding) for finding in findings)
 
+    lines.append(
+        "Inherited Debian findings carried through package upgrades: "
+        f"{len(comparison.package_upgrades)}"
+    )
+    for upgrade in comparison.package_upgrades:
+        lines.append(_format_finding(upgrade.derivative))
+        lines.append(
+            "  previous_upstream_version="
+            f"{_quoted(upgrade.upstream.identity.installed_version)}"
+        )
     lines.append(
         f"Reviewed inherited finding exceptions applied: {len(comparison.accepted)}"
     )

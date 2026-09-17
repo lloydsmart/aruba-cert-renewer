@@ -608,3 +608,175 @@ def test_cli_empty_registry_enforces_fixable_inherited_and_requires_context(
     output = capsys.readouterr().out
     assert "Unexcepted fixable inherited HIGH/CRITICAL findings: 1" in output
     assert "BLOCKED:" in output
+
+
+def debian_finding(version, *, fixed=None, vulnerability_id="CVE-EXISTING"):
+    return vulnerability(
+        vulnerability_id,
+        installed=version,
+        fixed=fixed,
+        package_id=f"example-package@{version}",
+    )
+
+
+def test_existing_unfixed_debian_finding_survives_security_upgrade():
+    old = debian_finding("5.40.1-6")
+    new = debian_finding("5.40.1-6+deb13u1")
+    comparison = compare(report(result(new)), report(result(old)))
+    assert not comparison.blocked
+    assert not comparison.introduced and not comparison.removed
+    assert len(comparison.inherited) == len(comparison.package_upgrades) == 1
+    assert comparison.inherited[0].identity.installed_version == "5.40.1-6+deb13u1"
+    output = comparator.render_comparison(comparison)
+    assert 'previous_upstream_version="5.40.1-6"' in output
+    assert 'installed="5.40.1-6+deb13u1"' in output
+    assert "Reviewed inherited finding exceptions applied: 0" in output
+
+
+@pytest.mark.parametrize(
+    "new,old,increased",
+    [
+        ("1.10-1", "1.9-1", True),
+        ("1.9-1", "1.10-1", False),
+        ("1:1.0-1", "9.0-1", True),
+        ("9.0-1", "1:1.0-1", False),
+        ("1.0-1", "1.0~rc1-1", True),
+        ("1.0~rc1-1", "1.0-1", False),
+        ("1.0-0", "1.0", False),
+        ("1.0", "1.0", False),
+    ],
+)
+def test_debian_version_order_is_not_lexical_or_semver(new, old, increased):
+    assert comparator._debian_version_increased(new, old) is increased
+
+
+@pytest.mark.parametrize("fixed", [None, "5.40.1-8"])
+def test_debian_downgrade_remains_introduced(fixed):
+    comparison = compare(
+        report(result(debian_finding("5.40.1-6", fixed=fixed))),
+        report(result(debian_finding("5.40.1-6+deb13u1", fixed=fixed))),
+    )
+    assert comparison.blocked and len(comparison.introduced) == 1
+    assert not comparison.package_upgrades
+
+
+def test_debian_upgrade_with_new_cve_still_blocks():
+    old = debian_finding("1.0-1")
+    new = debian_finding("1.0-2")
+    introduced = debian_finding("1.0-2", vulnerability_id="CVE-NEW")
+    comparison = compare(report(result(new, introduced)), report(result(old)))
+    assert comparison.blocked and len(comparison.package_upgrades) == 1
+    assert [row.identity.vulnerability_id for row in comparison.introduced] == [
+        "CVE-NEW"
+    ]
+
+
+def test_fixable_upgrade_needs_exception_for_exact_new_version(tmp_path):
+    old = debian_finding("1.0", fixed="1.2", vulnerability_id="CVE-EXAMPLE")
+    new = debian_finding("1.1", fixed="1.2", vulnerability_id="CVE-EXAMPLE")
+    comparison = compare(report(result(new)), report(result(old)))
+    assert comparison.blocked and len(comparison.unexcepted_fixable) == 1
+    entry = exception_entry()
+    entry["finding"]["fixed_version"] = "1.2"
+    old_exception = load_policy(tmp_path, [entry])
+    actual = comparator.apply_exceptions(comparison, old_exception, PINNED, PLATFORM)
+    assert actual.blocked and not actual.accepted
+    entry["finding"]["identity"].update(
+        installed_version="1.1", package_id="example-package@1.1"
+    )
+    exact_exception = load_policy(tmp_path, [entry])
+    actual = comparator.apply_exceptions(comparison, exact_exception, PINNED, PLATFORM)
+    assert not actual.blocked and len(actual.accepted) == 1
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"VulnerabilityID": "CVE-NEW"},
+        {"PkgName": "other", "PkgID": "other@1.1"},
+        {"PkgID": "module:example-package@1.1"},
+        {"PkgID": ""},
+        {"PkgPath": "different/location"},
+        {"Severity": "CRITICAL"},
+        {"FixedVersion": "1.2"},
+    ],
+)
+def test_debian_upgrade_does_not_cross_identity_or_advisory_fields(change):
+    old = debian_finding("1.0")
+    new = debian_finding("1.1") | change
+    comparison = compare(report(result(new)), report(result(old)))
+    assert comparison.blocked and len(comparison.introduced) == 1
+    assert not comparison.package_upgrades
+
+
+@pytest.mark.parametrize(
+    "context",
+    [
+        {"result_class": "lang-pkgs", "result_type": "python-pkg"},
+        {"result_class": "lang-pkgs", "result_type": "jar"},
+        {"result_type": "ubuntu"},
+        {"result_type": "alpine"},
+    ],
+)
+def test_other_package_ecosystems_keep_exact_version_matching(context):
+    comparison = compare(
+        report(result(debian_finding("1.1"), **context)),
+        report(result(debian_finding("1.0"), **context)),
+    )
+    assert comparison.blocked and not comparison.package_upgrades
+
+
+def test_os_release_change_is_not_package_inheritance():
+    old = report(result(debian_finding("1.0")))
+    new = report(result(debian_finding("1.1")))
+    new["Metadata"]["OS"]["Name"] = "13"
+    comparison = compare(new, old)
+    assert comparison.blocked and not comparison.package_upgrades
+
+
+@pytest.mark.parametrize("side", ["derivative", "upstream"])
+def test_multiple_versions_are_not_guessed_as_an_upgrade(side):
+    old = debian_finding("1.0")
+    new = debian_finding("1.1")
+    derivative = [new, old] if side == "derivative" else [new]
+    upstream = [old, debian_finding("0.9")] if side == "upstream" else [old]
+    comparison = compare(report(result(*derivative)), report(result(*upstream)))
+    assert comparison.blocked and not comparison.package_upgrades
+    assert comparison.introduced[0].identity.installed_version == "1.1"
+
+
+@pytest.mark.parametrize("version", ["--help", "x", "1\n2", "1" * 257, ""])
+def test_untrusted_debian_version_rejected_before_subprocess(monkeypatch, version):
+    comparator._debian_version_increased.cache_clear()
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("invalid version must not reach dpkg")
+
+    monkeypatch.setattr(comparator.subprocess, "run", unexpected)
+    with pytest.raises(comparator.InvalidReportError, match="invalid Debian"):
+        comparator._debian_version_increased(version, "1.0")
+
+
+@pytest.mark.parametrize("failure", ["missing", "timeout", "exit", "warning"])
+def test_debian_comparison_failure_is_not_an_exemption(monkeypatch, failure):
+    comparator._debian_version_increased.cache_clear()
+
+    def failing_run(arguments, **kwargs):
+        assert arguments == ["/usr/bin/dpkg", "--compare-versions", "1.1", "gt", "1.0"]
+        assert kwargs["timeout"] == 5
+        assert "shell" not in kwargs
+        if failure == "missing":
+            raise FileNotFoundError()
+        if failure == "timeout":
+            raise comparator.subprocess.TimeoutExpired(arguments, 5)
+        return comparator.subprocess.CompletedProcess(
+            arguments, 2 if failure == "exit" else 0, stderr=b"warning"
+        )
+
+    monkeypatch.setattr(comparator.subprocess, "run", failing_run)
+    with pytest.raises(comparator.InvalidReportError):
+        compare(
+            report(result(debian_finding("1.1"))),
+            report(result(debian_finding("1.0"))),
+        )
+    comparator._debian_version_increased.cache_clear()

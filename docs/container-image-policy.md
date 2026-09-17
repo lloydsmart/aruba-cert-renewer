@@ -31,10 +31,20 @@ package ID/path, and installed version. OS targets use the distribution family
 and version because Trivy's displayed OS target includes the image name. Java
 and other language targets retain their exact paths. Shared identities must
 agree on severity and fixed-version metadata or comparison fails closed.
-A patched package version is a distinct identity even when the same CVE exists
-in the upstream's older version. This conservative comparison blocks that case;
-it requires base alignment, remediation, or a separately reviewed classification
-change, and cannot be waived as an inherited exception.
+An existing Debian OS finding can remain inherited through a package upgrade
+when the same CVE, package, distribution, path, severity, and fix metadata occur
+exactly once in each image. Both IDs must be canonical `package@version` values,
+and Debian's `dpkg --compare-versions` must confirm a strictly newer version.
+The report shows both versions. New CVEs, downgrades, changed metadata, ambiguous
+multiple versions, and other package ecosystems retain exact matching. Missing
+or failing `dpkg` fails closed. The pinned comparison container supplies `dpkg`;
+standalone comparison of these upgrades needs `/usr/bin/dpkg` too. See
+[Debian version ordering](https://www.debian.org/doc/debian-policy/ch-controlfields.html#version).
+
+This corrects inheritance classification; it grants no risk exception. Fixable
+upgraded findings still block. Exceptions continue to match the derivative's
+full installed version and package ID, so an old-version approval cannot carry
+forward automatically. Unfixed inherited findings remain visible for review.
 
 The CLI exits 0 for a passing policy, 1 for blocked findings, and 2 for invalid
 comparison inputs. Scanner/download failures also stop the wrapper. Running the

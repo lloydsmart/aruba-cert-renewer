@@ -165,11 +165,11 @@ bound to the published digest. No Gitleaks or CVE-specific Trivy suppressions
 are enabled by default. The [common image policy](docs/container-image-policy.md)
 blocks introduced HIGH/CRITICAL findings even without a fix and fixable inherited
 findings without an exact, reviewed, unexpired exception. Its initial registry is
-empty. The current Perl security update leaves unfixed `CVE-2026-9538` in
-`perl-base 5.40.1-6+deb13u1`; the pinned upstream has `5.40.1-6`. Exact-version
-comparison conservatively classifies this as introduced and blocks the gate,
-even though the CVE appears in both versions. It needs base alignment or a
-separate classification review; inherited exceptions cannot waive it.
+empty. Existing Debian findings remain inherited across a verified package
+upgrade only when their other identity and advisory fields match unambiguously.
+The report retains both versions; downgrades, new CVEs, and ambiguous matches
+still block. The current Perl update therefore retains the visible, unfixed
+`CVE-2026-9538` without misclassifying that pre-existing finding as newly added.
 The separate pip-audit accepted risk is documented in `SECURITY.md`. GitHub native secret scanning and push
 protection are complementary repository settings that maintainers should verify
 or enable separately where supported.
