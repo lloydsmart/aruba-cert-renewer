@@ -1,6 +1,12 @@
 name: GitHub Actions lint
 
 on:
+  workflow_call:
+    outputs:
+      passed:
+        description: Every required internal job succeeded
+        value: ${{ jobs.ci_result.outputs.passed }}
+
   push:
     branches:
       - main
@@ -22,12 +28,33 @@ jobs:
   lint:
     name: actionlint
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Run actionlint
         uses: docker://rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 # v1.7.12
         with:
           args: -color
+
+  ci_result:
+    name: Workflow result
+    needs: [lint]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      passed: ${{ steps.check.outputs.passed }}
+
+    steps:
+      - name: Confirm all internal checks succeeded
+        id: check
+        env:
+          PASSED: ${{ needs.lint.result == 'success' }}
+        run: |
+          test "$PASSED" = 'true'
+          printf 'passed=true\n' >>"$GITHUB_OUTPUT"

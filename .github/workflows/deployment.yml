@@ -1,0 +1,41 @@
+name: Deployment CI
+
+on:
+  workflow_call:
+    inputs:
+      force-validation:
+        description: Common caller contract; this workflow always validates
+        type: boolean
+        default: false
+    outputs:
+      passed:
+        description: Container lint, smoke tests, and scans all succeeded
+        value: ${{ jobs.ci_result.outputs.passed }}
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    uses: ./.github/workflows/lint-container.yml
+
+  test:
+    uses: ./.github/workflows/test-container.yml
+
+  ci_result:
+    name: Workflow result
+    needs: [lint, test]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      passed: ${{ steps.check.outputs.passed }}
+
+    steps:
+      - name: Confirm all internal checks succeeded
+        id: check
+        env:
+          PASSED: ${{ needs.lint.result == 'success' && needs.test.result == 'success' && needs.lint.outputs.passed == 'true' && needs.test.outputs.passed == 'true' }}
+        run: |
+          test "$PASSED" = 'true'
+          printf 'passed=true\n' >>"$GITHUB_OUTPUT"

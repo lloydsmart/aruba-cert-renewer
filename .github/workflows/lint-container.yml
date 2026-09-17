@@ -1,6 +1,12 @@
 name: Container lint
 
 on:
+  workflow_call:
+    outputs:
+      passed:
+        description: Every required internal job succeeded
+        value: ${{ jobs.ci_result.outputs.passed }}
+
   push:
     branches:
       - main
@@ -24,10 +30,13 @@ jobs:
   hadolint:
     name: Hadolint
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Lint Dockerfile
         uses: docker://ghcr.io/hadolint/hadolint:v2.15.1@sha256:32dac94127fd60b7b7e3fbfc65e1383b9b5e25c9bfd7b8536de7a539fe68a12d # v2.15.1
@@ -38,12 +47,33 @@ jobs:
   compose:
     name: Docker Compose config
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Validate Compose configuration
         env:
           ARUBA_CERT_RENEWER_IMAGE: aruba-cert-renewer:test
         run: docker compose --env-file /dev/null -f compose.example.yaml config --quiet
+
+  ci_result:
+    name: Workflow result
+    needs: [hadolint, compose]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      passed: ${{ steps.check.outputs.passed }}
+
+    steps:
+      - name: Confirm all internal checks succeeded
+        id: check
+        env:
+          PASSED: ${{ needs.hadolint.result == 'success' && needs.compose.result == 'success' }}
+        run: |
+          test "$PASSED" = 'true'
+          printf 'passed=true\n' >>"$GITHUB_OUTPUT"

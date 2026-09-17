@@ -1,0 +1,88 @@
+name: Pull request CI
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pull-request-ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    name: Determine applicable CI
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      containers: ${{ steps.relevance.outputs.containers }}
+
+    steps:
+      - name: Checkout complete repository history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Classify all changed paths
+        id: relevance
+        env:
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$PR_BASE" =~ ^[0-9a-f]{40}$ && "$PR_HEAD" =~ ^[0-9a-f]{40}$ ]]
+          git cat-file -e "${PR_BASE}^{commit}"
+          git cat-file -e "${PR_HEAD}^{commit}"
+          git diff --no-ext-diff --no-textconv --no-renames --name-status -z \
+            "$PR_BASE...$PR_HEAD" >"$RUNNER_TEMP/ci-changes"
+          python scripts/ci_policy.py changes "$RUNNER_TEMP/ci-changes" >>"$GITHUB_OUTPUT"
+
+  actions:
+    name: Required Actions lint
+    uses: ./.github/workflows/lint-actions.yml
+
+  markdown:
+    name: Required Markdown lint
+    uses: ./.github/workflows/lint-markdown.yml
+
+  python_lint:
+    name: Required Python lint
+    uses: ./.github/workflows/lint-python.yml
+
+  python_tests:
+    name: Required Python tests
+    uses: ./.github/workflows/test-python.yml
+
+  security:
+    name: Required security scanning
+    uses: ./.github/workflows/security.yml
+
+  deployment:
+    name: Applicable deployment CI
+    needs: changes
+    if: needs.changes.outputs.containers == 'true'
+    uses: ./.github/workflows/deployment.yml
+    with:
+      force-validation: true
+
+  gate:
+    name: Required CI gate
+    needs: [changes, actions, markdown, python_lint, python_tests, security, deployment]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Require every applicable check to pass
+        env:
+          CI_NEEDS: ${{ toJSON(needs) }}
+        run: python scripts/ci_policy.py gate

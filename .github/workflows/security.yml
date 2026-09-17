@@ -1,6 +1,12 @@
 name: Security scanning
 
 on:
+  workflow_call:
+    outputs:
+      passed:
+        description: Every required internal job succeeded
+        value: ${{ jobs.ci_result.outputs.passed }}
+
   workflow_dispatch:
 
   push:
@@ -21,6 +27,7 @@ jobs:
   secrets:
     name: Full-history secret scan
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Checkout complete repository history
@@ -35,6 +42,7 @@ jobs:
   dependencies:
     name: Python dependency vulnerability scan
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Checkout repository
@@ -54,3 +62,21 @@ jobs:
 
       - name: Audit committed dependency locks
         run: ./scripts/scan-dependencies.sh
+
+  ci_result:
+    name: Workflow result
+    needs: [secrets, dependencies]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      passed: ${{ steps.check.outputs.passed }}
+
+    steps:
+      - name: Confirm all internal checks succeeded
+        id: check
+        env:
+          PASSED: ${{ needs.secrets.result == 'success' && needs.dependencies.result == 'success' }}
+        run: |
+          test "$PASSED" = 'true'
+          printf 'passed=true\n' >>"$GITHUB_OUTPUT"

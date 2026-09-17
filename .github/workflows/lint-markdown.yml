@@ -1,6 +1,12 @@
 name: Markdown lint
 
 on:
+  workflow_call:
+    outputs:
+      passed:
+        description: Every required internal job succeeded
+        value: ${{ jobs.ci_result.outputs.passed }}
+
   push:
     branches:
       - main
@@ -24,12 +30,33 @@ jobs:
   lint:
     name: Markdown lint
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Run markdownlint
         uses: DavidAnson/markdownlint-cli2-action@21c1be1b93ad9ed58fa840aacc3f279cde2a72ff # v24.2.0
         with:
           globs: '**/*.md'
+
+  ci_result:
+    name: Workflow result
+    needs: [lint]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      passed: ${{ steps.check.outputs.passed }}
+
+    steps:
+      - name: Confirm all internal checks succeeded
+        id: check
+        env:
+          PASSED: ${{ needs.lint.result == 'success' }}
+        run: |
+          test "$PASSED" = 'true'
+          printf 'passed=true\n' >>"$GITHUB_OUTPUT"

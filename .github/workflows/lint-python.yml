@@ -1,6 +1,12 @@
 name: Python lint
 
 on:
+  workflow_call:
+    outputs:
+      passed:
+        description: Every required internal job succeeded
+        value: ${{ jobs.ci_result.outputs.passed }}
+
   push:
     branches:
       - main
@@ -28,10 +34,13 @@ jobs:
   lint:
     name: Ruff
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -52,3 +61,21 @@ jobs:
 
       - name: Check formatting
         run: ruff format --check .
+
+  ci_result:
+    name: Workflow result
+    needs: [lint]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      passed: ${{ steps.check.outputs.passed }}
+
+    steps:
+      - name: Confirm all internal checks succeeded
+        id: check
+        env:
+          PASSED: ${{ needs.lint.result == 'success' }}
+        run: |
+          test "$PASSED" = 'true'
+          printf 'passed=true\n' >>"$GITHUB_OUTPUT"
