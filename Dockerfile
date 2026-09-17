@@ -1,5 +1,13 @@
 FROM python:3.14.7-slim-trixie@sha256:cad9a2c871761c413caa6fdd6441c783451e740a48aaeba60ae62a8b53525ef6
 
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends --only-upgrade \
+        gzip=1.13-1+deb13u1 \
+        libpcre2-8-0=10.46-1~deb13u2 \
+        libsqlite3-0=3.46.1-7+deb13u2 \
+        perl-base=5.40.1-6+deb13u1 \
+    && rm -rf /var/lib/apt/lists/*
+
 ARG UNRAID_ICON_REF=main
 
 LABEL org.opencontainers.image.source="https://github.com/lloydsmart/aruba-cert-renewer" \
