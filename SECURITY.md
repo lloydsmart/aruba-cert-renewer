@@ -569,3 +569,7 @@ verification does not replace it.
 An installation or verification error after the Aruba installation command may
 mean that the new certificate is already active. The tool must report that state
 clearly and must not attempt automatic rollback or other recovery changes.
+
+This includes failure to leave configuration mode after certificate confirmation.
+A cleanup failure must not hide an earlier installation failure or replace an
+interruption with a misleading success result.

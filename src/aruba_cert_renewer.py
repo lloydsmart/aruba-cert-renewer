@@ -1806,6 +1806,7 @@ def install_signed_certificate(
 ):
     """Install one validated PEM certificate using the guarded AOS-S prompts."""
     installation_attempted = False
+    installation_dialogue_completed = False
     entered_config_mode = False
 
     try:
@@ -1852,6 +1853,7 @@ def install_signed_certificate(
             raise ValueError(
                 "Switch reported an error while installing the certificate"
             )
+        installation_dialogue_completed = True
 
     except Exception as error:
         if installation_attempted:
@@ -1865,7 +1867,7 @@ def install_signed_certificate(
             try:
                 connection.exit_config_mode()
             except Exception as exit_error:
-                if sys.exc_info()[0] is None:
+                if installation_dialogue_completed:
                     raise CertificateInstallationAttemptError(
                         "Certificate installation may already have changed the switch, "
                         f"and config mode could not be exited: {exit_error}"
