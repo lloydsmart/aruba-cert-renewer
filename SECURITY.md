@@ -164,22 +164,19 @@ setup, which remains the static source-code security scan:
 * pip-audit scans all four fully resolved, hash-locked dependency sets: runtime,
   development/test, lock-generation, and security-scanner tooling. It disables
   pip-based resolution and fails if a committed requirement lacks a hash.
-* Trivy scans OS and language/package vulnerabilities twice in the exact image
-  archive exported with `docker save` after smoke testing. The reporting pass
-  shows every HIGH or CRITICAL finding, including `affected`, `fix_deferred`,
-  `will_not_fix`, and fixed/actionable findings. The enforcement pass fails when
-  a HIGH or CRITICAL finding has a known fixed version. Both passes use the same
-  archive and private cache. Trivy receives the archive and cache, but no Docker
-  socket.
+* Trivy scans the tested image and its exact digest-pinned upstream using the
+  same downloaded database snapshots and Linux platform. It reports inherited,
+  introduced, and removed HIGH/CRITICAL findings. Introduced findings block
+  even without a fix. Inherited findings with an available fix block unless an
+  exact, explicitly reviewed, unexpired exception applies. Scans run offline
+  against exported archives without access to the Docker socket.
 
-Unfixed distribution vulnerabilities remain visible in pull-request, release,
-and scheduled scans, but do not permanently fail the gate when Debian provides
-no remediation. This reporting-plus-enforcement policy avoids silently
-suppressing individual CVEs. When Debian makes a fixed package version available
-for a previously unfixed vulnerability, the enforcement pass automatically
-begins failing until the pinned base image is refreshed. HIGH or CRITICAL
-findings with an available fixed version block CI and release publication.
-Individual Trivy vulnerability suppressions remain disallowed by default.
+Unfixed inherited vulnerabilities remain visible for impact review. A newly
+available fix makes an inherited finding block automatically. The
+[common image policy](docs/container-image-policy.md) defines matching,
+fail-closed inputs, and explicit review with a maximum 90-day exception lifetime.
+The initial `.security/container-exceptions.json` registry is empty. Existing
+pip-audit risk acceptance does not grant a container exception.
 
 Secret and dependency scans run for every pull request and push to `main`, as
 well as weekly. Container CI smoke-tests one image and then scans that same

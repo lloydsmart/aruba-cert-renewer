@@ -18,6 +18,10 @@ on:
       - 'requirements.txt'
       - 'src/**'
       - 'scripts/scan-container.sh'
+      - 'scripts/compare_container_vulnerabilities.py'
+      - 'tests/test_compare_container_vulnerabilities.py'
+      - 'tests/test_scan_container.py'
+      - '.security/container-exceptions.json'
       - 'tests/container-smoke.sh'
       - '.github/workflows/test-container.yml'
 
@@ -33,6 +37,10 @@ on:
       - 'requirements.txt'
       - 'src/**'
       - 'scripts/scan-container.sh'
+      - 'scripts/compare_container_vulnerabilities.py'
+      - 'tests/test_compare_container_vulnerabilities.py'
+      - 'tests/test_scan_container.py'
+      - '.security/container-exceptions.json'
       - 'tests/container-smoke.sh'
       - '.github/workflows/test-container.yml'
 
@@ -50,8 +58,21 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Resolve and pull exact upstream image
+        run: |
+          set -euo pipefail
+          upstream_output=$(awk '$1 == "FROM" { print $2 }' Dockerfile)
+          mapfile -t upstreams <<<"$upstream_output"
+          if [[ ${#upstreams[@]} -ne 1 ]] || \
+            [[ ! ${upstreams[0]} =~ ^python:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}$ ]]; then
+            printf '%s\n' 'Dockerfile must have one exact pinned Python upstream.' >&2
+            exit 1
+          fi
+          docker pull "${upstreams[0]}"
+          printf 'CONTAINER_UPSTREAM=%s\n' "${upstreams[0]}" >>"$GITHUB_ENV"
+
       - name: Build and test container
         run: tests/container-smoke.sh "$TEST_IMAGE"
 
       - name: Scan tested container for vulnerabilities
-        run: ./scripts/scan-container.sh "$TEST_IMAGE"
+        run: ./scripts/scan-container.sh "$TEST_IMAGE" "$CONTAINER_UPSTREAM"

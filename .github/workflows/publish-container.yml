@@ -81,13 +81,26 @@ jobs:
 
           printf 'sha=%s\n' "$commit_sha" >>"$GITHUB_OUTPUT"
 
+      - name: Resolve and pull exact upstream image
+        run: |
+          set -euo pipefail
+          upstream_output=$(awk '$1 == "FROM" { print $2 }' Dockerfile)
+          mapfile -t upstreams <<<"$upstream_output"
+          if [[ ${#upstreams[@]} -ne 1 ]] || \
+            [[ ! ${upstreams[0]} =~ ^python:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}$ ]]; then
+            printf '%s\n' 'Dockerfile must have one exact pinned Python upstream.' >&2
+            exit 1
+          fi
+          docker pull "${upstreams[0]}"
+          printf 'CONTAINER_UPSTREAM=%s\n' "${upstreams[0]}" >>"$GITHUB_ENV"
+
       - name: Build and smoke-test release candidate
         env:
           ARUBA_CERT_RENEWER_ICON_REF: ${{ steps.commit.outputs.sha }}
         run: tests/container-smoke.sh "$CANDIDATE_IMAGE"
 
       - name: Scan release candidate for vulnerabilities
-        run: ./scripts/scan-container.sh "$CANDIDATE_IMAGE"
+        run: ./scripts/scan-container.sh "$CANDIDATE_IMAGE" "$CONTAINER_UPSTREAM"
 
       - name: Generate release SPDX JSON SBOM
         uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
