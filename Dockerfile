@@ -1,8 +1,10 @@
 FROM python:3.14.7-slim-trixie@sha256:cad9a2c871761c413caa6fdd6441c783451e740a48aaeba60ae62a8b53525ef6
 
+ARG UNRAID_ICON_REF=main
+
 LABEL org.opencontainers.image.source="https://github.com/lloydsmart/aruba-cert-renewer" \
       org.opencontainers.image.licenses="GPL-3.0-only" \
-      net.unraid.docker.icon="https://raw.githubusercontent.com/lloydsmart/aruba-cert-renewer/main/assets/icon.png"
+      net.unraid.docker.icon="https://raw.githubusercontent.com/lloydsmart/aruba-cert-renewer/${UNRAID_ICON_REF}/assets/icon.png"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
