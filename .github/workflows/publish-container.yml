@@ -8,9 +8,115 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
 jobs:
+  actions:
+    name: Release Actions lint
+    uses: ./.github/workflows/lint-actions.yml
+
+  markdown:
+    name: Release Markdown lint
+    uses: ./.github/workflows/lint-markdown.yml
+
+  python_lint:
+    name: Release Python lint
+    uses: ./.github/workflows/lint-python.yml
+
+  python_tests:
+    name: Release Python matrix and lock freshness
+    uses: ./.github/workflows/test-python.yml
+
+  security:
+    name: Release dependency and full-history secret scans
+    uses: ./.github/workflows/security.yml
+
+  container_lint:
+    name: Release Dockerfile and Compose lint
+    uses: ./.github/workflows/lint-container.yml
+
+  qualification:
+    name: Require complete checks on the release commit
+    needs: [actions, markdown, python_lint, python_tests, security, container_lint]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      passed: ${{ steps.qualified.outputs.passed }}
+      source_sha: ${{ steps.qualified.outputs.source_sha }}
+
+    steps:
+      - name: Checkout exact release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Require every qualification receipt
+        id: qualified
+        env:
+          QUALIFICATION_NEEDS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          [[ $(git rev-parse HEAD) == "$GITHUB_SHA" ]]
+          python3 -I scripts/release_qualification.py >>"$GITHUB_OUTPUT"
+
+  authorize:
+    name: Authenticate release authority independently of the build
+    needs: qualification
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      source_sha: ${{ steps.tag.outputs.source_sha }}
+      tag_object_sha: ${{ steps.tag.outputs.tag_object_sha }}
+      release_tag: ${{ steps.tag.outputs.release_tag }}
+
+    steps:
+      - name: Checkout immutable authorization controls
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Authenticate approved signed tag
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          QUALIFIED: ${{ needs.qualification.outputs.passed }}
+          QUALIFIED_SHA: ${{ needs.qualification.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$QUALIFIED" == true && "$QUALIFIED_SHA" == "$GITHUB_SHA" ]]
+          python3 -I scripts/validate_release_tag.py version "$RELEASE_TAG" >/dev/null
+          ref_json="$RUNNER_TEMP/release-tag-ref.json"
+          tag_json="$RUNNER_TEMP/release-tag-object.json"
+          gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" >"$ref_json"
+          tag_object_sha=$(python3 -I scripts/validate_release_tag.py \
+            ref "$RELEASE_TAG" "$ref_json")
+          gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_object_sha" >"$tag_json"
+          source_sha=$(python3 -I scripts/validate_release_tag.py \
+            tag "$RELEASE_TAG" "$tag_object_sha" "$tag_json")
+          [[ "$source_sha" == "$GITHUB_SHA" ]]
+          [[ $(git rev-parse HEAD) == "$source_sha" ]]
+          git --no-replace-objects cat-file tag "$tag_object_sha" >"$RUNNER_TEMP/signed-tag"
+          python3 -I scripts/verify_release_signature.py \
+            "$RELEASE_TAG" "$tag_object_sha" "$source_sha" "$RUNNER_TEMP/signed-tag"
+          git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+          git merge-base --is-ancestor "$source_sha" origin/main
+          {
+            printf 'source_sha=%s\n' "$source_sha"
+            printf 'tag_object_sha=%s\n' "$tag_object_sha"
+            printf 'release_tag=%s\n' "$RELEASE_TAG"
+          } >>"$GITHUB_OUTPUT"
+
   verify:
     name: Build and verify release container
+    needs: [authorize, qualification]
+    timeout-minutes: 60
     runs-on: ubuntu-latest
     outputs:
       artifact_name: ${{ steps.release.outputs.artifact_name }}
@@ -52,17 +158,22 @@ jobs:
       - name: Checkout exact release tag
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
 
       - name: Resolve and validate release commit
         id: commit
+        env:
+          AUTHORIZED_SOURCE: ${{ needs.authorize.outputs.source_sha }}
+          AUTHORIZED_TAG: ${{ needs.authorize.outputs.release_tag }}
         shell: bash
         run: |
           set -euo pipefail
 
           commit_sha=$(git rev-parse HEAD)
+          [[ "$commit_sha" == "$GITHUB_SHA" && "$commit_sha" == "$AUTHORIZED_SOURCE" ]]
+          [[ "$RELEASE_TAG" == "$AUTHORIZED_TAG" ]]
           if [[ ! "$commit_sha" =~ ^[0-9a-f]{40}$ ]]; then
             printf 'Resolved release commit is not a full lowercase SHA: %s\n' "$commit_sha" >&2
             exit 1
@@ -162,7 +273,8 @@ jobs:
 
   publish:
     name: Publish verified release container
-    needs: verify
+    needs: [authorize, qualification, verify]
+    timeout-minutes: 60
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -170,6 +282,11 @@ jobs:
       attestations: write
       id-token: write
     env:
+      AUTHORIZED_SOURCE: ${{ needs.authorize.outputs.source_sha }}
+      AUTHORIZED_TAG: ${{ needs.authorize.outputs.release_tag }}
+      AUTHORIZED_TAG_OBJECT: ${{ needs.authorize.outputs.tag_object_sha }}
+      QUALIFIED: ${{ needs.qualification.outputs.passed }}
+      QUALIFIED_SHA: ${{ needs.qualification.outputs.source_sha }}
       CANDIDATE_ARTIFACT_NAME: ${{ needs.verify.outputs.artifact_name }}
       COMMIT_SHA: ${{ needs.verify.outputs.commit_sha }}
       IMAGE_NAME: ghcr.io/lloydsmart/aruba-cert-renewer
@@ -182,6 +299,8 @@ jobs:
     steps:
       - name: Validate verified release metadata
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
@@ -234,6 +353,25 @@ jobs:
             printf '%s\n' 'The publish_latest value is inconsistent with the release.' >&2
             exit 1
           fi
+
+          [[ "$QUALIFIED" == true && "$QUALIFIED_SHA" == "$GITHUB_SHA" ]]
+          [[ "$COMMIT_SHA" == "$GITHUB_SHA" && "$COMMIT_SHA" == "$AUTHORIZED_SOURCE" ]]
+          [[ "$RELEASE_TAG" == "$AUTHORIZED_TAG" ]]
+          [[ "$AUTHORIZED_TAG_OBJECT" =~ ^[0-9a-f]{40}$ ]]
+          # Recheck the independently authenticated immutable object. No source checkout.
+          gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" \
+            >"$RUNNER_TEMP/publish-tag-ref.json"
+          jq -e --arg tag "$RELEASE_TAG" --arg object "$AUTHORIZED_TAG_OBJECT" \
+            '.ref == ("refs/tags/" + $tag) and .object.type == "tag" and .object.sha == $object' \
+            "$RUNNER_TEMP/publish-tag-ref.json" >/dev/null
+          gh api "repos/$GITHUB_REPOSITORY/git/tags/$AUTHORIZED_TAG_OBJECT" \
+            >"$RUNNER_TEMP/publish-tag-object.json"
+          jq -e --arg tag "$RELEASE_TAG" --arg object "$AUTHORIZED_TAG_OBJECT" \
+            --arg source "$GITHUB_SHA" \
+            '.tag == $tag and .sha == $object and .object.type == "commit" and
+             .object.sha == $source and .verification.verified == true and
+             .verification.reason == "valid"' \
+            "$RUNNER_TEMP/publish-tag-object.json" >/dev/null
 
       - name: Download verified release candidate
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1

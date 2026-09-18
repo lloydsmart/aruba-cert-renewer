@@ -85,9 +85,23 @@ writers.
 Normal container CI has no package-write permission and never publishes an
 image. The release workflow defaults to `contents: read`. Its verification job
 inherits only that read permission and receives no package, attestation, or
-OIDC write privileges. It validates the release tag and main ancestry, builds
-one candidate, and smoke-tests, scans, and generates an SPDX JSON SBOM from
-that exact image.
+OIDC write privileges. Before building, six reusable workflows must explicitly
+confirm success for lint, the full Python 3.12/3.14 suite, lock freshness,
+dependency audit, full-history secrets, Hadolint and Compose. All checkouts use
+the exact event commit; missing, skipped, cancelled or failed checks block.
+
+A separate read-only authorization job validates GitHub's signed annotated tag
+metadata, main ancestry and the exact event commit. It verifies the raw tag's
+object ID, signed name and direct source commit with GnuPG in an isolated
+public-only keyring. The approved primary fingerprint is
+`02EBB31CC0032A86C2C0401A1534542E61DC82D3`, including its certified signing
+subkeys. Tagger names or short key IDs cannot authorize publication. Invalid,
+expired, revoked, ambiguous or other-key signatures fail closed. The reviewed
+public key is in `.security/release-signing-key.asc`; automatic key retrieval
+and key import are disabled during verification.
+
+The builder must use the authorized event commit. It builds one candidate and
+smoke-tests, scans, and generates an SPDX JSON SBOM from that exact image.
 
 Only the publication job receives `packages: write`, `attestations: write`, and
 `id-token: write`, alongside `contents: read`. It does not receive
@@ -103,6 +117,21 @@ The privileged job does not check out, rebuild, or execute repository source.
 It verifies the artifact digest, archive checksum, recorded image ID, loaded
 image ID, and every release tag before registry authentication. The SHA tag
 continues to provide an exact source-commit audit reference.
+
+The publisher also requires the independent authorization job's source, tag and
+tag-object ID and the complete qualification receipt. It rechecks GitHub's
+current ref and immutable signed object against those identities before
+downloading or loading the candidate. These checks use fixed workflow commands,
+not repository scripts or candidate executables; no publisher checkout is added.
+The authorization runner, reviewed workflow source and GitHub job-output
+integrity remain trusted. The builder cannot supply its own authorization.
+
+The published-release trigger and existing prerelease suffix and `latest` rules
+are retained. Older tagged commits retain their historical workflows; these
+controls cannot retroactively secure old release paths. Public revocation/key
+updates require a reviewed PR. The [release procedure](docs/releasing.md)
+documents the supported signing identity and these limits. Tag-creation
+authority and immutable finalization remain separate controls.
 
 Publication does not add real deployment configuration, CA material, or
 secrets to the image, and does not weaken the documented runtime hardening.
