@@ -228,8 +228,14 @@ Publishing a GitHub Release with a tag such as `v1.2.3` is the explicit
 promotion action; creating a Git tag alone does not publish an image. Release
 tags must have the form `vMAJOR.MINOR.PATCH`, optionally followed by a
 prerelease suffix such as `-rc.1`; build metadata using `+` is not supported.
-The release workflow checks out that exact tag, builds and smoke-tests its
-source independently of normal CI, and only then publishes the tested image. A
+The release tag must be an annotated tag signed by Lloyd's approved GPG key.
+Every release runs the full read-only lint, Python 3.12/3.14 tests, lock freshness,
+dependency and secret scans, plus Hadolint and Compose checks on its exact event
+commit. A separate job authenticates the signed tag before the builder starts.
+The publisher requires that independently authorized identity and checks the
+current GitHub tag object again without checking out or executing repository
+source. The [release procedure](docs/releasing.md) documents the public key,
+signing commands, rejection cases, and historical-workflow limits. A
 successful stable release publishes:
 
 ```text
