@@ -234,9 +234,13 @@ dependency and secret scans, plus Hadolint and Compose checks on its exact event
 commit. A separate job authenticates the signed tag before the builder starts.
 The publisher requires that independently authorized identity and checks the
 current GitHub tag object again without checking out or executing repository
-source. The [release procedure](docs/releasing.md) documents the public key,
-signing commands, rejection cases, and historical-workflow limits. A
-successful stable release publishes:
+source. A bounded manifest binds the exact current run and attempt, candidate
+archive bytes, independently derived image descriptors and SPDX subject before
+registry login. Archive-byte, image-config, image-manifest, archive-index and
+Syft-native manifest digests remain distinct. The
+[release procedure](docs/releasing.md) documents the public key, immutable-alias
+recovery matrix, signing commands, rejection cases and historical-workflow
+limits. A successful stable release publishes:
 
 ```text
 ghcr.io/lloydsmart/aruba-cert-renewer:vX.Y.Z
@@ -244,8 +248,10 @@ ghcr.io/lloydsmart/aruba-cert-renewer:sha-<full-source-commit>
 ghcr.io/lloydsmart/aruba-cert-renewer:latest
 ```
 
-The workflow also resolves the published OCI manifest digest and uses it for
-the release's provenance and SBOM attestations. Release publication therefore
+The workflow inspects both version and source aliases before mutation and will
+not repoint an existing one. It establishes or reuses one exact OCI manifest
+digest, uploads provenance and SBOM attestations for it, and updates an eligible
+`latest` only after both uploads succeed. Release publication therefore
 ties together these identities:
 
 ```text
@@ -260,6 +266,19 @@ tested published OCI image
 OCI sha256 manifest digest
 ```
 
+The builder exports before scanning and gives pinned Syft the archive directly.
+A display-only source-name setting keeps the public package name stable; no
+source-version override is supplied or trusted. Both independent validators accept
+only one unambiguous image. They validate the config and every ordered layer,
+reconstruct Syft's native manifest identity, and require the SPDX version,
+checksum and OCI purl to identify that value. An OCI-layout archive must have
+exactly one index descriptor selecting one image manifest; a multi-platform or
+nested index is rejected rather than host-selected. Classic single-image Docker
+archives are also accepted, but have no archive manifest or index digest to
+claim. The registry must return one image manifest, never an index, with the
+candidate config digest; where the archive carried an OCI manifest, its digest
+must also be the selected registry digest.
+
 Each reference serves a different purpose:
 
 - `ghcr.io/lloydsmart/aruba-cert-renewer@sha256:<digest>` addresses the exact
@@ -267,20 +286,23 @@ Each reference serves a different purpose:
   deployment immutability, and is the preferred production reference.
 - `ghcr.io/lloydsmart/aruba-cert-renewer:vX.Y.Z` identifies the human-readable
   GitHub release and its source tag. It improves operational auditability, but
-  remains a registry tag and is not intrinsically content-addressed or
-  immutable.
+  remains a registry tag and is not intrinsically content-addressed. The
+  participating release workflow refuses to repoint it after creation.
 - `ghcr.io/lloydsmart/aruba-cert-renewer:sha-<full-source-commit>` identifies
   the exact source commit used for publication and makes source tracing easier.
-  It also remains a mutable registry tag rather than a content-addressed
-  reference.
+  It is also not content-addressed, but the participating workflow refuses to
+  repoint it after creation.
 - `ghcr.io/lloydsmart/aruba-cert-renewer:latest` is a convenience pointer to
-  the newest successfully published stable release. It intentionally moves
-  when a newer stable release is published, so it is useful for discovery or
-  testing but is not the recommended unattended production reference.
+  the most recently completed eligible stable publication in this serialized
+  workflow. It intentionally moves and is useful for discovery or testing, but
+  is not the recommended unattended production reference. The workflow does
+  not compare semantic versions or claim that the highest version wins.
 
 Of these reference types, only the OCI digest is intrinsically content-addressed
-and immutable. Version and source-commit tags improve auditability without
-providing that registry-level property.
+and immutable. Version and source-commit tags improve auditability, and the
+workflow enforces no-repoint behavior for its own participating jobs, without
+providing a registry-level immutable-tag property or controlling external GHCR
+writers.
 
 A GitHub prerelease such as `v1.2.3-rc.1` publishes its version and SHA tags but
 does not move `latest`. The version and source-commit tags remain useful
@@ -288,6 +310,15 @@ human-readable and auditable references even when production pins the digest.
 No single reference proves every link in the publication chain: the version
 names the selected release, the SHA tag exposes its source correlation, and the
 digest fixes the container object deployed.
+
+The release workflow queues same-tag runs and serializes all participating
+publisher jobs for this package. Those controls are not an atomic registry
+conditional write and do not prevent a separate external writer from racing the
+inspection and update sequence. Partial immutable-alias success is preserved;
+a later full rerun validates and fills only a missing alias. A full rerun is a
+rebuild, not reuse of an earlier attempt's artifact. If a rebuilt candidate at
+the same source SHA has a different config identity, its existing source alias
+conflicts and is not repointed, even when the version name is changed.
 
 The release workflow has not by itself demonstrated that a package is already
 available. Its first successful publication may create a GHCR package whose
