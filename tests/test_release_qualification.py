@@ -91,7 +91,19 @@ tool = Path(sys.argv[0]).name
 args = sys.argv[1:]
 if tool == 'gh':
     obj = {'type': 'tag', 'sha': os.environ['TAG_SHA']}
-    if '/git/ref/' in args[-1]:
+    if '/actions/artifacts/' in args[-1]:
+        print(json.dumps({
+            'id': int(os.environ['API_ARTIFACT_ID']),
+            'name': os.environ['CANDIDATE_ARTIFACT_NAME'],
+            'digest': 'sha256:' + os.environ['API_ARTIFACT_DIGEST'],
+            'expired': False,
+            'workflow_run': {
+                'id': int(os.environ['EXPECTED_RUN_ID']),
+                'repository_id': int(os.environ['GITHUB_REPOSITORY_ID']),
+                'head_sha': os.environ['API_SOURCE'],
+            },
+        }))
+    elif '/git/ref/' in args[-1]:
         print(json.dumps({'ref': 'refs/tags/v1.2.3', 'object': obj}))
     else:
         print(json.dumps({'tag': 'v1.2.3', 'sha': obj['sha'],
@@ -227,6 +239,9 @@ def run_step(name, environment, directory):
         "api-source",
         "github-invalid",
         "image-id",
+        "artifact-id",
+        "artifact-digest",
+        "release-id",
     ],
 )
 def test_publisher_requires_independent_authorization_before_handoff(tmp_path, damage):
@@ -246,8 +261,15 @@ def test_publisher_requires_independent_authorization_before_handoff(tmp_path, d
         "VERIFIED_RELEASE_TAG": "v1.2.3",
         "IS_GITHUB_PRERELEASE": "false",
         "PUBLISH_LATEST": "true",
-        "TESTED_IMAGE_ID": "sha256:" + "d" * 64,
+        "TESTED_CONFIG_DIGEST": "sha256:" + "d" * 64,
+        "CANDIDATE_ARTIFACT_DIGEST": "e" * 64,
+        "CANDIDATE_ARTIFACT_ID": "123456",
+        "API_ARTIFACT_DIGEST": "e" * 64,
+        "API_ARTIFACT_ID": "123456",
         "CANDIDATE_ARTIFACT_NAME": "aruba-cert-renewer-v1.2.3-candidate",
+        "EXPECTED_RELEASE_ID": "654321",
+        "EXPECTED_RUN_ID": "789012",
+        "GITHUB_REPOSITORY_ID": "123456",
         "GITHUB_REPOSITORY": "lloydsmart/aruba-cert-renewer",
         "RUNNER_TEMP": str(tmp_path),
     }
@@ -259,10 +281,17 @@ def test_publisher_requires_independent_authorization_before_handoff(tmp_path, d
         "authorized-tag": "AUTHORIZED_TAG",
         "tag-object": "AUTHORIZED_TAG_OBJECT",
         "api-source": "API_SOURCE",
-        "image-id": "TESTED_IMAGE_ID",
+        "image-id": "TESTED_CONFIG_DIGEST",
+        "artifact-id": "CANDIDATE_ARTIFACT_ID",
+        "artifact-digest": "CANDIDATE_ARTIFACT_DIGEST",
+        "release-id": "EXPECTED_RELEASE_ID",
     }.get(damage)
     if changed:
-        environment[changed] = "b" * 40
+        environment[changed] = {
+            "CANDIDATE_ARTIFACT_ID": "654321",
+            "CANDIDATE_ARTIFACT_DIGEST": "f" * 64,
+            "EXPECTED_RELEASE_ID": "0",
+        }.get(changed, "b" * 40)
     binary = tmp_path / "bin"
     binary.mkdir()
     gh = binary / "gh"
@@ -343,6 +372,17 @@ def test_aruba_release_graph_requires_qualification_and_independent_authority():
     assert '[[ "$source_sha" == "$GITHUB_SHA" ]]' in authorize
     assert "python3 -I scripts/verify_release_signature.py" in authorize
     assert "ARUBA_CERT_RENEWER_ICON_REF: ${{ steps.commit.outputs.sha }}" in verify
+    assert "Export verified release candidate" in verify
+    assert (
+        "image: docker-archive:${{ runner.temp }}/release-candidate/"
+        "release-candidate.tar" in verify
+    )
+    assert "config: ${{ runner.temp }}/release-syft.yaml" in verify
+    syft_config = verify.split("      - name: Export verified release candidate", 1)[
+        1
+    ].split("      - name: Generate release SPDX JSON SBOM", 1)[0]
+    assert "'  name: aruba-cert-renewer'" in syft_config
+    assert "version:" not in syft_config
     assert workflow.count('run: tests/container-smoke.sh "$CANDIDATE_IMAGE"') == 1
     assert "./.github/workflows/deployment.yml" not in workflow
     assert "actions/checkout@" not in publish
@@ -358,3 +398,21 @@ def test_aruba_release_graph_requires_qualification_and_independent_authority():
         "docker image load"
     )
     assert publish.index("docker image load") < publish.index("docker login")
+    assert "artifact-ids: ${{ needs.verify.outputs.artifact_id }}" in publish
+    assert "digest-mismatch: error" in publish
+    assert "actions: read" in publish
+    assert "actions/artifacts/$CANDIDATE_ARTIFACT_ID" in publish
+    assert ".workflow_run.id == $run" in publish
+    workflow_concurrency = workflow.split("jobs:", 1)[0]
+    assert "cancel-in-progress: false" in workflow_concurrency
+    assert "queue: max" in workflow_concurrency
+    assert "group: release-tag-${{ github.event.release.tag_name }}" in workflow
+    assert "group: release-publisher-${{ github.repository_id }}" in publish
+    assert "cancel-in-progress: false" in publish
+    assert "queue: max" in publish
+    assert publish.index("Promote immutable release aliases") < publish.index(
+        "Attest build provenance"
+    )
+    assert publish.index("Attest release SBOM") < publish.index(
+        "Promote eligible latest alias last"
+    )

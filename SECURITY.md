@@ -110,13 +110,44 @@ Only the publication job receives `packages: write`, `attestations: write`, and
 the repository-scoped `GITHUB_TOKEN`, not a personal access token, only after
 the verified candidate has been imported and checked.
 
-The unprivileged job exports the tested image with `docker save`, records an
-explicit SHA-256 archive checksum and Docker image ID, and transfers those
-values and the generated SBOM through an integrity-checked workflow artifact.
+The unprivileged job exports the tested image with `docker save` and creates a
+canonical, bounded manifest for an exact three-file handoff. The manifest binds
+the archive size and SHA-256, independently parsed config digest, optional OCI
+manifest and archive-index digests, reconstructed Syft-native manifest digest,
+SBOM size and SHA-256, and the repository, workflow, run, attempt, release, tag
+object, source and prerelease identities. The upload action's numeric artifact
+ID and digest select the exact current-run artifact without a name fallback.
 The privileged job does not check out, rebuild, or execute repository source.
-It verifies the artifact digest, archive checksum, recorded image ID, loaded
-image ID, and every release tag before registry authentication. The SHA tag
-continues to provide an exact source-commit audit reference.
+Fixed inline workflow code rejects non-canonical or ambiguous JSON, unsafe
+inventory, identity substitution and an unrelated SPDX subject.
+
+Pinned Syft scans the exported archive with only a display-name setting and no
+source-version override. The display name is not an image identity. Both
+validators independently parse one Docker image, hash its config and layers,
+verify layer diff IDs, and reconstruct the native Syft manifest digest from the
+ordered descriptors. The SPDX container's native version, checksum and OCI purl
+must match that value. User-overridable scanner metadata is not an identity
+authority. OCI-layout archives must contain exactly one index descriptor that
+selects one supported image manifest; nested indexes and multiple descriptors
+are rejected. Classic single-image Docker archives are supported without
+claiming an unavailable archive manifest or index digest. The publisher then
+loads the archive and verifies source, license and immutable-icon labels before
+registry authentication. This binding assumes the pinned scanner honestly
+reports the inventory it observed; it does not prove an intentionally dishonest
+scanner produced an accurate package list.
+
+Both archive validators preflight the complete tar stream before Python's tar
+parser sees it. They bound expanded archive bytes, ordinary members, extension
+headers, POSIX and Solaris PAX records and bytes, metadata files, layer count,
+trailing padding, and total uncompressed layer bytes. Oversized numeric PAX
+fields and GNU sparse metadata are rejected before integer conversion or sparse
+processing. JSON integers and gzip filename/comment fields are also bounded
+before conversion or unbounded byte-at-a-time scanning. Gzip inputs must contain
+one member; concatenated members are rejected. These limits prevent compressed
+or metadata-driven candidate inputs from causing unbounded allocation,
+accumulation, or decompression in either trust domain. Outer XZ compression is
+rejected because its stream metadata can request decoder memory before an
+expanded-byte ceiling takes effect.
 
 The publisher also requires the independent authorization job's source, tag and
 tag-object ID and the complete qualification receipt. It rechecks GitHub's
@@ -126,12 +157,33 @@ not repository scripts or candidate executables; no publisher checkout is added.
 The authorization runner, reviewed workflow source and GitHub job-output
 integrity remain trusted. The builder cannot supply its own authorization.
 
+Publisher jobs are serialized package-wide in addition to the per-tag workflow
+queue. Each concurrency group can retain up to 100 pending items; additional
+items are cancelled when that queue is full. Before a mutation, the publisher
+strictly inspects both version and source aliases. It either publishes the
+version once and copies its exact OCI
+digest to the source alias, copies an existing valid digest only to a missing
+alias, or preserves two aliases already at the same tested digest. Existing
+alias disagreement, config-digest mismatch, index responses and ambiguous
+absence fail closed. Absence requires a reference-specific `not found` or
+`manifest unknown` result; credential-helper, authentication, authorization,
+transport, throttling, server, malformed, mixed and unexplained HTTP errors do
+not authorize mutation.
+Successful partial state is retained for investigation or a later full rerun;
+there is no delete, repoint or destructive rollback. Failures report whether no
+mutation was attempted, a remote outcome is uncertain, or version/source alias
+publication or reuse was confirmed. An eligible `latest` copy is the final
+registry mutation and occurs only after both immutable aliases and both
+attestation uploads succeed.
+
 The published-release trigger and existing prerelease suffix and `latest` rules
 are retained. Older tagged commits retain their historical workflows; these
 controls cannot retroactively secure old release paths. Public revocation/key
 updates require a reviewed PR. The [release procedure](docs/releasing.md)
-documents the supported signing identity and these limits. Tag-creation
-authority and immutable finalization remain separate controls.
+documents the supported signing identity and these limits. The queues serialize
+only participating jobs; they are not an atomic registry conditional write and
+cannot exclude uncontrolled external GHCR writers. Tag-creation authority,
+consumer verification and immutable finalization remain separate controls.
 
 Publication does not add real deployment configuration, CA material, or
 secrets to the image, and does not weaken the documented runtime hardening.
@@ -158,13 +210,14 @@ Each release generates an SPDX JSON SBOM from the exact local image that already
 passed the container smoke tests and Trivy scan. The unprivileged verification
 job retains the SBOM as a release-specific workflow artifact and transfers it
 with the exported candidate across the publication boundary. The privileged
-job integrity-checks and imports that candidate without rebuilding it, then
-tags and publishes the loaded image. It resolves and validates the registry OCI
-manifest digest and publishes both build-provenance and SBOM attestations for
-that digest to GitHub and GHCR, using the transferred SBOM rather than
-generating another one. It does not automatically upload the SBOM as a GitHub
-Release asset. Attestation failure after publication fails visibly and does
-not trigger destructive rollback.
+job independently validates and imports that candidate without rebuilding it,
+then establishes or recovers the version and source aliases at one exact OCI
+manifest digest. It uploads both build-provenance and SBOM attestations for that
+digest to GitHub and GHCR, using the transferred SBOM rather than generating
+another one. These are attestation uploads, not consumer verification. It does
+not automatically upload the SBOM as a GitHub Release asset. Attestation failure
+after immutable publication fails visibly, prevents `latest`, and does not
+trigger destructive rollback.
 
 To reconstruct and audit the immutable inputs associated with a source commit
 or release tag, check out that exact revision, inspect the digest-pinned `FROM`

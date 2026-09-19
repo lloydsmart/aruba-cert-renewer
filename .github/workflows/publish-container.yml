@@ -9,8 +9,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.event.release.tag_name }}
+  group: release-tag-${{ github.event.release.tag_name }}
   cancel-in-progress: false
+  queue: max
 
 jobs:
   actions:
@@ -119,9 +120,11 @@ jobs:
     timeout-minutes: 60
     runs-on: ubuntu-latest
     outputs:
+      artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
       artifact_name: ${{ steps.release.outputs.artifact_name }}
       commit_sha: ${{ steps.commit.outputs.sha }}
-      image_id: ${{ steps.candidate.outputs.image_id }}
+      config_digest: ${{ steps.candidate.outputs.config_digest }}
       publish_latest: ${{ steps.release.outputs.publish_latest }}
       release_tag: ${{ steps.release.outputs.release_tag }}
     env:
@@ -213,10 +216,25 @@ jobs:
       - name: Scan release candidate for vulnerabilities
         run: ./scripts/scan-container.sh "$CANDIDATE_IMAGE" "$CONTAINER_UPSTREAM"
 
+      - name: Export verified release candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          handoff_directory="$RUNNER_TEMP/release-candidate"
+          mkdir -- "$handoff_directory"
+          docker image save \
+            --output "$handoff_directory/release-candidate.tar" \
+            "$CANDIDATE_IMAGE"
+          printf '%s\n' \
+            'source:' \
+            '  name: aruba-cert-renewer' \
+            >"$RUNNER_TEMP/release-syft.yaml"
+
       - name: Generate release SPDX JSON SBOM
         uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:
-          image: ${{ env.CANDIDATE_IMAGE }}
+          image: docker-archive:${{ runner.temp }}/release-candidate/release-candidate.tar
+          config: ${{ runner.temp }}/release-syft.yaml
           format: spdx-json
           output-file: release-sbom.spdx.json
           artifact-name: aruba-cert-renewer-${{ env.RELEASE_TAG }}-sbom.spdx.json
@@ -225,45 +243,39 @@ jobs:
           upload-artifact: true
           upload-release-assets: false
 
-      - name: Export verified release candidate
+      - name: Finalize verified release candidate
         id: candidate
+        env:
+          ARTIFACT_NAME: ${{ steps.release.outputs.artifact_name }}
+          IMAGE_NAME: ghcr.io/lloydsmart/aruba-cert-renewer
+          PUBLISH_LATEST: ${{ steps.release.outputs.publish_latest }}
+          RELEASE_ID: ${{ github.event.release.id }}
+          SOURCE_SHA: ${{ steps.commit.outputs.sha }}
+          TAG_OBJECT_SHA: ${{ needs.authorize.outputs.tag_object_sha }}
         shell: bash
         run: |
           set -euo pipefail
-
-          tested_image_id=$(docker image inspect --format '{{.Id}}' \
-            "$CANDIDATE_IMAGE")
-          if [[ ! "$tested_image_id" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            printf 'Unexpected tested image ID: %s\n' "$tested_image_id" >&2
-            exit 1
-          fi
 
           if [[ ! -s release-sbom.spdx.json ]]; then
             printf '%s\n' 'The generated release SBOM is missing or empty.' >&2
             exit 1
           fi
 
-          handoff_directory="$RUNNER_TEMP/release-candidate"
-          mkdir -- "$handoff_directory"
+          python3 -I scripts/release_candidate.py \
+            "$RUNNER_TEMP/release-candidate" release-sbom.spdx.json
 
-          docker image save \
-            --output "$handoff_directory/release-candidate.tar" \
-            "$CANDIDATE_IMAGE"
-
-          (
-            cd "$handoff_directory"
-            sha256sum release-candidate.tar \
-              >release-candidate.tar.sha256
+          config_digest=$(python3 -I - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          manifest = Path(os.environ["RUNNER_TEMP"]) / "release-candidate/candidate-manifest.json"
+          print(json.loads(manifest.read_bytes())["archive"]["config_digest"])
+          PY
           )
-
-          printf '%s\n' "$tested_image_id" \
-            >"$handoff_directory/tested-image-id.txt"
-          cp -- release-sbom.spdx.json \
-            "$handoff_directory/release-sbom.spdx.json"
-
-          printf 'image_id=%s\n' "$tested_image_id" >>"$GITHUB_OUTPUT"
+          printf 'config_digest=%s\n' "$config_digest" >>"$GITHUB_OUTPUT"
 
       - name: Upload verified release candidate
+        id: upload
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ steps.release.outputs.artifact_name }}
@@ -276,7 +288,12 @@ jobs:
     needs: [authorize, qualification, verify]
     timeout-minutes: 60
     runs-on: ubuntu-latest
+    concurrency:
+      group: release-publisher-${{ github.repository_id }}
+      cancel-in-progress: false
+      queue: max
     permissions:
+      actions: read
       contents: read
       packages: write
       attestations: write
@@ -287,13 +304,18 @@ jobs:
       AUTHORIZED_TAG_OBJECT: ${{ needs.authorize.outputs.tag_object_sha }}
       QUALIFIED: ${{ needs.qualification.outputs.passed }}
       QUALIFIED_SHA: ${{ needs.qualification.outputs.source_sha }}
+      CANDIDATE_ARTIFACT_DIGEST: ${{ needs.verify.outputs.artifact_digest }}
+      CANDIDATE_ARTIFACT_ID: ${{ needs.verify.outputs.artifact_id }}
       CANDIDATE_ARTIFACT_NAME: ${{ needs.verify.outputs.artifact_name }}
       COMMIT_SHA: ${{ needs.verify.outputs.commit_sha }}
+      EXPECTED_RELEASE_ID: ${{ github.event.release.id }}
+      EXPECTED_RUN_ID: ${{ github.run_id }}
       IMAGE_NAME: ghcr.io/lloydsmart/aruba-cert-renewer
+      CANDIDATE_IMAGE: aruba-cert-renewer:release-candidate
       IS_GITHUB_PRERELEASE: ${{ github.event.release.prerelease }}
       PUBLISH_LATEST: ${{ needs.verify.outputs.publish_latest }}
       RELEASE_TAG: ${{ github.event.release.tag_name }}
-      TESTED_IMAGE_ID: ${{ needs.verify.outputs.image_id }}
+      TESTED_CONFIG_DIGEST: ${{ needs.verify.outputs.config_digest }}
       VERIFIED_RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
 
     steps:
@@ -321,13 +343,28 @@ jobs:
             exit 1
           fi
 
+          if [[ ! "$CANDIDATE_ARTIFACT_ID" =~ ^[1-9][0-9]{0,15}$ ]]; then
+            printf '%s\n' 'The candidate artifact ID is invalid.' >&2
+            exit 1
+          fi
+
+          if [[ ! "$CANDIDATE_ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]; then
+            printf '%s\n' 'The candidate artifact digest is invalid.' >&2
+            exit 1
+          fi
+
+          if [[ ! "$EXPECTED_RELEASE_ID" =~ ^[1-9][0-9]{0,15}$ ]]; then
+            printf '%s\n' 'The release event ID is invalid.' >&2
+            exit 1
+          fi
+
           if [[ ! "$COMMIT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
             printf '%s\n' 'The verified release commit is invalid.' >&2
             exit 1
           fi
 
-          if [[ ! "$TESTED_IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            printf '%s\n' 'The verified image ID is invalid.' >&2
+          if [[ ! "$TESTED_CONFIG_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            printf '%s\n' 'The verified image config digest is invalid.' >&2
             exit 1
           fi
 
@@ -372,105 +409,886 @@ jobs:
              .object.sha == $source and .verification.verified == true and
              .verification.reason == "valid"' \
             "$RUNNER_TEMP/publish-tag-object.json" >/dev/null
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$CANDIDATE_ARTIFACT_ID" \
+            >"$RUNNER_TEMP/publish-artifact.json"
+          jq -e --argjson id "$CANDIDATE_ARTIFACT_ID" \
+            --argjson run "$EXPECTED_RUN_ID" \
+            --argjson repository "$GITHUB_REPOSITORY_ID" \
+            --arg name "$CANDIDATE_ARTIFACT_NAME" \
+            --arg digest "$CANDIDATE_ARTIFACT_DIGEST" \
+            --arg source "$GITHUB_SHA" \
+            '.id == $id and .name == $name and .digest == ("sha256:" + $digest) and
+             .expired == false and .workflow_run.id == $run and
+             .workflow_run.repository_id == $repository and
+             .workflow_run.head_sha == $source' \
+            "$RUNNER_TEMP/publish-artifact.json" >/dev/null
 
       - name: Download verified release candidate
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: ${{ needs.verify.outputs.artifact_name }}
+          artifact-ids: ${{ needs.verify.outputs.artifact_id }}
           path: ${{ runner.temp }}/release-candidate
           digest-mismatch: error
 
-      - name: Verify and load release candidate
+      - name: Validate candidate handoff independently
         shell: bash
         run: |
           set -euo pipefail
+          python3 -I - "$RUNNER_TEMP/release-candidate" <<'PY'
+          import bz2
+          import hashlib
+          import gzip
+          import json
+          import os
+          import re
+          import stat
+          import sys
+          import tarfile
+          import zlib
+          from pathlib import Path
+          from urllib.parse import parse_qs, unquote
 
-          handoff_directory="$RUNNER_TEMP/release-candidate"
-          image_archive="$handoff_directory/release-candidate.tar"
-          archive_checksum="$handoff_directory/release-candidate.tar.sha256"
-          image_id_metadata="$handoff_directory/tested-image-id.txt"
-          release_sbom="$handoff_directory/release-sbom.spdx.json"
+          MANIFEST_MAX = 32 * 1024
+          SBOM_MAX = 64 * 1024 * 1024
+          ARCHIVE_MAX = 1024 * 1024 * 1024
+          ARCHIVE_MEMBER_MAX = 1024
+          ARCHIVE_METADATA_MAX = 4 * 1024 * 1024
+          ARCHIVE_LAYER_MAX = 128
+          TAR_EXTENSION_MAX = 64 * 1024
+          TAR_EXTENSIONS_TOTAL_MAX = 256 * 1024
+          TAR_EXTENSION_COUNT_MAX = 2 * ARCHIVE_MEMBER_MAX
+          TAR_CONSECUTIVE_EXTENSION_MAX = 4
+          TAR_PAX_RECORD_MAX = 4 * ARCHIVE_MEMBER_MAX
+          TAR_PAX_GLOBAL_RECORD_MAX = 64
+          TAR_TRAILING_MAX = 1024 * 1024
+          GZIP_HEADER_TEXT_MAX = 64 * 1024
+          UNCOMPRESSED_LAYERS_MAX = 4 * ARCHIVE_MAX
+          SAFE_INTEGER = 9_007_199_254_740_991
+          EXPECTED_FILES = {
+              "candidate-manifest.json",
+              "release-candidate.tar",
+              "release-sbom.spdx.json",
+          }
+          TOP_LEVEL_KEYS = {
+              "schema_version", "repository", "repository_id", "workflow_ref",
+              "workflow_sha", "run_id", "run_attempt", "release_id",
+              "artifact_name", "release_tag", "tag_object_sha", "source_sha",
+              "github_prerelease", "publish_latest", "image_name", "archive",
+              "sbom",
+          }
+          FILE_KEYS = {"name", "size", "sha256"}
+          ARCHIVE_KEYS = FILE_KEYS | {
+              "format", "config_digest", "manifest_digest", "index_digest",
+              "syft_manifest_digest", "reference", "layer_diff_ids",
+          }
+          SHA = re.compile(r"^[0-9a-f]{40}$")
+          DIGEST = re.compile(r"^sha256:([0-9a-f]{64})$")
+          HASH = re.compile(r"^[0-9a-f]{64}$")
+          MANIFEST_MEDIA_TYPES = {
+              "application/vnd.oci.image.manifest.v1+json",
+              "application/vnd.docker.distribution.manifest.v2+json",
+          }
+          CONFIG_MEDIA_TYPES = {
+              "application/vnd.oci.image.config.v1+json",
+              "application/vnd.docker.container.image.v1+json",
+          }
+          GZIP_LAYER_MEDIA_TYPES = {
+              "application/vnd.oci.image.layer.v1.tar+gzip",
+              "application/vnd.docker.image.rootfs.diff.tar.gzip",
+          }
 
-          for artifact_file in \
-            "$image_archive" \
-            "$archive_checksum" \
-            "$image_id_metadata" \
-            "$release_sbom"; do
-            if [[ ! -f "$artifact_file" || -L "$artifact_file" ]]; then
-              printf '%s\n' 'The candidate artifact contains a missing or invalid file.' >&2
-              exit 1
-            fi
-          done
+          class InvalidCandidate(ValueError):
+              pass
 
-          if [[ ! -s "$image_archive" || ! -s "$release_sbom" ]]; then
-            printf '%s\n' 'The candidate image archive or SBOM is empty.' >&2
-            exit 1
-          fi
+          def reject_duplicate(pairs):
+              value = {}
+              for key, item in pairs:
+                  if key in value:
+                      raise InvalidCandidate(f"duplicate JSON key: {key}")
+                  value[key] = item
+              return value
 
-          checksum_metadata=$(<"$archive_checksum")
-          if [[ ! "$checksum_metadata" =~ ^[0-9a-f]{64}[[:space:]][[:space:]]release-candidate\.tar$ ]]; then
-            printf '%s\n' 'The candidate archive checksum metadata is invalid.' >&2
-            exit 1
-          fi
+          def reject_number(value):
+              raise InvalidCandidate(f"non-integer JSON number is forbidden: {value}")
 
-          (
-            cd "$handoff_directory"
-            sha256sum --check --strict release-candidate.tar.sha256
-          )
+          def json_integer(value):
+              digits = value.removeprefix("-")
+              if len(digits) > len(str(SAFE_INTEGER)):
+                  raise InvalidCandidate("JSON integer exceeds the safe-integer bound")
+              number = int(value)
+              if abs(number) > SAFE_INTEGER:
+                  raise InvalidCandidate("JSON integer exceeds the safe-integer bound")
+              return number
 
-          mapfile -t recorded_image_ids <"$image_id_metadata"
-          if (( ${#recorded_image_ids[@]} != 1 )); then
-            printf '%s\n' 'The candidate image-ID metadata must contain exactly one line.' >&2
-            exit 1
-          fi
+          def regular(path, maximum):
+              info = path.lstat()
+              if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                  raise InvalidCandidate(f"{path.name} is not one safe regular file")
+              if info.st_size <= 0 or info.st_size > maximum:
+                  raise InvalidCandidate(f"{path.name} violates its size bound")
+              return info
 
-          recorded_image_id=${recorded_image_ids[0]}
-          if [[ ! "$recorded_image_id" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            printf '%s\n' 'The candidate image-ID metadata is invalid.' >&2
-            exit 1
-          fi
+          def read_json(path, maximum):
+              info = regular(path, maximum)
+              raw = path.read_bytes()
+              if len(raw) != info.st_size:
+                  raise InvalidCandidate(f"{path.name} changed while being read")
+              if raw.startswith(b"\xef\xbb\xbf"):
+                  raise InvalidCandidate(f"{path.name} contains a UTF-8 BOM")
+              try:
+                  text = raw.decode("utf-8")
+                  value = json.loads(
+                      text,
+                      object_pairs_hook=reject_duplicate,
+                      parse_int=json_integer,
+                      parse_float=reject_number,
+                      parse_constant=reject_number,
+                  )
+              except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
+                  raise InvalidCandidate(f"invalid {path.name}: {error}") from error
+              if type(value) is not dict:
+                  raise InvalidCandidate(f"{path.name} is not a JSON object")
+              return value, raw
 
-          if [[ "$recorded_image_id" != "$TESTED_IMAGE_ID" ]]; then
-            printf '%s\n' 'The candidate image ID does not match the verification output.' >&2
-            exit 1
-          fi
+          def bounded_string(value, name, maximum=512):
+              if type(value) is not str or not value:
+                  raise InvalidCandidate(f"{name} is not a non-empty string")
+              if len(value.encode("utf-8")) > maximum:
+                  raise InvalidCandidate(f"{name} exceeds its bound")
+              if any(ord(character) < 0x20 or ord(character) == 0x7f for character in value):
+                  raise InvalidCandidate(f"{name} contains a control character")
+              return value
 
+          def positive_integer(value, name):
+              if type(value) is not int or value <= 0 or value > SAFE_INTEGER:
+                  raise InvalidCandidate(f"{name} is not a positive safe integer")
+              return value
+
+          def env_integer(name):
+              value = os.environ.get(name, "")
+              if (len(value) > len(str(SAFE_INTEGER)) or
+                      re.fullmatch(r"[1-9][0-9]*", value) is None):
+                  raise InvalidCandidate(f"{name} is not a positive decimal integer")
+              number = int(value)
+              if number > SAFE_INTEGER:
+                  raise InvalidCandidate(f"{name} exceeds the safe-integer bound")
+              return number
+
+          def sha256(path, expected_size):
+              digest = hashlib.sha256()
+              consumed = 0
+              with path.open("rb") as source:
+                  while chunk := source.read(1024 * 1024):
+                      consumed += len(chunk)
+                      if consumed > expected_size:
+                          raise InvalidCandidate(f"{path.name} grew while being hashed")
+                      digest.update(chunk)
+              if consumed != expected_size:
+                  raise InvalidCandidate(f"{path.name} changed while being hashed")
+              return digest.hexdigest()
+
+          def json_value(raw, name, expected_type):
+              if raw.startswith(b"\xef\xbb\xbf"):
+                  raise InvalidCandidate(f"{name} contains a UTF-8 BOM")
+              try:
+                  value = json.loads(
+                      raw.decode("utf-8"), object_pairs_hook=reject_duplicate,
+                      parse_int=json_integer, parse_float=reject_number,
+                      parse_constant=reject_number,
+                  )
+              except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
+                  raise InvalidCandidate(f"invalid {name}: {error}") from error
+              if type(value) is not expected_type:
+                  raise InvalidCandidate(f"{name} has the wrong JSON type")
+              return value
+
+          def digest_from_path(name, classic_config=False):
+              pattern = r"([0-9a-f]{64})\.json" if classic_config else r"blobs/sha256/([0-9a-f]{64})"
+              match = re.fullmatch(pattern, name)
+              if match is None:
+                  raise InvalidCandidate(f"unsupported archive content path: {name}")
+              return "sha256:" + match.group(1)
+
+          def hash_stream(stream, maximum, name):
+              digest = hashlib.sha256()
+              consumed = 0
+              while chunk := stream.read(1024 * 1024):
+                  consumed += len(chunk)
+                  if consumed > maximum:
+                      raise InvalidCandidate(f"{name} exceeds its uncompressed bound")
+                  digest.update(chunk)
+              return "sha256:" + digest.hexdigest(), consumed
+
+          class BoundedReader:
+              def __init__(self, source, maximum):
+                  self.source = source
+                  self.maximum = maximum
+                  self.consumed = 0
+
+              def read(self, size):
+                  if size < 0:
+                      raise InvalidCandidate("unbounded archive read is forbidden")
+                  raw = self.source.read(min(size, self.maximum - self.consumed + 1))
+                  self.consumed += len(raw)
+                  if self.consumed > self.maximum:
+                      raise InvalidCandidate("expanded archive exceeds its safety bound")
+                  return raw
+
+          def gzip_exact(source, size, name):
+              raw = bytearray()
+              while len(raw) < size:
+                  chunk = source.read(size - len(raw))
+                  if not chunk:
+                      raise InvalidCandidate(f"{name} gzip stream is truncated")
+                  raw.extend(chunk)
+              return bytes(raw)
+
+          def validate_single_gzip(source, name, maximum):
+              header = gzip_exact(source, 10, name)
+              if header[:3] != b"\x1f\x8b\x08" or header[3] & 0xe0:
+                  raise InvalidCandidate(f"{name} is not valid gzip")
+              flags = header[3]
+              if flags & 0x04:
+                  extra_size = int.from_bytes(gzip_exact(source, 2, name), "little")
+                  gzip_exact(source, extra_size, name)
+              header_text_size = 0
+              for flag in (0x08, 0x10):
+                  if flags & flag:
+                      while True:
+                          header_text_size += 1
+                          if header_text_size > GZIP_HEADER_TEXT_MAX:
+                              raise InvalidCandidate(
+                                  f"{name} gzip header text exceeds its safety bound"
+                              )
+                          if gzip_exact(source, 1, name) == b"\0":
+                              break
+              if flags & 0x02:
+                  gzip_exact(source, 2, name)
+
+              decompressor = zlib.decompressobj(-zlib.MAX_WBITS)
+              pending = b""
+              expanded = 0
+              try:
+                  while not decompressor.eof:
+                      if not pending:
+                          pending = source.read(64 * 1024)
+                          if not pending:
+                              raise InvalidCandidate(f"{name} gzip stream is truncated")
+                      raw = decompressor.decompress(
+                          pending, min(64 * 1024, maximum - expanded + 1)
+                      )
+                      expanded += len(raw)
+                      if expanded > maximum:
+                          raise InvalidCandidate(
+                              f"{name} exceeds its uncompressed bound"
+                          )
+                      pending = decompressor.unconsumed_tail
+              except zlib.error as error:
+                  raise InvalidCandidate(f"{name} is not valid gzip") from error
+
+              trailer = bytearray(decompressor.unused_data)
+              if len(trailer) < 8:
+                  trailer.extend(gzip_exact(source, 8 - len(trailer), name))
+              if len(trailer) > 8 or source.read(1):
+                  raise InvalidCandidate(
+                      f"{name} concatenated gzip members are unsupported"
+                  )
+
+          def tar_number(raw, name):
+              if raw and raw[0] & 0x80:
+                  if raw[0] & 0x40:
+                      raise InvalidCandidate(f"negative tar {name} is forbidden")
+                  return int.from_bytes(bytes([raw[0] & 0x7f]) + raw[1:], "big")
+              value = raw.rstrip(b"\0 ").lstrip(b" ")
+              if not value:
+                  return 0
+              if any(character not in b"01234567" for character in value):
+                  raise InvalidCandidate(f"invalid tar {name}")
+              return int(value, 8)
+
+          def read_exact(source, size, name):
+              chunks = []
+              remaining = size
+              while remaining:
+                  chunk = source.read(min(remaining, 64 * 1024))
+                  if not chunk:
+                      raise InvalidCandidate(f"archive is truncated in {name}")
+                  chunks.append(chunk)
+                  remaining -= len(chunk)
+              return b"".join(chunks)
+
+          def skip_exact(source, size, name):
+              remaining = size
+              while remaining:
+                  chunk = source.read(min(remaining, 64 * 1024))
+                  if not chunk:
+                      raise InvalidCandidate(f"archive is truncated in {name}")
+                  remaining -= len(chunk)
+
+          def pax_values(raw):
+              values = {}
+              offset = 0
+              record_count = 0
+              while offset < len(raw):
+                  separator = raw.find(b" ", offset)
+                  length_raw = raw[offset:separator]
+                  if (separator < 0 or not length_raw.isdigit() or
+                          len(length_raw) > len(str(TAR_EXTENSION_MAX))):
+                      raise InvalidCandidate("archive contains malformed PAX metadata")
+                  length = int(length_raw)
+                  end = offset + length
+                  if length <= separator - offset + 2 or end > len(raw) or raw[end - 1] != 10:
+                      raise InvalidCandidate("archive contains malformed PAX metadata")
+                  record = raw[separator + 1:end - 1]
+                  if b"=" not in record:
+                      raise InvalidCandidate("archive contains malformed PAX metadata")
+                  key_raw, value_raw = record.split(b"=", 1)
+                  try:
+                      key = key_raw.decode("utf-8")
+                      value = value_raw.decode("utf-8")
+                  except UnicodeDecodeError as error:
+                      raise InvalidCandidate("archive PAX metadata is not UTF-8") from error
+                  if not key or key in values or key.startswith("GNU.sparse"):
+                      raise InvalidCandidate("archive contains ambiguous PAX metadata")
+                  values[key] = value
+                  record_count += 1
+                  offset = end
+              return values, record_count
+
+          def preflight_archive(path):
+              with path.open("rb") as raw_source:
+                  magic = raw_source.read(6)
+                  raw_source.seek(0)
+                  if magic.startswith(b"\x1f\x8b"):
+                      validate_single_gzip(raw_source, "archive", ARCHIVE_MAX)
+                      raw_source.seek(0)
+                      decoded = gzip.GzipFile(fileobj=raw_source)
+                  elif magic.startswith(b"BZh"):
+                      decoded = bz2.BZ2File(raw_source)
+                  elif magic.startswith(b"\xfd7zXZ\0"):
+                      raise InvalidCandidate("XZ-compressed archives are unsupported")
+                  else:
+                      decoded = raw_source
+                  source = BoundedReader(decoded, ARCHIVE_MAX)
+                  member_count = 0
+                  extension_count = 0
+                  consecutive_extension_count = 0
+                  extension_total = 0
+                  pax_record_count = 0
+                  global_pax_record_count = 0
+                  global_pax = {}
+                  next_pax = {}
+                  zero_blocks = 0
+                  try:
+                      while True:
+                          header = source.read(512)
+                          if not header:
+                              raise InvalidCandidate("archive has no complete end marker")
+                          if len(header) != 512:
+                              raise InvalidCandidate("archive has a truncated tar header")
+                          if header == bytes(512):
+                              zero_blocks += 1
+                              if zero_blocks == 2:
+                                  trailing_size = 0
+                                  while trailing := source.read(64 * 1024):
+                                      trailing_size += len(trailing)
+                                      if trailing_size > TAR_TRAILING_MAX:
+                                          raise InvalidCandidate(
+                                              "archive trailing padding exceeds its bound"
+                                          )
+                                      if trailing.strip(b"\0"):
+                                          raise InvalidCandidate("archive has data after its end marker")
+                                  break
+                              continue
+                          if zero_blocks:
+                              raise InvalidCandidate("archive has an invalid end marker")
+                          stored_checksum = tar_number(header[148:156], "checksum")
+                          if sum(header[:148]) + 8 * 32 + sum(header[156:]) != stored_checksum:
+                              raise InvalidCandidate("archive tar checksum is invalid")
+                          size = tar_number(header[124:136], "member size")
+                          kind = header[156:157]
+                          if kind in {b"x", b"X", b"g", b"L", b"K"}:
+                              extension_count += 1
+                              consecutive_extension_count += 1
+                              if extension_count > TAR_EXTENSION_COUNT_MAX:
+                                  raise InvalidCandidate(
+                                      "archive tar extension count exceeds its bound"
+                                  )
+                              if consecutive_extension_count > TAR_CONSECUTIVE_EXTENSION_MAX:
+                                  raise InvalidCandidate(
+                                      "archive consecutive tar extensions exceed their bound"
+                                  )
+                              if size > TAR_EXTENSION_MAX:
+                                  raise InvalidCandidate("archive tar extension exceeds its bound")
+                              extension_total += size
+                              if extension_total > TAR_EXTENSIONS_TOTAL_MAX:
+                                  raise InvalidCandidate("archive tar extensions exceed their total bound")
+                              extension = read_exact(source, size, "tar extension")
+                              skip_exact(source, (-size) % 512, "tar extension padding")
+                              if kind == b"K":
+                                  raise InvalidCandidate("archive contains a long link")
+                              if kind == b"L":
+                                  try:
+                                      long_name = extension.rstrip(b"\0").decode("utf-8")
+                                  except UnicodeDecodeError as error:
+                                      raise InvalidCandidate("archive long name is not UTF-8") from error
+                                  if not long_name or len(long_name.encode()) > TAR_EXTENSION_MAX:
+                                      raise InvalidCandidate("archive long name is invalid")
+                                  next_pax["path"] = long_name
+                              else:
+                                  values, record_count = pax_values(extension)
+                                  pax_record_count += record_count
+                                  if pax_record_count > TAR_PAX_RECORD_MAX:
+                                      raise InvalidCandidate(
+                                          "archive PAX record count exceeds its bound"
+                                      )
+                                  if kind == b"g":
+                                      global_pax_record_count += record_count
+                                      if global_pax_record_count > TAR_PAX_GLOBAL_RECORD_MAX:
+                                          raise InvalidCandidate(
+                                              "archive global PAX record count exceeds its bound"
+                                          )
+                                      global_pax.update(values)
+                                  else:
+                                      next_pax.update(values)
+                              continue
+                          if kind == b"S":
+                              raise InvalidCandidate(
+                                  "archive contains unsupported sparse metadata"
+                              )
+                          consecutive_extension_count = 0
+                          member_count += 1
+                          if member_count > ARCHIVE_MEMBER_MAX:
+                              raise InvalidCandidate("archive member count exceeds its bound")
+                          pax_size = next_pax.get("size", global_pax.get("size"))
+                          next_pax.clear()
+                          if pax_size is not None:
+                              if (len(pax_size) > len(str(ARCHIVE_MAX)) or
+                                      re.fullmatch(r"0|[1-9][0-9]*", pax_size) is None):
+                                  raise InvalidCandidate("archive PAX size is invalid")
+                              size = int(pax_size)
+                          if size > ARCHIVE_MAX:
+                              raise InvalidCandidate("archive member exceeds its safety bound")
+                          skip_exact(source, size, "tar member")
+                          skip_exact(source, (-size) % 512, "tar member padding")
+                  except (OSError, EOFError) as error:
+                      raise InvalidCandidate(f"invalid compressed archive: {error}") from error
+
+          def inspect_archive(path):
+              preflight_archive(path)
+              try:
+                  archive = tarfile.open(path, mode="r:*")
+              except (OSError, tarfile.TarError) as error:
+                  raise InvalidCandidate(f"invalid candidate archive: {error}") from error
+              with archive:
+                  by_name = {}
+                  for member in archive:
+                      if len(by_name) >= ARCHIVE_MEMBER_MAX:
+                          raise InvalidCandidate("archive member count is outside its bound")
+                      name = member.name
+                      if (not name or name.startswith("/") or "\\" in name or
+                              any(part in {"", ".", ".."} for part in name.split("/"))):
+                          raise InvalidCandidate("archive contains an unsafe path")
+                      if name in by_name:
+                          raise InvalidCandidate(f"archive repeats member {name}")
+                      if not (member.isfile() or member.isdir()):
+                          raise InvalidCandidate("archive contains a non-regular member")
+                      by_name[name] = member
+
+                  if not by_name:
+                      raise InvalidCandidate("archive is empty")
+
+                  def member_bytes(name):
+                      member = by_name.get(name)
+                      if member is None or not member.isfile():
+                          raise InvalidCandidate(f"archive is missing regular file {name}")
+                      if member.size <= 0 or member.size > ARCHIVE_METADATA_MAX:
+                          raise InvalidCandidate(f"archive member {name} has invalid size")
+                      source = archive.extractfile(member)
+                      if source is None:
+                          raise InvalidCandidate(f"archive member {name} cannot be read")
+                      raw = source.read(member.size + 1)
+                      if len(raw) != member.size:
+                          raise InvalidCandidate(f"archive member {name} changed while read")
+                      return raw
+
+                  docker_manifest = json_value(
+                      member_bytes("manifest.json"), "archive manifest.json", list
+                  )
+                  if len(docker_manifest) != 1 or type(docker_manifest[0]) is not dict:
+                      raise InvalidCandidate("archive must contain exactly one image")
+                  entry = docker_manifest[0]
+                  config_path = entry.get("Config")
+                  layer_paths = entry.get("Layers")
+                  repo_tags = entry.get("RepoTags")
+                  if (type(layer_paths) is not list or not layer_paths or
+                          len(layer_paths) > ARCHIVE_LAYER_MAX):
+                      raise InvalidCandidate("archive layer count exceeds its bound")
+                  if (type(config_path) is not str or
+                          any(type(name) is not str for name in layer_paths) or
+                          len(set(layer_paths)) != len(layer_paths) or
+                          repo_tags != [os.environ["CANDIDATE_IMAGE"]]):
+                      raise InvalidCandidate("archive image descriptor is ambiguous")
+                  is_oci = config_path.startswith("blobs/sha256/")
+                  config_digest = digest_from_path(config_path, classic_config=not is_oci)
+                  config_raw = member_bytes(config_path)
+                  if "sha256:" + hashlib.sha256(config_raw).hexdigest() != config_digest:
+                      raise InvalidCandidate("archive config digest does not match its bytes")
+                  config = json_value(config_raw, "archive image config", dict)
+                  rootfs = config.get("rootfs")
+                  diff_ids = rootfs.get("diff_ids") if type(rootfs) is dict else None
+                  if (type(rootfs) is not dict or rootfs.get("type") != "layers" or
+                          type(diff_ids) is not list or len(diff_ids) > ARCHIVE_LAYER_MAX or
+                          len(diff_ids) != len(layer_paths) or
+                          any(type(item) is not str or DIGEST.fullmatch(item) is None
+                              for item in diff_ids)):
+                      raise InvalidCandidate("archive config has invalid rootfs identities")
+
+                  manifest_digest = None
+                  index_digest = None
+                  if is_oci:
+                      if not {"index.json", "oci-layout"} <= set(by_name):
+                          raise InvalidCandidate("OCI archive metadata is incomplete")
+                      index_raw = member_bytes("index.json")
+                      index = json_value(index_raw, "archive index.json", dict)
+                      descriptors = index.get("manifests")
+                      if (index.get("schemaVersion") != 2 or type(descriptors) is not list or
+                              len(descriptors) != 1 or type(descriptors[0]) is not dict):
+                          raise InvalidCandidate("archive index is ambiguous")
+                      descriptor = descriptors[0]
+                      if descriptor.get("mediaType") not in MANIFEST_MEDIA_TYPES:
+                          raise InvalidCandidate("archive index does not select one image manifest")
+                      manifest_digest = bounded_string(descriptor.get("digest"), "manifest digest")
+                      if DIGEST.fullmatch(manifest_digest) is None:
+                          raise InvalidCandidate("archive manifest digest is invalid")
+                      manifest_path = "blobs/sha256/" + manifest_digest.removeprefix("sha256:")
+                      manifest_raw = member_bytes(manifest_path)
+                      if "sha256:" + hashlib.sha256(manifest_raw).hexdigest() != manifest_digest:
+                          raise InvalidCandidate("archive manifest digest does not match its bytes")
+                      if descriptor.get("size") != len(manifest_raw):
+                          raise InvalidCandidate("archive manifest size is inconsistent")
+                      image_manifest = json_value(manifest_raw, "archive image manifest", dict)
+                      image_config = image_manifest.get("config")
+                      layers = image_manifest.get("layers")
+                      if (image_manifest.get("schemaVersion") != 2 or
+                              image_manifest.get("mediaType") not in MANIFEST_MEDIA_TYPES or
+                              type(image_config) is not dict or
+                              image_config.get("mediaType") not in CONFIG_MEDIA_TYPES or
+                              image_config.get("digest") != config_digest or
+                              image_config.get("size") != len(config_raw) or
+                              type(layers) is not list or len(layers) != len(layer_paths) or
+                              any(type(layer) is not dict for layer in layers)):
+                          raise InvalidCandidate("archive image manifest is inconsistent")
+                      media_types = [layer.get("mediaType") for layer in layers]
+                      layer_sizes = [layer.get("size") for layer in layers]
+                      for position, (layer, layer_path) in enumerate(
+                          zip(layers, layer_paths, strict=True)
+                      ):
+                          member = by_name.get(layer_path)
+                          if (layer.get("mediaType") not in GZIP_LAYER_MEDIA_TYPES or
+                                  layer.get("digest") != digest_from_path(layer_path) or
+                                  type(layer.get("size")) is not int or member is None or
+                                  layer.get("size") != member.size or
+                                  layer_path != "blobs/sha256/" +
+                                  layer["digest"].removeprefix("sha256:")):
+                              raise InvalidCandidate(f"archive layer {position} is inconsistent")
+                      index_digest = "sha256:" + hashlib.sha256(index_raw).hexdigest()
+                  else:
+                      if {"index.json", "oci-layout"} & set(by_name):
+                          raise InvalidCandidate("archive mixes classic and OCI representations")
+                      media_types = ["application/vnd.docker.image.rootfs.diff.tar"] * len(layer_paths)
+                      layer_sizes = [by_name.get(name, tarfile.TarInfo()).size for name in layer_paths]
+
+                  total_uncompressed = 0
+                  for position, (name, media_type, expected_diff_id) in enumerate(
+                      zip(layer_paths, media_types, diff_ids, strict=True)
+                  ):
+                      member = by_name.get(name)
+                      if member is None or not member.isfile() or member.size <= 0:
+                          raise InvalidCandidate(f"archive layer {position} is missing")
+                      source = archive.extractfile(member)
+                      if source is None:
+                          raise InvalidCandidate(f"archive layer {position} cannot be read")
+                      if media_type in GZIP_LAYER_MEDIA_TYPES:
+                          compressed_hash, compressed_size = hash_stream(
+                              source, ARCHIVE_MAX, f"archive layer {position}"
+                          )
+                          if compressed_hash != digest_from_path(name) or compressed_size != member.size:
+                              raise InvalidCandidate(f"archive layer {position} digest is invalid")
+                          source = archive.extractfile(member)
+                          validate_single_gzip(
+                              source, f"archive layer {position}",
+                              UNCOMPRESSED_LAYERS_MAX - total_uncompressed,
+                          )
+                          source = archive.extractfile(member)
+                          try:
+                              with gzip.GzipFile(fileobj=source) as uncompressed:
+                                  actual_diff_id, uncompressed_size = hash_stream(
+                                      uncompressed, UNCOMPRESSED_LAYERS_MAX - total_uncompressed,
+                                      f"archive layer {position}",
+                                  )
+                          except (OSError, EOFError) as error:
+                              raise InvalidCandidate(
+                                  f"archive layer {position} is not valid gzip"
+                              ) from error
+                      else:
+                          actual_diff_id, uncompressed_size = hash_stream(
+                              source, UNCOMPRESSED_LAYERS_MAX - total_uncompressed,
+                              f"archive layer {position}",
+                          )
+                      total_uncompressed += uncompressed_size
+                      if actual_diff_id != expected_diff_id:
+                          raise InvalidCandidate(f"archive layer {position} diff ID is invalid")
+
+                  syft_manifest = {
+                      "schemaVersion": 2,
+                      "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+                      "config": {
+                          "mediaType": "application/vnd.docker.container.image.v1+json",
+                          "size": len(config_raw), "digest": config_digest,
+                      },
+                      "layers": [
+                          {
+                              "mediaType": "application/vnd.docker.image.rootfs.diff.tar.gzip",
+                              "size": size, "digest": diff_id,
+                          }
+                          for size, diff_id in zip(layer_sizes, diff_ids, strict=True)
+                      ],
+                  }
+                  syft_raw = json.dumps(syft_manifest, separators=(",", ":")).encode()
+                  return {
+                      "format": "oci-single-manifest" if is_oci else "docker-single-image",
+                      "reference": os.environ["CANDIDATE_IMAGE"],
+                      "config_digest": config_digest,
+                      "layer_diff_ids": diff_ids,
+                      "manifest_digest": manifest_digest,
+                      "index_digest": index_digest,
+                      "syft_manifest_digest": "sha256:" + hashlib.sha256(syft_raw).hexdigest(),
+                  }
+
+          def validate_file(manifest, key, expected_name, maximum, directory,
+                            expected_keys=FILE_KEYS):
+              value = manifest.get(key)
+              if type(value) is not dict or set(value) != expected_keys:
+                  raise InvalidCandidate(f"{key} has an invalid schema")
+              if value["name"] != expected_name:
+                  raise InvalidCandidate(f"{key} has an unexpected name")
+              size = positive_integer(value["size"], f"{key}.size")
+              if size > maximum:
+                  raise InvalidCandidate(f"{key}.size exceeds its bound")
+              checksum = bounded_string(value["sha256"], f"{key}.sha256")
+              if HASH.fullmatch(checksum) is None:
+                  raise InvalidCandidate(f"{key}.sha256 is invalid")
+              path = directory / expected_name
+              info = regular(path, maximum)
+              if info.st_size != size or sha256(path, size) != checksum:
+                  raise InvalidCandidate(f"{key} size or hash does not match")
+
+          def validate_spdx(document, config_digest, syft_manifest_digest):
+              for key, expected in {
+                  "spdxVersion": "SPDX-2.3", "dataLicense": "CC0-1.0",
+                  "SPDXID": "SPDXRef-DOCUMENT",
+              }.items():
+                  if document.get(key) != expected:
+                      raise InvalidCandidate(f"SBOM {key} is invalid")
+              bounded_string(document.get("name"), "SBOM name")
+              bounded_string(document.get("documentNamespace"), "SBOM namespace")
+              creation = document.get("creationInfo")
+              creators = creation.get("creators") if type(creation) is dict else None
+              if type(creators) is not list or not creators or len(creators) > 32:
+                  raise InvalidCandidate("SBOM creators are invalid")
+              for creator in creators:
+                  bounded_string(creator, "SBOM creator")
+              packages = document.get("packages")
+              relationships = document.get("relationships")
+              if type(packages) is not list or not packages or len(packages) > 100_000:
+                  raise InvalidCandidate("SBOM package inventory is invalid")
+              if (type(relationships) is not list or not relationships or
+                      len(relationships) > 500_000):
+                  raise InvalidCandidate("SBOM relationships are invalid")
+              package_by_id = {}
+              for package in packages:
+                  if type(package) is not dict:
+                      raise InvalidCandidate("SBOM package is not an object")
+                  package_id = bounded_string(package.get("SPDXID"), "package SPDXID")
+                  bounded_string(package.get("name"), "package name")
+                  if package_id in package_by_id:
+                      raise InvalidCandidate("SBOM package SPDXID is duplicated")
+                  package_by_id[package_id] = package
+              described = []
+              for relationship in relationships:
+                  if type(relationship) is not dict:
+                      raise InvalidCandidate("SBOM relationship is not an object")
+                  source = bounded_string(relationship.get("spdxElementId"), "relationship source")
+                  target = bounded_string(relationship.get("relatedSpdxElement"), "relationship target")
+                  kind = bounded_string(relationship.get("relationshipType"), "relationship type")
+                  if source == "SPDXRef-DOCUMENT" and kind == "DESCRIBES":
+                      described.append(target)
+              if len(described) != 1 or described[0] not in package_by_id:
+                  raise InvalidCandidate("SBOM does not describe exactly one package")
+              root_id = described[0]
+              root = package_by_id[root_id]
+              if root.get("name") != "aruba-cert-renewer":
+                  raise InvalidCandidate("SBOM describes the wrong image")
+              if root.get("primaryPackagePurpose") != "CONTAINER":
+                  raise InvalidCandidate("SBOM subject is not a container")
+              if root.get("versionInfo") != syft_manifest_digest:
+                  raise InvalidCandidate("SBOM subject version is not the archive image")
+              if DIGEST.fullmatch(config_digest) is None:
+                  raise InvalidCandidate("archive config digest is invalid")
+              checksums = root.get("checksums")
+              image_checksums = [
+                  item.get("checksumValue") for item in checksums or []
+                  if type(item) is dict and item.get("algorithm") in {"SHA256", "SHA-256"}
+                  and type(item.get("checksumValue")) is str
+                  and HASH.fullmatch(item["checksumValue"])
+              ]
+              if len(image_checksums) != 1:
+                  raise InvalidCandidate("SBOM subject must have one SHA-256 image checksum")
+              if "sha256:" + image_checksums[0] != syft_manifest_digest:
+                  raise InvalidCandidate("SBOM subject checksum is not the archive image")
+              matching_purls = []
+              for reference in root.get("externalRefs", []):
+                  locator = reference.get("referenceLocator") if type(reference) is dict else None
+                  if (type(locator) is str and
+                          reference.get("referenceCategory") == "PACKAGE-MANAGER" and
+                          reference.get("referenceType") == "purl" and
+                          "?" in locator):
+                      identity, query_text = locator.split("?", 1)
+                      try:
+                          query = parse_qs(query_text, keep_blank_values=True,
+                                           strict_parsing=True)
+                      except ValueError as error:
+                          raise InvalidCandidate("SBOM subject purl is malformed") from error
+                      expected_identity = (
+                          "pkg:oci/aruba-cert-renewer@sha256:" + image_checksums[0]
+                      )
+                      valid_query = (
+                          "arch" in query and
+                          set(query) <= {"arch", "os", "repository_url", "tag"} and
+                          all(len(values) == 1 and
+                              len(values[0].encode("utf-8")) <= 512
+                              for values in query.values()) and
+                          query.get("tag", ["release-candidate"]) ==
+                          ["release-candidate"]
+                      )
+                      if unquote(identity) == expected_identity and valid_query:
+                          matching_purls.append(locator)
+              if len(matching_purls) != 1:
+                  raise InvalidCandidate("SBOM OCI subject is not the tested image")
+              if len(packages) > 1 and not any(
+                  type(item) is dict and item.get("spdxElementId") == root_id and
+                  item.get("relationshipType") == "CONTAINS" and
+                  item.get("relatedSpdxElement") in package_by_id and
+                  item.get("relatedSpdxElement") != root_id
+                  for item in relationships
+              ):
+                  raise InvalidCandidate("SBOM subject does not contain its inventory")
+
+          try:
+              directory = Path(sys.argv[1])
+              if not directory.is_dir() or directory.is_symlink():
+                  raise InvalidCandidate("candidate handoff is not a real directory")
+              entries = list(directory.iterdir())
+              if {entry.name for entry in entries} != EXPECTED_FILES or len(entries) != 3:
+                  raise InvalidCandidate("candidate handoff inventory is not exact")
+              manifest, manifest_raw = read_json(directory / "candidate-manifest.json", MANIFEST_MAX)
+              if set(manifest) != TOP_LEVEL_KEYS:
+                  raise InvalidCandidate("candidate manifest has missing or unknown fields")
+              canonical = (json.dumps(manifest, ensure_ascii=False, allow_nan=False,
+                                      sort_keys=True, separators=(",", ":")) + "\n").encode()
+              if manifest_raw != canonical:
+                  raise InvalidCandidate("candidate manifest encoding is not canonical")
+              if manifest["schema_version"] != 2 or type(manifest["schema_version"]) is not int:
+                  raise InvalidCandidate("candidate manifest schema version is invalid")
+              expected_strings = {
+                  "repository": "lloydsmart/aruba-cert-renewer",
+                  "workflow_ref": (
+                      "lloydsmart/aruba-cert-renewer/.github/workflows/"
+                      f"publish-container.yml@refs/tags/{os.environ['RELEASE_TAG']}"
+                  ),
+                  "workflow_sha": os.environ["GITHUB_WORKFLOW_SHA"],
+                  "artifact_name": os.environ["CANDIDATE_ARTIFACT_NAME"],
+                  "release_tag": os.environ["RELEASE_TAG"],
+                  "tag_object_sha": os.environ["AUTHORIZED_TAG_OBJECT"],
+                  "source_sha": os.environ["COMMIT_SHA"],
+                  "image_name": "ghcr.io/lloydsmart/aruba-cert-renewer",
+              }
+              for key, expected in expected_strings.items():
+                  maximum = 128 if key == "release_tag" else 512
+                  if bounded_string(manifest[key], key, maximum) != expected:
+                      raise InvalidCandidate(f"candidate {key} does not match trusted context")
+              if manifest["repository"] != os.environ["GITHUB_REPOSITORY"]:
+                  raise InvalidCandidate("candidate repository does not match event context")
+              if manifest["workflow_ref"] != os.environ["GITHUB_WORKFLOW_REF"]:
+                  raise InvalidCandidate("candidate workflow ref does not match event context")
+              if manifest["workflow_sha"] != os.environ["GITHUB_SHA"]:
+                  raise InvalidCandidate("candidate workflow SHA does not match event source")
+              expected_integers = {
+                  "repository_id": env_integer("GITHUB_REPOSITORY_ID"),
+                  "run_id": env_integer("GITHUB_RUN_ID"),
+                  "run_attempt": env_integer("GITHUB_RUN_ATTEMPT"),
+                  "release_id": env_integer("EXPECTED_RELEASE_ID"),
+              }
+              for key, expected in expected_integers.items():
+                  if positive_integer(manifest[key], key) != expected:
+                      raise InvalidCandidate(f"candidate {key} does not match trusted context")
+              expected_prerelease = os.environ["IS_GITHUB_PRERELEASE"] == "true"
+              expected_latest = os.environ["PUBLISH_LATEST"] == "true"
+              if type(manifest["github_prerelease"]) is not bool or manifest["github_prerelease"] != expected_prerelease:
+                  raise InvalidCandidate("candidate prerelease identity does not match")
+              if type(manifest["publish_latest"]) is not bool or manifest["publish_latest"] != expected_latest:
+                  raise InvalidCandidate("candidate latest decision does not match")
+              validate_file(manifest, "archive", "release-candidate.tar", ARCHIVE_MAX,
+                            directory, ARCHIVE_KEYS)
+              validate_file(manifest, "sbom", "release-sbom.spdx.json", SBOM_MAX, directory)
+              archive_identity = inspect_archive(directory / "release-candidate.tar")
+              for key, expected in archive_identity.items():
+                  if manifest["archive"].get(key) != expected:
+                      raise InvalidCandidate(f"archive {key} does not match its bytes")
+              if manifest["archive"]["config_digest"] != os.environ["TESTED_CONFIG_DIGEST"]:
+                  raise InvalidCandidate("archive config digest does not match the builder output")
+              sbom, _ = read_json(directory / "release-sbom.spdx.json", SBOM_MAX)
+              validate_spdx(
+                  sbom, archive_identity["config_digest"],
+                  archive_identity["syft_manifest_digest"],
+              )
+              with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as output:
+                  output.write(
+                      "ARCHIVE_MANIFEST_DIGEST=" +
+                      (archive_identity["manifest_digest"] or "") + "\n"
+                  )
+                  output.write(
+                      "CANDIDATE_LAYER_DIFF_IDS=" +
+                      json.dumps(archive_identity["layer_diff_ids"], separators=(",", ":")) +
+                      "\n"
+                  )
+          except (InvalidCandidate, KeyError, OSError) as error:
+              print(f"candidate validation failed: {error}", file=sys.stderr)
+              raise SystemExit(1)
+          PY
+
+      - name: Load and inspect validated candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          image_archive="$RUNNER_TEMP/release-candidate/release-candidate.tar"
           docker image load --input "$image_archive"
-
-          loaded_image_id=$(docker image inspect --format '{{.Id}}' \
-            "$recorded_image_id")
-          if [[ "$loaded_image_id" != "$TESTED_IMAGE_ID" ]]; then
-            printf 'Loaded image ID mismatch: expected %s, got %s\n' \
-              "$TESTED_IMAGE_ID" "$loaded_image_id" >&2
+          docker image inspect "$CANDIDATE_IMAGE" >/dev/null
+          expected_source='https://github.com/lloydsmart/aruba-cert-renewer'
+          expected_icon="https://raw.githubusercontent.com/lloydsmart/aruba-cert-renewer/$COMMIT_SHA/assets/icon.png"
+          source_label=$(docker image inspect --format \
+            '{{index .Config.Labels "org.opencontainers.image.source"}}' "$CANDIDATE_IMAGE")
+          license_label=$(docker image inspect --format \
+            '{{index .Config.Labels "org.opencontainers.image.licenses"}}' "$CANDIDATE_IMAGE")
+          icon_label=$(docker image inspect --format \
+            '{{index .Config.Labels "net.unraid.docker.icon"}}' "$CANDIDATE_IMAGE")
+          if [[ "$source_label" != "$expected_source" || \
+                "$license_label" != 'GPL-3.0-only' || \
+                "$icon_label" != "$expected_icon" ]]; then
+            printf '%s\n' 'Loaded candidate image identity labels are invalid.' >&2
             exit 1
           fi
-
-      - name: Tag and verify loaded tested image
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          release_references=(
-            "$IMAGE_NAME:$RELEASE_TAG"
-            "$IMAGE_NAME:sha-$COMMIT_SHA"
-          )
-          if [[ "$PUBLISH_LATEST" == 'true' ]]; then
-            release_references+=("$IMAGE_NAME:latest")
-          fi
-
-          for reference in "${release_references[@]}"; do
-            docker image tag "$TESTED_IMAGE_ID" "$reference"
-          done
-
-          for reference in "${release_references[@]}"; do
-            tagged_image_id=$(docker image inspect --format '{{.Id}}' \
-              "$reference")
-            if [[ "$tagged_image_id" != "$TESTED_IMAGE_ID" ]]; then
-              printf 'Image ID mismatch for %s: expected %s, got %s\n' \
-                "$reference" "$TESTED_IMAGE_ID" "$tagged_image_id" >&2
-              exit 1
-            fi
-          done
 
       - name: Log in to GHCR
         id: login
@@ -483,48 +1301,291 @@ jobs:
             --username "$GHCR_USERNAME" \
             --password-stdin
 
-      - name: Publish tested image
-        run: |
-          set -euo pipefail
-
-          docker push "$IMAGE_NAME:$RELEASE_TAG"
-          docker push "$IMAGE_NAME:sha-$COMMIT_SHA"
-          if [[ "$PUBLISH_LATEST" == 'true' ]]; then
-            docker push "$IMAGE_NAME:latest"
-          fi
-
-      - name: Resolve published image digest
+      - name: Promote immutable release aliases
         id: published
         shell: bash
         run: |
           set -euo pipefail
+          version_ref="$IMAGE_NAME:$RELEASE_TAG"
+          source_ref="$IMAGE_NAME:sha-$COMMIT_SHA"
+          publication_state='No mutation attempted by this run.'
+          report_failure_state() {
+            local status=$?
+            if [[ $status -ne 0 ]]; then
+              printf 'Publication state: %s Remaining verification, attestation and latest stages are incomplete.\n' \
+                "$publication_state" >&2
+            fi
+          }
+          trap report_failure_state EXIT
 
-          published_manifest=$(docker buildx imagetools inspect \
-            "$IMAGE_NAME:$RELEASE_TAG" \
-            --format '{{.Manifest}}')
-          published_digest=$(awk '$1 == "Digest:" { print $2; exit }' \
-            <<<"$published_manifest")
+          inspect_alias() {
+            local reference=$1 output_file error_file stdout stderr output_size error_size digest status
+            output_file=$(mktemp "$RUNNER_TEMP/alias-output.XXXXXX")
+            error_file=$(mktemp "$RUNNER_TEMP/alias-error.XXXXXX")
+            if docker buildx imagetools inspect "$reference" \
+                --format '{{.Manifest}}' >"$output_file" 2>"$error_file"; then
+              status=0
+            else
+              status=$?
+            fi
+            output_size=$(stat -c '%s' "$output_file")
+            error_size=$(stat -c '%s' "$error_file")
+            if [[ ! "$output_size" =~ ^[0-9]+$ || ! "$error_size" =~ ^[0-9]+$ || \
+                  "$output_size" -gt 1048576 || "$error_size" -gt 1048576 ]]; then
+              printf 'Registry diagnostic for %s exceeds its safety bound.\n' "$reference" >&2
+              return 1
+            fi
+            stdout=$(<"$output_file")
+            stderr=$(<"$error_file")
+            if [[ $status -eq 0 ]]; then
+              if [[ -n "$stderr" ]]; then
+                printf 'Registry state for %s is ambiguous: successful inspection also wrote stderr.\n' \
+                  "$reference" >&2
+                return 1
+              fi
+              digest=$(awk '$1 == "Digest:" { print $2 }' <<<"$stdout")
+              if [[ $(grep -c '^Digest:' <<<"$stdout") -ne 1 || \
+                    ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+                printf 'Registry returned a malformed manifest for %s.\n' "$reference" >&2
+                return 1
+              fi
+              printf 'present %s\n' "$digest"
+              return 0
+            fi
+            if [[ -n "$stdout" ]]; then
+              printf 'Registry state for %s is ambiguous: failed inspection also wrote stdout.\n' \
+                "$reference" >&2
+              return 1
+            fi
+            case "$stderr" in
+              "ERROR: $reference: not found"|"ERROR: $reference: manifest unknown")
+                printf '%s\n' 'absent'
+                return 0
+                ;;
+            esac
+            printf 'Registry state for %s is ambiguous: %s\n' "$reference" "$stderr" >&2
+            return 1
+          }
 
-          if [[ ! "$published_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            printf 'Unexpected published image digest: %s\n' "$published_digest" >&2
+          verify_digest_identity() {
+            local digest=$1 raw raw_size actual pulled_id pulled_diff_ids
+            raw=$(mktemp "$RUNNER_TEMP/registry-manifest.XXXXXX")
+            docker buildx imagetools inspect "$IMAGE_NAME@$digest" --raw >"$raw"
+            raw_size=$(stat -c '%s' "$raw")
+            if [[ ! "$raw_size" =~ ^[1-9][0-9]*$ || "$raw_size" -gt 4194304 ]]; then
+              printf 'Registry manifest size %s is outside its safety bound.\n' \
+                "$raw_size" >&2
+              return 1
+            fi
+            actual="sha256:$(sha256sum "$raw" | awk '{print $1}')"
+            if [[ "$actual" != "$digest" ]]; then
+              printf 'Registry returned bytes hashing to %s for requested digest %s.\n' \
+                "$actual" "$digest" >&2
+              return 1
+            fi
+            if [[ -n "$ARCHIVE_MANIFEST_DIGEST" && \
+                  "$digest" != "$ARCHIVE_MANIFEST_DIGEST" ]]; then
+              printf 'Registry manifest %s is not the candidate archive manifest %s.\n' \
+                "$digest" "$ARCHIVE_MANIFEST_DIGEST" >&2
+              return 1
+            fi
+            python3 -I - "$raw" "$TESTED_CONFIG_DIGEST" "$CANDIDATE_LAYER_DIFF_IDS" <<'PY'
+          import json
+          import re
+          import sys
+          from pathlib import Path
+
+          def reject_duplicate(pairs):
+              value = {}
+              for key, item in pairs:
+                  if key in value:
+                      raise ValueError(f"duplicate JSON key: {key}")
+                  value[key] = item
+              return value
+
+          def reject_number(value):
+              raise ValueError(f"unsupported JSON number: {value}")
+
+          try:
+              value = json.loads(
+                  Path(sys.argv[1]).read_bytes(),
+                  object_pairs_hook=reject_duplicate,
+                  parse_float=reject_number,
+                  parse_constant=reject_number,
+              )
+              if type(value) is not dict:
+                  raise ValueError("manifest is not an object")
+              if value.get("schemaVersion") != 2:
+                  raise ValueError("schemaVersion is not 2")
+              if value.get("mediaType") not in {
+                  "application/vnd.oci.image.manifest.v1+json",
+                  "application/vnd.docker.distribution.manifest.v2+json",
+              }:
+                  raise ValueError("an index or unsupported media type was returned")
+              config = value.get("config")
+              if (type(config) is not dict or
+                      config.get("digest") != sys.argv[2] or
+                      re.fullmatch(r"sha256:[0-9a-f]{64}", config.get("digest", "")) is None or
+                      config.get("mediaType") not in {
+                          "application/vnd.oci.image.config.v1+json",
+                          "application/vnd.docker.container.image.v1+json",
+                      } or type(config.get("size")) is not int or
+                      config["size"] <= 0 or config["size"] > 4 * 1024 * 1024):
+                  raise ValueError("config digest does not match the candidate")
+              expected_diff_ids = json.loads(
+                  sys.argv[3], object_pairs_hook=reject_duplicate,
+                  parse_float=reject_number, parse_constant=reject_number,
+              )
+              if (type(expected_diff_ids) is not list or not expected_diff_ids or
+                      len(expected_diff_ids) > 128 or
+                      any(type(item) is not str or
+                          re.fullmatch(r"sha256:[0-9a-f]{64}", item) is None
+                          for item in expected_diff_ids)):
+                  raise ValueError("candidate layer diff IDs are invalid")
+              layers = value.get("layers")
+              if type(layers) is not list or len(layers) != len(expected_diff_ids):
+                  raise ValueError("manifest has no bounded single-image layer list")
+              compressed_total = 0
+              compressed_digests = set()
+              for position, layer in enumerate(layers):
+                  if (type(layer) is not dict or
+                          layer.get("mediaType") not in {
+                              "application/vnd.oci.image.layer.v1.tar+gzip",
+                              "application/vnd.docker.image.rootfs.diff.tar.gzip",
+                          } or type(layer.get("digest")) is not str or
+                          re.fullmatch(r"sha256:[0-9a-f]{64}", layer["digest"]) is None or
+                          type(layer.get("size")) is not int or
+                          layer["size"] <= 0 or layer["size"] > 1024 * 1024 * 1024):
+                      raise ValueError(f"layer descriptor {position} is invalid")
+                  if layer["digest"] in compressed_digests:
+                      raise ValueError("layer descriptors repeat a compressed digest")
+                  compressed_digests.add(layer["digest"])
+                  compressed_total += layer["size"]
+                  if compressed_total > 1024 * 1024 * 1024:
+                      raise ValueError("compressed layers exceed their total bound")
+          except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+              print(f"Registry manifest identity is invalid: {error}", file=sys.stderr)
+              raise SystemExit(1)
+          PY
+            docker pull "$IMAGE_NAME@$digest"
+            pulled_id=$(docker image inspect --format '{{.Id}}' "$IMAGE_NAME@$digest")
+            if [[ "$pulled_id" != "$TESTED_CONFIG_DIGEST" ]]; then
+              printf 'Pulled registry content has config %s; expected candidate config %s.\n' \
+                "$pulled_id" "$TESTED_CONFIG_DIGEST" >&2
+              return 1
+            fi
+            pulled_diff_ids=$(docker image inspect --format \
+              '{{json .RootFS.Layers}}' "$IMAGE_NAME@$digest")
+            python3 -I - "$CANDIDATE_LAYER_DIFF_IDS" "$pulled_diff_ids" <<'PY'
+          import json
+          import re
+          import sys
+
+          def reject_number(value):
+              raise ValueError(f"unsupported JSON number: {value}")
+
+          try:
+              expected = json.loads(
+                  sys.argv[1], parse_float=reject_number, parse_constant=reject_number,
+              )
+              actual = json.loads(
+                  sys.argv[2], parse_float=reject_number, parse_constant=reject_number,
+              )
+              for name, value in (("candidate", expected), ("pulled", actual)):
+                  if (type(value) is not list or not value or len(value) > 128 or
+                          any(type(item) is not str or
+                              re.fullmatch(r"sha256:[0-9a-f]{64}", item) is None
+                              for item in value)):
+                      raise ValueError(f"{name} layer diff IDs are invalid")
+              if actual != expected:
+                  raise ValueError("ordered layer diff IDs do not match the candidate")
+          except (json.JSONDecodeError, ValueError) as error:
+              print(f"Pulled registry rootfs identity is invalid: {error}", file=sys.stderr)
+              raise SystemExit(1)
+          PY
+          }
+
+          copy_alias() {
+            local digest=$1 destination=$2
+            docker buildx imagetools create --prefer-index=false \
+              --tag "$destination" "$IMAGE_NAME@$digest"
+          }
+
+          read -r version_state version_digest < <(inspect_alias "$version_ref")
+          read -r source_state source_digest < <(inspect_alias "$source_ref")
+
+          if [[ "$version_state" == present && "$source_state" == present ]]; then
+            if [[ "$version_digest" != "$source_digest" ]]; then
+              printf '%s\n' 'Immutable aliases disagree. No aliases were changed; investigate the existing registry state.' >&2
+              exit 1
+            fi
+            selected_digest=$version_digest
+            publication_state="No mutation attempted by this run; both pre-existing aliases await identity verification at $selected_digest."
+            verify_digest_identity "$selected_digest"
+            version_origin=reused
+            source_origin=reused
+            printf 'Immutable stage complete: both aliases already identify %s.\n' "$selected_digest"
+          elif [[ "$version_state" == absent && "$source_state" == absent ]]; then
+            docker image tag "$CANDIDATE_IMAGE" "$version_ref"
+            publication_state="Mutation attempted; the remote outcome of version alias $version_ref is not established."
+            docker push "$version_ref"
+            read -r version_state selected_digest < <(inspect_alias "$version_ref")
+            [[ "$version_state" == present ]]
+            publication_state="Confirmed version alias publication by this run at $selected_digest; source alias remains incomplete."
+            verify_digest_identity "$selected_digest"
+            version_origin=published
+            source_origin=published
+            printf 'Immutable stage partial: version alias published at %s; source alias remains incomplete.\n' \
+              "$selected_digest"
+            publication_state="Mutation attempted; version publication is confirmed, but the remote outcome of source alias $source_ref is not established."
+            copy_alias "$selected_digest" "$source_ref"
+          elif [[ "$version_state" == present && "$source_state" == absent ]]; then
+            selected_digest=$version_digest
+            publication_state="No mutation attempted by this run; pre-existing version alias awaits identity verification at $selected_digest."
+            verify_digest_identity "$selected_digest"
+            version_origin=reused
+            source_origin=published
+            printf 'Immutable stage partial: valid version alias exists at %s; source alias remains incomplete.\n' \
+              "$selected_digest"
+            publication_state="Mutation attempted; version reuse is confirmed, but the remote outcome of source alias $source_ref is not established."
+            copy_alias "$selected_digest" "$source_ref"
+          elif [[ "$version_state" == absent && "$source_state" == present ]]; then
+            selected_digest=$source_digest
+            publication_state="No mutation attempted by this run; pre-existing source alias awaits identity verification at $selected_digest."
+            verify_digest_identity "$selected_digest"
+            version_origin=published
+            source_origin=reused
+            printf 'Immutable stage partial: valid source alias exists at %s; version alias remains incomplete.\n' \
+              "$selected_digest"
+            publication_state="Mutation attempted; source reuse is confirmed, but the remote outcome of version alias $version_ref is not established."
+            copy_alias "$selected_digest" "$version_ref"
+          else
+            printf '%s\n' 'Unexpected immutable-alias state. No aliases were changed.' >&2
             exit 1
           fi
 
-          docker buildx imagetools inspect \
-            "$IMAGE_NAME@$published_digest" >/dev/null
-
-          docker pull "$IMAGE_NAME@$published_digest" >/dev/null
-          published_image_id=$(docker image inspect --format '{{.Id}}' \
-            "$IMAGE_NAME@$published_digest")
-          if [[ "$published_image_id" != "$TESTED_IMAGE_ID" ]]; then
-            printf 'Published image ID mismatch: expected %s, got %s\n' \
-              "$TESTED_IMAGE_ID" "$published_image_id" >&2
+          read -r version_state version_digest < <(inspect_alias "$version_ref")
+          read -r source_state source_digest < <(inspect_alias "$source_ref")
+          if [[ "$version_state" != present || "$source_state" != present || \
+                "$version_digest" != "$selected_digest" || \
+                "$source_digest" != "$selected_digest" ]]; then
+            printf 'Immutable alias postcheck failed. Selected digest %s; inspect both aliases.\n' \
+              "$selected_digest" >&2
             exit 1
           fi
-
-          printf 'digest=%s\n' "$published_digest" >>"$GITHUB_OUTPUT"
+          publication_state="Confirmed immutable aliases at $selected_digest (version: $version_origin; source: $source_origin); final identity re-verification remains incomplete."
+          verify_digest_identity "$selected_digest"
+          publication_state="Confirmed immutable aliases at $selected_digest (version: $version_origin; source: $source_origin)."
+          printf 'Immutable stage complete: version and source aliases identify %s.\n' \
+            "$selected_digest"
+          {
+            printf 'digest=%s\n' "$selected_digest"
+            printf 'version_origin=%s\n' "$version_origin"
+            printf 'source_origin=%s\n' "$source_origin"
+          } >>"$GITHUB_OUTPUT"
 
       - name: Attest build provenance
+        id: provenance_attestation
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-name: ${{ env.IMAGE_NAME }}
@@ -533,6 +1594,7 @@ jobs:
           create-storage-record: false
 
       - name: Attest release SBOM
+        id: sbom_attestation
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-name: ${{ env.IMAGE_NAME }}
@@ -540,6 +1602,50 @@ jobs:
           sbom-path: ${{ runner.temp }}/release-candidate/release-sbom.spdx.json
           push-to-registry: true
           create-storage-record: false
+
+      - name: Report incomplete immutable publication
+        if: ${{ failure() && steps.published.outcome == 'success' }}
+        env:
+          SELECTED_DIGEST: ${{ steps.published.outputs.digest }}
+          SOURCE_ORIGIN: ${{ steps.published.outputs.source_origin }}
+          VERSION_ORIGIN: ${{ steps.published.outputs.version_origin }}
+        run: |
+          printf '%s\n' \
+            "Immutable aliases are confirmed at $SELECTED_DIGEST (version: $VERSION_ORIGIN; source: $SOURCE_ORIGIN)." \
+            "Remaining attestation or latest stages are incomplete; no rollback was attempted." >&2
+
+      - name: Promote eligible latest alias last
+        if: ${{ success() && env.PUBLISH_LATEST == 'true' }}
+        shell: bash
+        env:
+          SELECTED_DIGEST: ${{ steps.published.outputs.digest }}
+        run: |
+          set -euo pipefail
+          latest_ref="$IMAGE_NAME:latest"
+          latest_state='No latest mutation attempted by this run.'
+          report_latest_failure() {
+            local status=$?
+            if [[ $status -ne 0 ]]; then
+              printf 'Latest state: %s Immutable aliases remain confirmed; latest is incomplete.\n' \
+                "$latest_state" >&2
+            fi
+          }
+          trap report_latest_failure EXIT
+          latest_state="Latest mutation attempted; the remote outcome for $latest_ref is not established."
+          docker buildx imagetools create --prefer-index=false \
+            --tag "$latest_ref" "$IMAGE_NAME@$SELECTED_DIGEST"
+          latest_manifest=$(docker buildx imagetools inspect \
+            "$latest_ref" --format '{{.Manifest}}')
+          latest_digest=$(awk '$1 == "Digest:" { print $2 }' <<<"$latest_manifest")
+          if [[ $(grep -c '^Digest:' <<<"$latest_manifest") -ne 1 || \
+                "$latest_digest" != "$SELECTED_DIGEST" ]]; then
+            printf 'Latest postcheck failed: expected %s, got %s. Immutable aliases remain valid.\n' \
+              "$SELECTED_DIGEST" "$latest_digest" >&2
+            exit 1
+          fi
+          latest_state="Confirmed latest publication at $SELECTED_DIGEST."
+          printf 'Latest stage complete: eligible latest alias identifies %s.\n' \
+            "$SELECTED_DIGEST"
 
       - name: Log out of GHCR
         if: ${{ always() && steps.login.outcome != 'skipped' }}
