@@ -459,8 +459,13 @@ def _preflight_archive(path: Path) -> None:
                             raise CandidateError(
                                 "candidate archive long name is not UTF-8"
                             ) from exc
-                        if not long_name or len(long_name.encode()) > TAR_EXTENSION_MAX_BYTES:
-                            raise CandidateError("candidate archive long name is invalid")
+                        if (
+                            not long_name
+                            or len(long_name.encode()) > TAR_EXTENSION_MAX_BYTES
+                        ):
+                            raise CandidateError(
+                                "candidate archive long name is invalid"
+                            )
                         next_pax["path"] = long_name
                     else:
                         values, record_count = _pax_values(extension)
@@ -487,7 +492,9 @@ def _preflight_archive(path: Path) -> None:
                 consecutive_extension_count = 0
                 member_count += 1
                 if member_count > ARCHIVE_MEMBER_MAX:
-                    raise CandidateError("candidate archive member count exceeds its bound")
+                    raise CandidateError(
+                        "candidate archive member count exceeds its bound"
+                    )
                 pax_size = next_pax.get("size", global_pax.get("size"))
                 next_pax.clear()
                 if pax_size is not None:
@@ -498,11 +505,15 @@ def _preflight_archive(path: Path) -> None:
                         raise CandidateError("candidate archive PAX size is invalid")
                     size = int(pax_size)
                 if size > ARCHIVE_MAX_BYTES:
-                    raise CandidateError("candidate archive member exceeds its safety bound")
+                    raise CandidateError(
+                        "candidate archive member exceeds its safety bound"
+                    )
                 _skip_exact(source, size, "tar member")
                 _skip_exact(source, (-size) % 512, "tar member padding")
         except (OSError, EOFError) as exc:
-            raise CandidateError(f"invalid compressed candidate archive: {exc}") from exc
+            raise CandidateError(
+                f"invalid compressed candidate archive: {exc}"
+            ) from exc
 
 
 def inspect_archive(path: Path) -> dict[str, object]:
@@ -516,7 +527,9 @@ def inspect_archive(path: Path) -> dict[str, object]:
         by_name: dict[str, tarfile.TarInfo] = {}
         for member in archive:
             if len(by_name) >= ARCHIVE_MEMBER_MAX:
-                raise CandidateError("candidate archive member count is outside its bound")
+                raise CandidateError(
+                    "candidate archive member count is outside its bound"
+                )
             name = member.name
             if (
                 not name

@@ -246,9 +246,12 @@ def write_hostile_archive(path: Path, attack: str) -> None:
         info.size = size
         header = info.tobuf(format=tarfile.USTAR_FORMAT)
         if attack == "compressed-pax":
-            with path.open("wb") as raw_output, gzip.GzipFile(
-                fileobj=raw_output, mode="wb", compresslevel=1, mtime=0
-            ) as output:
+            with (
+                path.open("wb") as raw_output,
+                gzip.GzipFile(
+                    fileobj=raw_output, mode="wb", compresslevel=1, mtime=0
+                ) as output,
+            ):
                 output.write(header)
                 block = bytes(1024 * 1024)
                 for _ in range(size // len(block)):
