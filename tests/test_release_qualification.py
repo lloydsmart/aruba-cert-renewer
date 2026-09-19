@@ -403,9 +403,12 @@ def test_aruba_release_graph_requires_qualification_and_independent_authority():
     assert "actions: read" in publish
     assert "actions/artifacts/$CANDIDATE_ARTIFACT_ID" in publish
     assert ".workflow_run.id == $run" in publish
-    assert "queue: max" in workflow.split("jobs:", 1)[0]
+    workflow_concurrency = workflow.split("jobs:", 1)[0]
+    assert "cancel-in-progress: false" in workflow_concurrency
+    assert "queue: max" in workflow_concurrency
     assert "group: release-tag-${{ github.event.release.tag_name }}" in workflow
     assert "group: release-publisher-${{ github.repository_id }}" in publish
+    assert "cancel-in-progress: false" in publish
     assert "queue: max" in publish
     assert publish.index("Promote immutable release aliases") < publish.index(
         "Attest build provenance"

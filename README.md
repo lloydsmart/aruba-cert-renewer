@@ -312,13 +312,15 @@ names the selected release, the SHA tag exposes its source correlation, and the
 digest fixes the container object deployed.
 
 The release workflow queues same-tag runs and serializes all participating
-publisher jobs for this package. Those controls are not an atomic registry
-conditional write and do not prevent a separate external writer from racing the
-inspection and update sequence. Partial immutable-alias success is preserved;
-a later full rerun validates and fills only a missing alias. A full rerun is a
-rebuild, not reuse of an earlier attempt's artifact. If a rebuilt candidate at
-the same source SHA has a different config identity, its existing source alias
-conflicts and is not repointed, even when the version name is changed.
+publisher jobs for this package. Each concurrency group can retain up to 100
+pending items; additional items are cancelled when that queue is full. Those
+controls are not an atomic registry conditional write and do not prevent a
+separate external writer from racing the inspection and update sequence.
+Partial immutable-alias success is preserved; a later full rerun validates and
+fills only a missing alias. A full rerun is a rebuild, not reuse of an earlier
+attempt's artifact. If a rebuilt candidate at the same source SHA has a
+different config identity, its existing source alias conflicts and is not
+repointed, even when the version name is changed.
 
 The release workflow has not by itself demonstrated that a package is already
 available. Its first successful publication may create a GHCR package whose

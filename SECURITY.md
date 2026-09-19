@@ -158,8 +158,10 @@ The authorization runner, reviewed workflow source and GitHub job-output
 integrity remain trusted. The builder cannot supply its own authorization.
 
 Publisher jobs are serialized package-wide in addition to the per-tag workflow
-queue. Before a mutation, the publisher strictly inspects both version and
-source aliases. It either publishes the version once and copies its exact OCI
+queue. Each concurrency group can retain up to 100 pending items; additional
+items are cancelled when that queue is full. Before a mutation, the publisher
+strictly inspects both version and source aliases. It either publishes the
+version once and copies its exact OCI
 digest to the source alias, copies an existing valid digest only to a missing
 alias, or preserves two aliases already at the same tested digest. Existing
 alias disagreement, config-digest mismatch, index responses and ambiguous

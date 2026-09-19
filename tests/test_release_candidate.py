@@ -749,12 +749,15 @@ def test_accepts_bounded_outer_gzip_archive(tmp_path: Path) -> None:
     plain = tmp_path / "plain.tar"
     compressed = tmp_path / "compressed.tar.gz"
     write_classic_archive(plain)
-    with plain.open("rb") as source, compressed.open("wb") as raw_output:
-        with gzip.GzipFile(
+    with (
+        plain.open("rb") as source,
+        compressed.open("wb") as raw_output,
+        gzip.GzipFile(
             fileobj=raw_output, mode="wb", compresslevel=1, mtime=0
-        ) as output:
-            while chunk := source.read(64 * 1024):
-                output.write(chunk)
+        ) as output,
+    ):
+        while chunk := source.read(64 * 1024):
+            output.write(chunk)
     assert candidate.inspect_archive(compressed) == candidate.inspect_archive(plain)
 
 

@@ -122,12 +122,13 @@ Historical tagged commits run their historical workflows, so new controls
 cannot retroactively constrain those paths. Tag-creation authorization and
 immutable release finalization remain separate work.
 
-Workflow and publisher concurrency both keep pending runs queued rather than
-cancelling them. The package-wide publisher group covers different tags that
-might share a source alias or update `latest`. These locks coordinate only
-participating GitHub Actions jobs: they are not an atomic registry conditional
-write and cannot prevent an uncontrolled external GHCR writer from racing the
-inspection and mutation sequence.
+Workflow and publisher concurrency keep up to 100 pending items queued rather
+than cancelling them; additional items are cancelled when a queue is full. The
+package-wide publisher group covers different tags that might share a source
+alias or update `latest`. These locks coordinate only participating GitHub
+Actions jobs: they are not an atomic registry conditional write and cannot
+prevent an uncontrolled external GHCR writer from racing the inspection and
+mutation sequence.
 
 Reusing the original candidate requires the same run and attempt artifact. A
 downstream-only retry cannot substitute an earlier attempt's handoff. A full

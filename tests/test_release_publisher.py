@@ -900,12 +900,15 @@ def test_actual_inline_accepts_bounded_outer_gzip_archive(handoff) -> None:
     archive = directory / candidate.ARCHIVE_NAME
     plain = directory.parent / "plain.tar"
     archive.replace(plain)
-    with plain.open("rb") as source, archive.open("wb") as raw_output:
-        with gzip.GzipFile(
+    with (
+        plain.open("rb") as source,
+        archive.open("wb") as raw_output,
+        gzip.GzipFile(
             fileobj=raw_output, mode="wb", compresslevel=1, mtime=0
-        ) as output:
-            while chunk := source.read(64 * 1024):
-                output.write(chunk)
+        ) as output,
+    ):
+        while chunk := source.read(64 * 1024):
+            output.write(chunk)
     manifest_path = directory / candidate.MANIFEST_NAME
     manifest = json.loads(manifest_path.read_text())
     refresh_file_record(manifest, directory, "archive")
@@ -1049,7 +1052,11 @@ def test_manifest_backed_load_uses_only_the_archived_builder_reference(
     assert (result.returncode == 0) == expected_success, result.stderr
     assert json.loads(loaded_tags.read_text()) == [BUILDER_CANDIDATE_IMAGE]
     trace = (tmp_path / "load-reference-trace").read_text()
-    assert "login" not in trace and "run" not in trace and "exec" not in trace
+    commands = {
+        tuple(line.split(maxsplit=2)[:2]) for line in trace.splitlines() if line
+    }
+    assert commands
+    assert commands <= {("image", "load"), ("image", "inspect")}
 
 
 @pytest.mark.parametrize("damage", ["none", "source", "license", "icon"])
@@ -1078,7 +1085,11 @@ def test_loaded_image_identity_is_checked_before_login(
     result = run_step("Load and inspect validated candidate", environment, Path("/tmp"))
     assert (result.returncode == 0) == (damage == "none"), result.stderr
     trace = (tmp_path / "load-trace").read_text()
-    assert "login" not in trace and "run" not in trace and "exec" not in trace
+    commands = {
+        tuple(line.split(maxsplit=2)[:2]) for line in trace.splitlines() if line
+    }
+    assert commands
+    assert commands <= {("image", "load"), ("image", "inspect")}
 
 
 FAKE_DOCKER = r"""#!/usr/bin/env python3
