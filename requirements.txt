@@ -235,9 +235,9 @@ mdurl==0.1.2 \
     --hash=sha256:84008a41e51615a49fc9966191ff91509e3c40b939176e643fd50a5c2196b8f8 \
     --hash=sha256:bb413d29f5eea38f31dd4754dd7377d4465116fb207585f97bf925588687c1ba
     # via markdown-it-py
-netmiko==4.7.0 \
-    --hash=sha256:406684e45b3822e17efa0f8e376644995693ff40a750c297ccce0c58e873f29d \
-    --hash=sha256:94cf7bfe5daed1d058444ce1637e10177df22f903683a53d1fbee47553488c65
+netmiko==4.8.0 \
+    --hash=sha256:6264cf8afcbd9c10efb832bacabb9a89370452d522f6c20532d2ad0fefcbdd69 \
+    --hash=sha256:b4875b36604bcc7a72339f3b4d3091ce545ce0b4629f77f7844413b1c380d0e6
     # via -r requirements.in
 ntc-templates==9.2.0 \
     --hash=sha256:79fef745d12b6dbdc1f7c00665327790adc91fd981199b0a9adb04f4b365cd97 \
@@ -366,10 +366,6 @@ pyyaml==6.0.3 \
 rich==15.0.0 \
     --hash=sha256:33bd4ef74232fb73fe9279a257718407f169c09b78a87ad3d296f548e27de0bb \
     --hash=sha256:edd07a4824c6b40189fb7ac9bc4c52536e9780fbbfbddf6f1e2502c31b068c36
-    # via netmiko
-ruamel-yaml==0.19.1 \
-    --hash=sha256:27592957fedf6e0b62f281e96effd28043345e0e66001f97683aa9a40c667c93 \
-    --hash=sha256:53eb66cd27849eff968ebf8f0bf61f46cdac2da1d1f3576dd4ccee9b25c31993
     # via netmiko
 scp==0.16.1 \
     --hash=sha256:3f2b260bf9bd4c2b6857f697a1d7e8edc26fa569282b77027e849dfe1e48580a \
