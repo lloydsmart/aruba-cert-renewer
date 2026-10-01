@@ -124,7 +124,7 @@ assert len(lifecycle_mounts) == 1, "Expected one lifecycle mount"
 mount = lifecycle_mounts[0]
 assert mount["type"] == "bind", "Lifecycle mount must be a bind mount"
 assert mount["source"] == "/run/aruba-cert-renewer-lifecycle", "Lifecycle mount must use the host directory"
-assert mount.get("read_only") is False, "Lifecycle mount must be writable"
+assert mount.get("read_only", False) is False, "Lifecycle mount must be writable"
 '
 
 printf '%s\n' "Container smoke tests passed for $image"
