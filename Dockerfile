@@ -3,7 +3,7 @@ FROM python:3.14.7-slim-trixie@sha256:51dafde81dbdb6ebde285137a295cf18a47ca95234
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends --only-upgrade \
         gzip=1.13-1+deb13u1 \
-        libpcre2-8-0=10.46-1~deb13u2 \
+        libpcre2-8-0=10.46-1~deb13u3 \
         libsqlite3-0=3.46.1-7+deb13u2 \
         libssl3t64=3.5.7-1~deb13u3 \
         openssl=3.5.7-1~deb13u3 \
