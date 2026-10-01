@@ -400,6 +400,13 @@ place the directory on an untrusted or shared path to simulate distributed
 locking. If the store is missing, unsafe, or another operation holds the same
 switch lock, the command fails closed with exit code 2 for that switch. A busy
 switch is not contacted, and its renewal does not contact OPNsense.
+If a protected check or command body otherwise completes, a close failure raises
+`LifecycleLockReleaseError`; the command reports a post-operation lock-release
+failure alongside the operation outcome. If the body raises, its exception takes
+precedence, so a simultaneous close failure is not separately reported. Inspect
+the reported switch and local lock state before retrying where operation state
+is uncertain. No automatic retry, rollback, lock-file deletion, or cleanup is
+attempted.
 
 On Linux hosts, including Unraid, the Compose example mounts
 `/etc/localtime:/etc/localtime:ro`. This read-only timezone database file lets

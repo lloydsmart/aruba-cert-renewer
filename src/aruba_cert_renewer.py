@@ -35,7 +35,7 @@ from netmiko.exceptions import (
     NetmikoTimeoutException,
 )
 
-from lifecycle_lock import LifecycleLockError, lifecycle_lock
+from lifecycle_lock import LifecycleLockError, LifecycleLockReleaseError, lifecycle_lock
 from opnsense_client import OPNsenseClient, validate_base_url
 from output_policy import SanitizingFormatter, sanitize_terminal_text
 from secure_file import open_secure_file
@@ -2253,6 +2253,7 @@ def renew_due_certificates(
 
     for switch in switches:
         username = password = None
+        result = None
         try:
             try:
                 username, password = get_switch_credentials(switch, config_file)
@@ -2261,7 +2262,7 @@ def renew_due_certificates(
                 print_terminal("Status:           ERROR")
                 print_terminal(f"Reason:           {error}")
                 print_terminal("Action:           No renewal attempted")
-                results.append("error")
+                result = "error"
                 continue
             except Exception:
                 print_switch_heading(switch)
@@ -2270,7 +2271,7 @@ def renew_due_certificates(
                     "Reason:           Unexpected credential resolution failure"
                 )
                 print_terminal("Action:           No renewal attempted")
-                results.append("error")
+                result = "error"
                 continue
 
             with lifecycle_lock(switch["host"]):
@@ -2280,16 +2281,16 @@ def renew_due_certificates(
                     print_terminal("Status:           ERROR")
                     print_terminal(f"Reason:           {error}")
                     print_terminal("Action:           No renewal attempted")
-                    results.append("error")
+                    result = "error"
                     continue
                 if status == "ok":
                     print_terminal("Action:           No renewal required")
-                    results.append("healthy")
+                    result = "healthy"
                     continue
 
                 if status not in {"renewal_due", "expired"}:
                     print_terminal("Action:           No renewal attempted")
-                    results.append("error")
+                    result = "error"
                     continue
 
                 print_terminal("Action:           Renewing certificate")
@@ -2305,7 +2306,7 @@ def renew_due_certificates(
                     )
                 except RENEWAL_FAILURE_TYPES as error:
                     report_renewal_failure(error)
-                    results.append("error")
+                    result = "error"
                 except Exception as error:
                     print_terminal(
                         "Error: Unexpected renewal failure "
@@ -2318,17 +2319,56 @@ def renew_due_certificates(
                         "if necessary.",
                         file=sys.stderr,
                     )
-                    results.append("error")
+                    result = "error"
                 else:
-                    results.append("renewed")
+                    result = "renewed"
+        except LifecycleLockReleaseError:
+            print_terminal("Status:           ERROR")
+            if result == "renewed":
+                print_terminal(
+                    "Reason:           Lifecycle lock release failed after renewal. "
+                    "Renewal may already have completed; inspect the switch manually"
+                )
+                print_terminal(
+                    "Action:           No automatic retry, cleanup, or rollback"
+                )
+            elif result == "healthy":
+                print_terminal(
+                    "Reason:           Certificate check completed; no renewal was "
+                    "required, but lifecycle lock release failed"
+                )
+                print_terminal(
+                    "Action:           Inspect local lifecycle lock state before retry"
+                )
+            elif result == "error":
+                print_terminal(
+                    "Reason:           Switch check or renewal had already reported "
+                    "an error; lifecycle lock release also failed"
+                )
+                print_terminal(
+                    "Action:           Inspect switch and lifecycle lock state "
+                    "manually before retry; no automatic retry, cleanup, or rollback"
+                )
+            else:
+                print_terminal(
+                    "Reason:           Lifecycle lock release failed; the protected "
+                    "operation outcome could not be confirmed"
+                )
+                print_terminal(
+                    "Action:           Inspect switch and lifecycle lock state "
+                    "manually before retry; no automatic retry, cleanup, or rollback"
+                )
+            result = "error"
         except LifecycleLockError as error:
             print_switch_heading(switch)
             print_terminal("Status:           ERROR")
             print_terminal(f"Reason:           {error}")
             print_terminal("Action:           No renewal attempted")
-            results.append("error")
+            result = "error"
         finally:
             username = password = None
+            if result is not None:
+                results.append(result)
 
     print_renewal_summary(results, get_local_time())
     return EXIT_ERROR if "error" in results else EXIT_OK
@@ -2571,6 +2611,7 @@ def main():
         )
 
     if explicit_operation:
+        body_result = None
         try:
             if (
                 args.renew
@@ -2579,7 +2620,7 @@ def main():
                 or args.generate_csr
             ):
                 with lifecycle_lock(switches[0]["host"]):
-                    return run_explicit_operation(
+                    body_result = run_explicit_operation(
                         args,
                         switches,
                         csr_settings,
@@ -2587,6 +2628,7 @@ def main():
                         verification_ca_file,
                         certificate_pem,
                     )
+                return body_result
             return run_explicit_operation(
                 args,
                 switches,
@@ -2595,6 +2637,30 @@ def main():
                 verification_ca_file,
                 certificate_pem,
             )
+        except LifecycleLockReleaseError:
+            if body_result == EXIT_OK:
+                print_terminal(
+                    "Error: Command body completed before lifecycle lock release "
+                    "failed. The operation may already have changed device state; "
+                    "inspect it before retry. No automatic retry, cleanup, or "
+                    "rollback was attempted.",
+                    file=sys.stderr,
+                )
+            elif body_result == EXIT_ERROR:
+                print_terminal(
+                    "Error: Operation had already reported an error; lifecycle lock "
+                    "release also failed. Inspect local lifecycle lock state before "
+                    "retry. No automatic retry, cleanup, or rollback was attempted.",
+                    file=sys.stderr,
+                )
+            else:
+                print_terminal(
+                    "Error: Lifecycle lock release failed; command body outcome "
+                    "could not be confirmed. Inspect device state before retry. "
+                    "No automatic retry, cleanup, or rollback was attempted.",
+                    file=sys.stderr,
+                )
+            return EXIT_ERROR
         except LifecycleLockError as error:
             print_terminal(f"Error: {error}", file=sys.stderr)
             return EXIT_ERROR

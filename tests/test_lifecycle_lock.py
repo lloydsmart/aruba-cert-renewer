@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 import lifecycle_lock as locks
-from aruba_cert_renewer import parse_identity
+from aruba_cert_renewer import CSRSigningError, parse_identity
 
 
 @pytest.fixture
@@ -75,6 +75,95 @@ def test_close_failure_does_not_mask_protected_oserror(store, monkeypatch):
     assert raised.value is operation_error
     with locks.lifecycle_lock("switch.example.com"):
         pass
+
+
+def test_close_failure_after_success_is_distinct_release_error(store, monkeypatch):
+    original_close = os.close
+    failed = False
+
+    def close_then_fail_once(descriptor):
+        nonlocal failed
+        original_close(descriptor)
+        if not failed:
+            failed = True
+            raise OSError("synthetic close failure")
+
+    with (
+        monkeypatch.context() as patch,
+        pytest.raises(locks.LifecycleLockReleaseError, match="release failed"),
+        locks.lifecycle_lock("switch.example.com"),
+    ):
+        patch.setattr(locks.os, "close", close_then_fail_once)
+    assert failed
+    with locks.lifecycle_lock("switch.example.com"):
+        pass
+
+
+def test_outer_exception_does_not_hide_release_failure(store, monkeypatch):
+    original_close = os.close
+
+    def close_then_fail(descriptor):
+        original_close(descriptor)
+        raise OSError("synthetic close failure")
+
+    try:
+        raise RuntimeError("unrelated outer exception")
+    except RuntimeError:
+        with (
+            monkeypatch.context() as patch,
+            pytest.raises(locks.LifecycleLockReleaseError, match="release failed"),
+            locks.lifecycle_lock("switch.example.com"),
+        ):
+            patch.setattr(locks.os, "close", close_then_fail)
+
+
+@pytest.mark.parametrize(
+    "body_error",
+    [
+        CSRSigningError("known renewal failure"),
+        RuntimeError("unexpected failure"),
+        KeyboardInterrupt(),
+        SystemExit(),
+        BaseException(),
+    ],
+)
+def test_body_exception_wins_over_close_failure(store, monkeypatch, body_error):
+    original_close = os.close
+
+    def close_then_fail(descriptor):
+        original_close(descriptor)
+        raise OSError("synthetic close failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(locks.os, "close", close_then_fail)
+        with (
+            pytest.raises(type(body_error)) as raised,
+            locks.lifecycle_lock("switch.example.com"),
+        ):
+            raise body_error
+    assert raised.value is body_error
+
+
+def test_acquisition_exception_wins_over_cleanup_failure(store, monkeypatch):
+    acquisition_error = locks.LifecycleLockError("unsafe directory")
+    original_close = os.close
+
+    def close_then_fail(descriptor):
+        original_close(descriptor)
+        raise OSError("synthetic close failure")
+
+    def reject_directory(metadata):
+        raise acquisition_error
+
+    with monkeypatch.context() as patch:
+        patch.setattr(locks, "_validate_directory", reject_directory)
+        patch.setattr(locks.os, "close", close_then_fail)
+        with (
+            pytest.raises(locks.LifecycleLockError) as raised,
+            locks.lifecycle_lock("switch.example.com"),
+        ):
+            pytest.fail("Acquisition unexpectedly succeeded")
+    assert raised.value is acquisition_error
 
 
 def test_open_failure_is_classified_as_lock_error(store):

@@ -5,7 +5,6 @@ import fcntl
 import hashlib
 import os
 import stat
-import sys
 from contextlib import contextmanager
 
 LIFECYCLE_DIRECTORY = "/run/aruba-cert-renewer-lifecycle"
@@ -17,6 +16,10 @@ class LifecycleLockError(ValueError):
 
 class LifecycleLockBusy(LifecycleLockError):
     """Another invocation owns this device's lifecycle lock."""
+
+
+class LifecycleLockReleaseError(LifecycleLockError):
+    """The protected operation ran, but closing its lifecycle lock failed."""
 
 
 def lock_filename(canonical_host):
@@ -52,6 +55,7 @@ def _validate_lock_file(metadata):
 def lifecycle_lock(canonical_host):
     """Hold one host-visible lock until the protected operation completes."""
     directory_fd = lock_fd = None
+    body_entered = body_raised = False
     try:
         try:
             directory_fd = os.open(
@@ -93,9 +97,13 @@ def lifecycle_lock(canonical_host):
                 "Lifecycle lock is unavailable or unsafe"
             ) from error
 
-        yield
+        body_entered = True
+        try:
+            yield
+        except BaseException:
+            body_raised = True
+            raise
     finally:
-        active_error = sys.exc_info()[0] is not None
         close_error = None
         for descriptor in (lock_fd, directory_fd):
             if descriptor is not None:
@@ -104,5 +112,7 @@ def lifecycle_lock(canonical_host):
                 except OSError as error:
                     if close_error is None:
                         close_error = error
-        if close_error is not None and not active_error:
-            raise LifecycleLockError("Lifecycle lock release failed") from close_error
+        if close_error is not None and body_entered and not body_raised:
+            raise LifecycleLockReleaseError(
+                "Lifecycle lock release failed"
+            ) from close_error

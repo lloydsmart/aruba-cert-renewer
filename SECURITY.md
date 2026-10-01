@@ -53,6 +53,13 @@ operation. Read-only checks and CSR retrieval do not require it. Busy or unsafe
 lock state fails closed with the existing error exit code before switch or
 OPNsense contact for that switch. Process death releases the flock; persistent
 zero-byte lock files are normal and are never unlinked by the application.
+If the protected body otherwise completes, a close failure is reported as
+`LifecycleLockReleaseError` with the operation outcome. If the body raises, its
+exception takes precedence and a simultaneous close failure is not separately
+reported. A reported release error never turns a completed operation into a
+claim that no renewal was attempted. Inspect uncertain operation and local lock
+state before retrying. No automatic retry, rollback, lock-file deletion, or
+cleanup is attempted.
 
 The lock path derives from the validated canonical switch host through SHA-256.
 The directory is fixed at `/run/aruba-cert-renewer-lifecycle` and must be a

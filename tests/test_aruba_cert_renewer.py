@@ -32,6 +32,20 @@ FIXTURES_DIR = Path(__file__).parent / "fixtures"
 KNOWN_HOSTS_FILE = FIXTURES_DIR / "known_hosts"
 
 
+def fail_next_lock_close(patch):
+    original_close = lifecycle_lock.os.close
+    failed = False
+
+    def close_then_fail_once(descriptor):
+        nonlocal failed
+        original_close(descriptor)
+        if not failed:
+            failed = True
+            raise OSError("synthetic lifecycle close failure")
+
+    patch.setattr(lifecycle_lock.os, "close", close_then_fail_once)
+
+
 @pytest.fixture(autouse=True)
 def lifecycle_store(monkeypatch, tmp_path):
     directory = tmp_path / "lifecycle"
@@ -3711,6 +3725,43 @@ def test_explicit_install_wrong_ca_is_preinstall_and_skips_live_https(
     assert "Post-install HTTPS verification failed" not in error_output
 
 
+def test_explicit_install_preinstall_error_and_lock_release_failure(
+    monkeypatch, tmp_path, capsys
+):
+    live_calls = []
+    connection, _ = prepare_explicit_install(
+        monkeypatch,
+        tmp_path,
+        lambda *args: live_calls.append(args),
+        trusted_issuer=False,
+    )
+    original_install = checker.install_pending_certificate
+
+    with monkeypatch.context() as close_patch:
+
+        def install_then_fail_lock_close(*args, **kwargs):
+            try:
+                return original_install(*args, **kwargs)
+            finally:
+                fail_next_lock_close(close_patch)
+
+        monkeypatch.setattr(
+            checker, "install_pending_certificate", install_then_fail_lock_close
+        )
+        result = checker.main()
+
+    error_output = capsys.readouterr().err
+    assert result == checker.EXIT_ERROR
+    assert not connection.entered_config_mode
+    assert all(command.startswith("show ") for command in connection.commands)
+    assert live_calls == []
+    assert "Pre-install failure; the switch has not been modified" in error_output
+    assert "pre-install trust verification" in error_output
+    assert "lifecycle lock release also failed" in error_output
+    assert "Inspect local lifecycle lock state before retry" in error_output
+    assert "device state may have changed" not in error_output.lower()
+
+
 @pytest.mark.parametrize(
     "expected_prompt",
     [checker.CERTIFICATE_PASTE_PROMPT, checker.CERTIFICATE_REPLACEMENT_PROMPT],
@@ -5621,6 +5672,8 @@ def test_busy_lifecycle_rejects_before_switch_or_opnsense(monkeypatch, capsys, m
         assert checker.main() == checker.EXIT_ERROR
     output = capsys.readouterr()
     assert "already in progress" in output.err + output.out
+    if mode == "--renew-due":
+        assert "No renewal attempted" in output.out
 
 
 @pytest.mark.parametrize("status", ["ok", "renewal_due"])
@@ -6012,3 +6065,197 @@ def test_aging_before_installation_rejects_certificate_at_warning_boundary(monke
         )
     assert not connection.entered_config_mode
     assert all(command.startswith("show ") for command in connection.commands)
+
+
+def test_renew_due_release_failure_counts_one_error_and_continues(monkeypatch, capsys):
+    switches = make_multi_switch_config()["switches"]
+    checked = []
+    renewed = []
+    monkeypatch.setattr(
+        checker,
+        "get_switch_credentials",
+        lambda switch, config_file: ("user", "password"),
+    )
+
+    def check(switch, *args):
+        checked.append(switch["name"])
+        return "renewal_due" if switch is switches[0] else "ok"
+
+    with monkeypatch.context() as close_patch:
+
+        def renew(switch, *args, **kwargs):
+            renewed.append(switch["name"])
+            fail_next_lock_close(close_patch)
+
+        monkeypatch.setattr(checker, "check_switch", check)
+        monkeypatch.setattr(checker, "renew_certificate", renew)
+        result = checker.renew_due_certificates(
+            switches,
+            Path("config.toml"),
+            30,
+            make_csr_settings(),
+            make_opnsense_settings(),
+            Path("public-ca.pem"),
+        )
+
+    output = capsys.readouterr().out
+    assert result == checker.EXIT_ERROR
+    assert checked == ["SWITCH-A", "SWITCH-B"]
+    assert renewed == ["SWITCH-A"]
+    assert "Switches processed: 2" in output
+    assert "Healthy:             1" in output
+    assert "Renewed:             0" in output
+    assert "Errors:              1" in output
+    assert "Renewal may already have completed" in output
+    assert "inspect the switch manually" in output
+    assert "No automatic retry, cleanup, or rollback" in output
+    assert "No renewal attempted" not in output
+    for switch in switches:
+        with lifecycle_lock.lifecycle_lock(switch["host"]):
+            pass
+
+
+def test_renew_due_healthy_check_release_failure_is_not_renewal(monkeypatch, capsys):
+    switch = make_multi_switch_config()["switches"][0]
+    monkeypatch.setattr(
+        checker,
+        "get_switch_credentials",
+        lambda switch, config_file: ("user", "password"),
+    )
+    with monkeypatch.context() as close_patch:
+
+        def check(*args):
+            fail_next_lock_close(close_patch)
+            return "ok"
+
+        monkeypatch.setattr(checker, "check_switch", check)
+        monkeypatch.setattr(
+            checker,
+            "renew_certificate",
+            lambda *args, **kwargs: pytest.fail("Healthy switch was renewed"),
+        )
+        result = checker.renew_due_certificates(
+            [switch],
+            Path("config.toml"),
+            30,
+            make_csr_settings(),
+            make_opnsense_settings(),
+            Path("public-ca.pem"),
+        )
+
+    output = capsys.readouterr().out
+    assert result == checker.EXIT_ERROR
+    assert "Switches processed: 1" in output
+    assert "Renewed:             0" in output
+    assert "Errors:              1" in output
+    assert "check completed; no renewal was required" in output
+    assert "Inspect local lifecycle lock state before retry" in output
+    assert "Renewal may already have completed" not in output
+
+
+@pytest.mark.parametrize("failure_stage", ["check", "renewal"])
+def test_renew_due_existing_error_and_release_failure_remain_distinct(
+    monkeypatch, capsys, failure_stage
+):
+    switch = make_multi_switch_config()["switches"][0]
+    monkeypatch.setattr(
+        checker,
+        "get_switch_credentials",
+        lambda switch, config_file: ("user", "password"),
+    )
+    with monkeypatch.context() as close_patch:
+
+        def check(*args):
+            if failure_stage == "check":
+                fail_next_lock_close(close_patch)
+                raise OSError("synthetic switch check failure")
+            return "renewal_due"
+
+        def renew(*args, **kwargs):
+            fail_next_lock_close(close_patch)
+            raise checker.CSRSigningError("synthetic signing failure")
+
+        monkeypatch.setattr(checker, "check_switch", check)
+        monkeypatch.setattr(checker, "renew_certificate", renew)
+        result = checker.renew_due_certificates(
+            [switch],
+            Path("config.toml"),
+            30,
+            make_csr_settings(),
+            make_opnsense_settings(),
+            Path("public-ca.pem"),
+        )
+
+    output = capsys.readouterr()
+    combined = output.out + output.err
+    assert result == checker.EXIT_ERROR
+    assert "Switches processed: 1" in output.out
+    assert "Renewed:             0" in output.out
+    assert "Errors:              1" in output.out
+    assert "had already reported an error" in output.out
+    assert "lifecycle lock release also failed" in output.out
+    assert "Renewal may already have completed" not in combined
+    if failure_stage == "check":
+        assert "synthetic switch check failure" in combined
+    else:
+        assert "CSR signing failed" in combined
+
+
+@pytest.mark.parametrize(
+    "mode", ["--renew", "--install-certificate", "--sign-csr", "--generate-csr"]
+)
+@pytest.mark.parametrize("body_result", [checker.EXIT_OK, checker.EXIT_ERROR])
+def test_explicit_mutation_release_failure_is_post_operation(
+    monkeypatch, capsys, tmp_path, mode, body_result
+):
+    config = make_multi_switch_config()
+    switch = config["switches"][0]
+    argv = ["aruba_cert_renewer.py", mode, "--switch", switch["name"]]
+    if mode != "--renew":
+        argv.extend(["--certificate-name", "webcert-new"])
+    if mode == "--sign-csr":
+        argv.extend(["--certificate-output", str(tmp_path / "issued.pem")])
+    if mode == "--install-certificate":
+        argv.extend(["--certificate-input", str(tmp_path / "issued.pem")])
+    monkeypatch.setattr(checker.sys, "argv", argv)
+    monkeypatch.setattr(checker, "load_config", lambda config_file: config)
+    monkeypatch.setattr(
+        checker,
+        "get_verification_ca_file",
+        lambda config, config_file: Path("public-ca.pem"),
+    )
+    monkeypatch.setattr(
+        checker, "read_certificate_input", lambda path: "synthetic certificate"
+    )
+
+    with monkeypatch.context() as close_patch:
+
+        def completed_operation(*args):
+            fail_next_lock_close(close_patch)
+            if body_result == checker.EXIT_ERROR:
+                checker.print_terminal(
+                    "Error: Synthetic operation failure", file=checker.sys.stderr
+                )
+            return body_result
+
+        monkeypatch.setattr(checker, "run_explicit_operation", completed_operation)
+        result = checker.main()
+
+    output = capsys.readouterr().err
+    assert result == checker.EXIT_ERROR
+    if body_result == checker.EXIT_OK:
+        assert "Command body completed before lifecycle lock release failed" in output
+        assert "operation may already have changed device state" in output
+        assert "Operation had already reported an error" not in output
+        assert "inspect it before retry" in output
+    else:
+        assert "Synthetic operation failure" in output
+        assert "Operation had already reported an error" in output
+        assert "lifecycle lock release also failed" in output
+        assert "completed before lifecycle lock release failed" not in output
+        assert "Inspect local lifecycle lock state before retry" in output
+        assert "device state may have changed" not in output.lower()
+    assert "No automatic retry, cleanup, or rollback" in output
+    assert "No renewal attempted" not in output
+    with lifecycle_lock.lifecycle_lock(switch["host"]):
+        pass
