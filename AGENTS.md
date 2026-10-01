@@ -88,6 +88,10 @@ Do not automatically:
 * Reboot a switch.
 * Save configuration using `write memory` or an equivalent command.
 
+Automatic renewal and staged state-changing commands must hold the host-visible
+per-switch lifecycle lock described in `README.md` and `SECURITY.md`. Keep
+repeated switch-state checks and conservative manual recovery in place.
+
 Installation must only confirm the exact interactive prompts expected by the
 application. Unexpected prompts must fail closed.
 

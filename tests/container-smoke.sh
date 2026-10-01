@@ -58,7 +58,7 @@ docker run --rm \
     --read-only \
     --entrypoint /bin/sh \
     "$image" \
-    -c 'test -z "$(find /config /run/secrets -mindepth 1 -print -quit)" && test ! -w /app/src/aruba_cert_renewer.py'
+    -c 'test -z "$(find /config /run/secrets /run/aruba-cert-renewer-lifecycle -mindepth 1 -print -quit)" && test ! -w /app/src/aruba_cert_renewer.py && test ! -w /run/aruba-cert-renewer-lifecycle'
 
 docker run --rm \
     --network none \
@@ -119,6 +119,12 @@ mount = timezone_mounts[0]
 assert mount["type"] == "bind", "Host timezone must be a bind mount"
 assert mount["source"] == "/etc/localtime", "Host timezone must come from /etc/localtime"
 assert mount.get("read_only") is True, "Host timezone mount must be read-only"
+lifecycle_mounts = [mount for mount in volumes if mount["target"] == "/run/aruba-cert-renewer-lifecycle"]
+assert len(lifecycle_mounts) == 1, "Expected one lifecycle mount"
+mount = lifecycle_mounts[0]
+assert mount["type"] == "bind", "Lifecycle mount must be a bind mount"
+assert mount["source"] == "/run/aruba-cert-renewer-lifecycle", "Lifecycle mount must use the host directory"
+assert mount.get("read_only") is False, "Lifecycle mount must be writable"
 '
 
 printf '%s\n' "Container smoke tests passed for $image"

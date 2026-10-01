@@ -34,13 +34,45 @@ privileged mode, host networking, a Docker socket mount, published inbound
 ports, or broad host filesystem mounts.
 
 Mount only the required configuration, dedicated SSH `known_hosts`, public CA,
-and credential files, each read-only, and ensure they are readable by UID
-`10001` as appropriate while credential sources remain inaccessible to
+and credential files, each read-only, plus the protected lifecycle directory as
+a writable bind mount. Ensure the read-only files are readable by UID `10001`
+as appropriate while credential sources remain inaccessible to
 unrelated host users. Restrict network egress to the Aruba SSH and HTTPS
 services, the OPNsense HTTPS API, and supporting DNS/NTP required by the
 environment. These runtime controls reduce container privileges; they do not
 replace the application's credential, SSH host-key, TLS, certificate, or
 device-level safety checks.
+
+## Local Renewal Lifecycle Lock
+
+`--renew-due` acquires a host-visible, per-switch Linux `flock` before the due
+check and holds it through issuance, installation, and live HTTPS verification.
+Forced `--renew` holds the same lock for its complete renewal. Staged CSR
+generation, signing, and installation each hold it for their individual local
+operation. Read-only checks and CSR retrieval do not require it. Busy or unsafe
+lock state fails closed with the existing error exit code before switch or
+OPNsense contact for that switch. Process death releases the flock; persistent
+zero-byte lock files are normal and are never unlinked by the application.
+
+The lock path derives from the validated canonical switch host through SHA-256.
+The directory is fixed at `/run/aruba-cert-renewer-lifecycle` and must be a
+protected, host-visible writable bind mount for every one-shot container. The
+image's mountpoint alone is not a lock store. One external scheduler remains
+the intended owner for each device. This is local coordination only: multi-host
+operation and distributed locking are unsupported. Do not place the directory
+on an untrusted or shared path to simulate distributed locking.
+
+The supported executable CLI is the lifecycle-coordination boundary. Raw
+Python calls to renewal and staged-operation functions do not acquire this
+lock themselves and are not independently concurrency-safe; state-changing
+operations must enter through the CLI path.
+
+Automatic `--renew-due` requires `warning_days < lifetime_days` and rejects an
+issued certificate unless its remaining lifetime is strictly greater than the
+warning window both after signing and before installation. Forced and staged
+operations retain their existing validity checks. Existing switch-state
+rechecks and conservative manual recovery remain authoritative; the lock adds
+no cleanup, retry, deletion, or rollback.
 
 ## Local Security-Sensitive File Integrity
 
@@ -66,7 +98,7 @@ of these concrete patterns:
 * preferably owner `root:10001`, mode `0440` where host management permits it.
 
 The same trusted-owner/no-group-or-other-write policy applies to mounted
-configuration and trust files. All mounts should remain read-only. Mount
+configuration and trust files. Those mounts should remain read-only. Mount
 read-only status complements the application's metadata validation and does
 not replace it.
 

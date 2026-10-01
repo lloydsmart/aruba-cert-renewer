@@ -40,6 +40,7 @@ RUN groupadd --gid 10001 aruba-cert-renewer \
     && install -d -o root -g root -m 0555 \
         /config \
         /run/secrets \
+        /run/aruba-cert-renewer-lifecycle \
         /usr/share/licenses/aruba-cert-renewer
 
 COPY src/ /app/src/

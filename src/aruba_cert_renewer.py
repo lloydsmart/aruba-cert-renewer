@@ -35,6 +35,7 @@ from netmiko.exceptions import (
     NetmikoTimeoutException,
 )
 
+from lifecycle_lock import LifecycleLockError, lifecycle_lock
 from opnsense_client import OPNsenseClient, validate_base_url
 from output_policy import SanitizingFormatter, sanitize_terminal_text
 from secure_file import open_secure_file
@@ -1110,6 +1111,7 @@ def validate_issued_certificate(
     *,
     now=None,
     clock_skew=timedelta(minutes=5),
+    minimum_remaining_days=None,
 ):
     try:
         certificates = x509.load_pem_x509_certificates(certificate_pem.encode("ascii"))
@@ -1209,6 +1211,14 @@ def validate_issued_certificate(
 
     if not_after <= now:
         raise ValueError("Issued certificate has expired")
+
+    if minimum_remaining_days is not None and not_after <= now + timedelta(
+        days=minimum_remaining_days
+    ):
+        raise ValueError(
+            "Issued certificate does not have enough remaining validity "
+            "to leave the renewal warning window"
+        )
 
     actual_lifetime = not_after - not_before
     expected_lifetime = timedelta(days=lifetime_days)
@@ -1357,6 +1367,8 @@ def sign_pending_csr(
     certificate_name,
     csr_settings,
     opnsense_settings,
+    *,
+    minimum_remaining_days=None,
 ):
     identities = validate_switch_signing_identity(switch)
     csr_pem = retrieve_csr(
@@ -1387,6 +1399,7 @@ def sign_pending_csr(
         csr,
         switch,
         opnsense_settings["lifetime_days"],
+        minimum_remaining_days=minimum_remaining_days,
     )
     return certificate_pem
 
@@ -1503,6 +1516,7 @@ def renew_certificate(
     verification_ca_file,
     *,
     now=None,
+    minimum_remaining_days=None,
 ):
     """Compose the proven staged functions into one explicit renewal."""
     preflight = renewal_preflight(
@@ -1542,6 +1556,7 @@ def renew_certificate(
             certificate_name,
             csr_settings,
             opnsense_settings,
+            minimum_remaining_days=minimum_remaining_days,
         )
     except (ValueError, OSError) as error:
         raise CSRSigningError(
@@ -1562,6 +1577,7 @@ def renew_certificate(
             csr_settings,
             opnsense_settings["lifetime_days"],
             verification_ca_file,
+            minimum_remaining_days=minimum_remaining_days,
         )
     except CertificateInstallationAttemptError:
         raise
@@ -1925,6 +1941,8 @@ def install_pending_certificate(
     csr_settings,
     lifetime_days,
     verification_ca_file,
+    *,
+    minimum_remaining_days=None,
 ):
     certificate_name = validate_cli_identifier(
         certificate_name,
@@ -1956,6 +1974,7 @@ def install_pending_certificate(
                 csr,
                 switch,
                 lifetime_days,
+                minimum_remaining_days=minimum_remaining_days,
             )
             verify_issued_certificate_trust(
                 certificate,
@@ -2212,6 +2231,14 @@ RENEWAL_FAILURE_TYPES = (
 )
 
 
+def validate_automatic_renewal_window(warning_days, opnsense_settings):
+    if warning_days < 0 or warning_days >= opnsense_settings["lifetime_days"]:
+        raise ValueError(
+            "--renew-due requires settings.warning_days to be less than "
+            "opnsense.lifetime_days"
+        )
+
+
 def renew_due_certificates(
     switches,
     config_file,
@@ -2220,6 +2247,7 @@ def renew_due_certificates(
     opnsense_settings,
     verification_ca_file,
 ):
+    validate_automatic_renewal_window(warning_days, opnsense_settings)
     print_run_start("Aruba certificate renewal check", get_local_time())
     results = []
 
@@ -2245,52 +2273,60 @@ def renew_due_certificates(
                 results.append("error")
                 continue
 
-            try:
-                status = check_switch(switch, username, password, warning_days)
-            except Exception as error:
-                print_terminal("Status:           ERROR")
-                print_terminal(f"Reason:           {error}")
-                print_terminal("Action:           No renewal attempted")
-                results.append("error")
-                continue
-            if status == "ok":
-                print_terminal("Action:           No renewal required")
-                results.append("healthy")
-                continue
+            with lifecycle_lock(switch["host"]):
+                try:
+                    status = check_switch(switch, username, password, warning_days)
+                except Exception as error:
+                    print_terminal("Status:           ERROR")
+                    print_terminal(f"Reason:           {error}")
+                    print_terminal("Action:           No renewal attempted")
+                    results.append("error")
+                    continue
+                if status == "ok":
+                    print_terminal("Action:           No renewal required")
+                    results.append("healthy")
+                    continue
 
-            if status not in {"renewal_due", "expired"}:
-                print_terminal("Action:           No renewal attempted")
-                results.append("error")
-                continue
+                if status not in {"renewal_due", "expired"}:
+                    print_terminal("Action:           No renewal attempted")
+                    results.append("error")
+                    continue
 
-            print_terminal("Action:           Renewing certificate")
-            try:
-                renew_certificate(
-                    switch,
-                    username,
-                    password,
-                    csr_settings,
-                    opnsense_settings,
-                    verification_ca_file,
-                )
-            except RENEWAL_FAILURE_TYPES as error:
-                report_renewal_failure(error)
-                results.append("error")
-            except Exception as error:
-                print_terminal(
-                    "Error: Unexpected renewal failure "
-                    f"({type(error).__name__}). Renewal state may be uncertain.",
-                    file=sys.stderr,
-                )
-                print_terminal(
-                    "No automatic retry, cleanup, or rollback was attempted; "
-                    "inspect the switch and use the explicit staged commands "
-                    "if necessary.",
-                    file=sys.stderr,
-                )
-                results.append("error")
-            else:
-                results.append("renewed")
+                print_terminal("Action:           Renewing certificate")
+                try:
+                    renew_certificate(
+                        switch,
+                        username,
+                        password,
+                        csr_settings,
+                        opnsense_settings,
+                        verification_ca_file,
+                        minimum_remaining_days=warning_days,
+                    )
+                except RENEWAL_FAILURE_TYPES as error:
+                    report_renewal_failure(error)
+                    results.append("error")
+                except Exception as error:
+                    print_terminal(
+                        "Error: Unexpected renewal failure "
+                        f"({type(error).__name__}). Renewal state may be uncertain.",
+                        file=sys.stderr,
+                    )
+                    print_terminal(
+                        "No automatic retry, cleanup, or rollback was attempted; "
+                        "inspect the switch and use the explicit staged commands "
+                        "if necessary.",
+                        file=sys.stderr,
+                    )
+                    results.append("error")
+                else:
+                    results.append("renewed")
+        except LifecycleLockError as error:
+            print_switch_heading(switch)
+            print_terminal("Status:           ERROR")
+            print_terminal(f"Reason:           {error}")
+            print_terminal("Action:           No renewal attempted")
+            results.append("error")
         finally:
             username = password = None
 
@@ -2315,67 +2351,19 @@ def write_certificate(certificate_pem, output_path):
     print_terminal(f"Certificate written to {output_path}")
 
 
-def main():
-    args = parse_args()
-    configure_logging(args.debug)
-
+def run_explicit_operation(
+    args,
+    switches,
+    csr_settings,
+    opnsense_settings,
+    verification_ca_file,
+    certificate_pem,
+):
     try:
-        validate_cli_args(args)
-        config = load_config(args.config)
-        warning_days, switches = validate_config(config, args.config)
-        switches = select_switches(switches, args.switch_name)
-        renew_due = getattr(args, "renew_due", False)
-
-        if (
-            args.generate_csr
-            or args.retrieve_csr
-            or args.sign_csr
-            or args.install_certificate
-            or args.renew
-            or renew_due
-        ):
-            csr_settings = get_csr_settings(config)
-
-        if args.sign_csr or args.install_certificate or args.renew or renew_due:
-            opnsense_settings = get_opnsense_settings(config)
-            for switch in switches if renew_due else switches[:1]:
-                validate_switch_signing_identity(switch)
-
-        if args.install_certificate or args.renew or renew_due:
-            verification_ca_file = get_verification_ca_file(config, args.config)
-
-        if args.install_certificate:
-            certificate_pem = read_certificate_input(args.certificate_input)
-
+        username, password = get_switch_credentials(switches[0], args.config)
     except ValueError as error:
         print_terminal(f"Error: {error}", file=sys.stderr)
         return EXIT_ERROR
-
-    explicit_operation = any(
-        (
-            args.generate_csr,
-            args.retrieve_csr,
-            args.sign_csr,
-            args.install_certificate,
-            args.renew,
-        )
-    )
-    if explicit_operation:
-        try:
-            username, password = get_switch_credentials(switches[0], args.config)
-        except ValueError as error:
-            print_terminal(f"Error: {error}", file=sys.stderr)
-            return EXIT_ERROR
-
-    if renew_due:
-        return renew_due_certificates(
-            switches,
-            args.config,
-            warning_days,
-            csr_settings,
-            opnsense_settings,
-            verification_ca_file,
-        )
 
     if args.renew:
         switch = switches[0]
@@ -2520,6 +2508,94 @@ def main():
             return EXIT_OK
 
         except ValueError as error:
+            print_terminal(f"Error: {error}", file=sys.stderr)
+            return EXIT_ERROR
+
+
+def main():
+    args = parse_args()
+    configure_logging(args.debug)
+    csr_settings = opnsense_settings = verification_ca_file = certificate_pem = None
+
+    try:
+        validate_cli_args(args)
+        config = load_config(args.config)
+        warning_days, switches = validate_config(config, args.config)
+        switches = select_switches(switches, args.switch_name)
+        renew_due = getattr(args, "renew_due", False)
+
+        if (
+            args.generate_csr
+            or args.retrieve_csr
+            or args.sign_csr
+            or args.install_certificate
+            or args.renew
+            or renew_due
+        ):
+            csr_settings = get_csr_settings(config)
+
+        if args.sign_csr or args.install_certificate or args.renew or renew_due:
+            opnsense_settings = get_opnsense_settings(config)
+            if renew_due:
+                validate_automatic_renewal_window(warning_days, opnsense_settings)
+            for switch in switches if renew_due else switches[:1]:
+                validate_switch_signing_identity(switch)
+
+        if args.install_certificate or args.renew or renew_due:
+            verification_ca_file = get_verification_ca_file(config, args.config)
+
+        if args.install_certificate:
+            certificate_pem = read_certificate_input(args.certificate_input)
+
+    except ValueError as error:
+        print_terminal(f"Error: {error}", file=sys.stderr)
+        return EXIT_ERROR
+
+    explicit_operation = any(
+        (
+            args.generate_csr,
+            args.retrieve_csr,
+            args.sign_csr,
+            args.install_certificate,
+            args.renew,
+        )
+    )
+    if renew_due:
+        return renew_due_certificates(
+            switches,
+            args.config,
+            warning_days,
+            csr_settings,
+            opnsense_settings,
+            verification_ca_file,
+        )
+
+    if explicit_operation:
+        try:
+            if (
+                args.renew
+                or args.install_certificate
+                or args.sign_csr
+                or args.generate_csr
+            ):
+                with lifecycle_lock(switches[0]["host"]):
+                    return run_explicit_operation(
+                        args,
+                        switches,
+                        csr_settings,
+                        opnsense_settings,
+                        verification_ca_file,
+                        certificate_pem,
+                    )
+            return run_explicit_operation(
+                args,
+                switches,
+                csr_settings,
+                opnsense_settings,
+                verification_ca_file,
+                certificate_pem,
+            )
+        except LifecycleLockError as error:
             print_terminal(f"Error: {error}", file=sys.stderr)
             return EXIT_ERROR
 

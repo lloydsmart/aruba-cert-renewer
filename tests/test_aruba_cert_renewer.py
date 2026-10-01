@@ -25,10 +25,19 @@ from netmiko.exceptions import (
 from paramiko.hostkeys import HostKeys
 
 import aruba_cert_renewer as checker
+import lifecycle_lock
 from secure_file import SecureFileError
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 KNOWN_HOSTS_FILE = FIXTURES_DIR / "known_hosts"
+
+
+@pytest.fixture(autouse=True)
+def lifecycle_store(monkeypatch, tmp_path):
+    directory = tmp_path / "lifecycle"
+    directory.mkdir(mode=0o700)
+    monkeypatch.setattr(lifecycle_lock, "LIFECYCLE_DIRECTORY", str(directory))
+    return directory
 
 
 def test_known_hosts_fixture_is_valid_openssh():
@@ -4504,12 +4513,12 @@ def test_renew_certificate_composes_stages_in_order_without_files(monkeypatch):
     monkeypatch.setattr(
         checker,
         "sign_pending_csr",
-        lambda *args: calls.append(("sign", args)) or certificate_pem,
+        lambda *args, **kwargs: calls.append(("sign", args)) or certificate_pem,
     )
     monkeypatch.setattr(
         checker,
         "install_pending_certificate",
-        lambda *args: calls.append(("install", args)) or certificate,
+        lambda *args, **kwargs: calls.append(("install", args)) or certificate,
     )
     monkeypatch.setattr(
         checker,
@@ -4571,9 +4580,11 @@ def test_renew_trust_failure_is_preinstall_and_skips_live_https(monkeypatch):
         },
     )
     monkeypatch.setattr(checker, "generate_csr", lambda *args: "CSR")
-    monkeypatch.setattr(checker, "sign_pending_csr", lambda *args: "certificate")
+    monkeypatch.setattr(
+        checker, "sign_pending_csr", lambda *args, **kwargs: "certificate"
+    )
 
-    def reject_untrusted_certificate(*args):
+    def reject_untrusted_certificate(*args, **kwargs):
         calls.append(("install", args))
         raise ValueError("Issued certificate failed pre-install trust verification")
 
@@ -4722,7 +4733,9 @@ def test_renew_signing_failure_reports_that_pending_csr_remains(monkeypatch):
     monkeypatch.setattr(
         checker,
         "sign_pending_csr",
-        lambda *args: (_ for _ in ()).throw(ValueError("OPNsense unavailable")),
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            ValueError("OPNsense unavailable")
+        ),
     )
     monkeypatch.setattr(
         checker,
@@ -5054,7 +5067,7 @@ def test_renew_due_orchestrates_and_summarizes_switches(
         assert warning_days == 30
         return statuses[switch["name"]]
 
-    def renew(switch, username, password, *settings):
+    def renew(switch, username, password, *settings, **kwargs):
         renewal_calls.append(switch["name"])
         assert username == f"user-{switch['name']}"
         assert password == f"password-{switch['name']}"
@@ -5110,7 +5123,9 @@ def test_renew_due_prints_start_before_switches_and_completion_in_summary(
     monkeypatch.setattr(
         checker,
         "renew_certificate",
-        lambda *args: pytest.fail("A healthy certificate must not be renewed"),
+        lambda *args, **kwargs: pytest.fail(
+            "A healthy certificate must not be renewed"
+        ),
     )
 
     result = checker.renew_due_certificates(
@@ -5156,7 +5171,7 @@ def test_renew_due_credential_failure_does_not_stop_later_switch(monkeypatch, ca
     monkeypatch.setattr(
         checker,
         "renew_certificate",
-        lambda switch, *args: renewed.append(switch["name"]),
+        lambda switch, *args, **kwargs: renewed.append(switch["name"]),
     )
 
     result = checker.renew_due_certificates(
@@ -5197,7 +5212,7 @@ def test_renew_due_unexpected_credential_failure_is_sanitized_and_isolated(
     monkeypatch.setattr(
         checker,
         "renew_certificate",
-        lambda *args: pytest.fail("A healthy switch must not be renewed"),
+        lambda *args, **kwargs: pytest.fail("A healthy switch must not be renewed"),
     )
 
     result = checker.renew_due_certificates(
@@ -5282,7 +5297,7 @@ def test_renew_due_failure_class_continues_without_retry(
     )
     monkeypatch.setattr(checker, "check_switch", lambda *args: "renewal_due")
 
-    def renew(switch, *args):
+    def renew(switch, *args, **kwargs):
         renewal_calls.append(switch["name"])
         if switch["name"] == "SWITCH-A":
             raise exception
@@ -5317,7 +5332,7 @@ def test_renew_due_unexpected_renewal_failure_is_sanitized_and_isolated(
     )
     monkeypatch.setattr(checker, "check_switch", lambda *args: "renewal_due")
 
-    def renew(switch, *args):
+    def renew(switch, *args, **kwargs):
         renewal_calls.append(switch["name"])
         if switch["name"] == "SWITCH-A":
             raise RuntimeError("synthetic unexpected failure")
@@ -5358,7 +5373,7 @@ def test_renew_due_renewal_keyboard_interrupt_propagates(monkeypatch):
     monkeypatch.setattr(
         checker,
         "renew_certificate",
-        lambda *args: (_ for _ in ()).throw(KeyboardInterrupt()),
+        lambda *args, **kwargs: (_ for _ in ()).throw(KeyboardInterrupt()),
     )
 
     with pytest.raises(KeyboardInterrupt):
@@ -5389,7 +5404,7 @@ def test_renew_due_monitor_exception_does_not_stop_later_switch(monkeypatch):
     monkeypatch.setattr(
         checker,
         "renew_certificate",
-        lambda switch, *args: renewed.append(switch["name"]),
+        lambda switch, *args, **kwargs: renewed.append(switch["name"]),
     )
 
     assert (
@@ -5493,7 +5508,7 @@ def test_renew_due_main_healthy_run_uses_selection_without_opnsense_contact(
     monkeypatch.setattr(
         checker,
         "renew_certificate",
-        lambda *args: pytest.fail("Healthy certificates must not be renewed"),
+        lambda *args, **kwargs: pytest.fail("Healthy certificates must not be renewed"),
     )
     monkeypatch.setattr(
         checker,
@@ -5504,3 +5519,496 @@ def test_renew_due_main_healthy_run_uses_selection_without_opnsense_contact(
     assert checker.main() == checker.EXIT_OK
     assert checked == expected_switch
     assert f"Switches processed: {len(expected_switch)}" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("warning_days", [0, 396])
+def test_automatic_renewal_window_accepts_satisfiable_threshold(warning_days):
+    checker.validate_automatic_renewal_window(warning_days, make_opnsense_settings())
+
+
+@pytest.mark.parametrize("warning_days", [397, 398])
+def test_renew_due_rejects_invalid_window_before_device_access(
+    monkeypatch, capsys, warning_days
+):
+    config = make_multi_switch_config()
+    config["settings"]["warning_days"] = warning_days
+    monkeypatch.setattr(checker.sys, "argv", ["aruba_cert_renewer.py", "--renew-due"])
+    monkeypatch.setattr(checker, "load_config", lambda config_file: config)
+    monkeypatch.setattr(
+        checker,
+        "get_switch_credentials",
+        lambda *args: pytest.fail("No credentials should be read"),
+    )
+    monkeypatch.setattr(
+        checker,
+        "check_switch",
+        lambda *args: pytest.fail("No switch access should occur"),
+    )
+    monkeypatch.setattr(
+        checker,
+        "OPNsenseClient",
+        lambda *args: pytest.fail("No signing should occur"),
+    )
+
+    assert checker.main() == checker.EXIT_ERROR
+    assert "settings.warning_days" in capsys.readouterr().err
+
+
+def test_forced_renew_does_not_reject_automatic_threshold(monkeypatch):
+    config = make_multi_switch_config()
+    config["settings"]["warning_days"] = 397
+    calls = []
+    monkeypatch.setattr(
+        checker.sys,
+        "argv",
+        ["aruba_cert_renewer.py", "--switch", "SWITCH-A", "--renew"],
+    )
+    monkeypatch.setattr(checker, "load_config", lambda config_file: config)
+    monkeypatch.setattr(
+        checker,
+        "get_verification_ca_file",
+        lambda config, config_file: Path("public-ca.pem"),
+    )
+    monkeypatch.setattr(
+        checker,
+        "get_switch_credentials",
+        lambda switch, config_file: ("user", "password"),
+    )
+    monkeypatch.setattr(
+        checker,
+        "renew_certificate",
+        lambda *args, **kwargs: calls.append(kwargs),
+    )
+
+    assert checker.main() == checker.EXIT_OK
+    assert calls == [{}]
+
+
+@pytest.mark.parametrize("mode", ["--renew", "--renew-due"])
+def test_busy_lifecycle_rejects_before_switch_or_opnsense(monkeypatch, capsys, mode):
+    config = make_multi_switch_config()
+    switch = config["switches"][0]
+    argv = ["aruba_cert_renewer.py", mode, "--switch", switch["name"]]
+    monkeypatch.setattr(checker.sys, "argv", argv)
+    monkeypatch.setattr(checker, "load_config", lambda config_file: config)
+    monkeypatch.setattr(
+        checker,
+        "get_verification_ca_file",
+        lambda config, config_file: Path("public-ca.pem"),
+    )
+    monkeypatch.setattr(
+        checker,
+        "get_switch_credentials",
+        lambda switch, config_file: ("user", "password"),
+    )
+    monkeypatch.setattr(
+        checker,
+        "check_switch",
+        lambda *args: pytest.fail("Busy call contacted switch"),
+    )
+    monkeypatch.setattr(
+        checker,
+        "renew_certificate",
+        lambda *args: pytest.fail("Busy call started renewal"),
+    )
+    monkeypatch.setattr(
+        checker,
+        "OPNsenseClient",
+        lambda *args: pytest.fail("Busy call contacted OPNsense"),
+    )
+
+    with lifecycle_lock.lifecycle_lock(switch["host"]):
+        assert checker.main() == checker.EXIT_ERROR
+    output = capsys.readouterr()
+    assert "already in progress" in output.err + output.out
+
+
+@pytest.mark.parametrize("status", ["ok", "renewal_due"])
+def test_renew_due_holds_lock_through_check_and_renewal(monkeypatch, status):
+    switch = make_multi_switch_config()["switches"][0]
+    calls = []
+
+    def assert_locked(stage):
+        with (
+            pytest.raises(lifecycle_lock.LifecycleLockBusy),
+            lifecycle_lock.lifecycle_lock(switch["host"]),
+        ):
+            pytest.fail("Lifecycle lock was released too early")
+        calls.append(stage)
+
+    def check(*args):
+        assert_locked("check")
+        return status
+
+    def renew(*args, **kwargs):
+        assert kwargs == {"minimum_remaining_days": 30}
+        assert_locked("renew")
+
+    monkeypatch.setattr(
+        checker,
+        "get_switch_credentials",
+        lambda switch, config_file: ("user", "password"),
+    )
+    monkeypatch.setattr(checker, "check_switch", check)
+    monkeypatch.setattr(checker, "renew_certificate", renew)
+
+    assert (
+        checker.renew_due_certificates(
+            [switch],
+            Path("config.toml"),
+            30,
+            make_csr_settings(),
+            make_opnsense_settings(),
+            Path("public-ca.pem"),
+        )
+        == checker.EXIT_OK
+    )
+    assert calls == (["check"] if status == "ok" else ["check", "renew"])
+    with lifecycle_lock.lifecycle_lock(switch["host"]):
+        pass
+
+
+@pytest.mark.parametrize(
+    ("remaining_seconds", "accepted"),
+    [(30 * 86400 + 1, True), (30 * 86400, False), (30 * 86400 - 1, False)],
+)
+def test_issued_certificate_requires_strict_remaining_window(
+    remaining_seconds, accepted
+):
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    not_after = now + timedelta(seconds=remaining_seconds)
+    _, csr, certificate_pem = make_test_identity_and_certificate(
+        not_before=not_after - timedelta(days=397), not_after=not_after
+    )
+    args = (certificate_pem, csr, make_config()["switches"][0], 397)
+
+    if accepted:
+        checker.validate_issued_certificate(*args, now=now, minimum_remaining_days=30)
+    else:
+        with pytest.raises(ValueError, match="remaining validity"):
+            checker.validate_issued_certificate(
+                *args, now=now, minimum_remaining_days=30
+            )
+        checker.validate_issued_certificate(*args, now=now)
+
+
+def test_automatic_short_lived_certificate_never_reaches_install(monkeypatch):
+    switch = make_config()["switches"][0]
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    not_after = now + timedelta(days=30)
+    _, csr, certificate_pem = make_test_identity_and_certificate(
+        not_before=not_after - timedelta(days=397), not_after=not_after
+    )
+    monkeypatch.setattr(
+        checker,
+        "renewal_preflight",
+        lambda *args, **kwargs: {
+            "active_certificate_name": "current",
+            "new_certificate_name": "new-certificate",
+        },
+    )
+    monkeypatch.setattr(checker, "generate_csr", lambda *args: "synthetic CSR")
+
+    def sign(*args, **kwargs):
+        checker.validate_issued_certificate(
+            certificate_pem,
+            csr,
+            switch,
+            397,
+            now=now,
+            minimum_remaining_days=kwargs["minimum_remaining_days"],
+        )
+        return certificate_pem
+
+    monkeypatch.setattr(checker, "sign_pending_csr", sign)
+    monkeypatch.setattr(
+        checker,
+        "install_pending_certificate",
+        lambda *args, **kwargs: pytest.fail("Short-lived certificate reached install"),
+    )
+
+    with pytest.raises(checker.CSRSigningError, match="remaining validity"):
+        checker.renew_certificate(
+            switch,
+            "user",
+            "password",
+            make_csr_settings(),
+            make_opnsense_settings(),
+            Path("public-ca.pem"),
+            minimum_remaining_days=30,
+        )
+
+
+def test_automatic_minimum_reaches_signing_and_preinstallation(monkeypatch):
+    switch = make_config()["switches"][0]
+    stages = []
+    monkeypatch.setattr(
+        checker,
+        "renewal_preflight",
+        lambda *args, **kwargs: {
+            "active_certificate_name": "current",
+            "new_certificate_name": "new-certificate",
+        },
+    )
+    monkeypatch.setattr(checker, "generate_csr", lambda *args: "synthetic CSR")
+
+    def sign(*args, **kwargs):
+        stages.append(("sign", kwargs))
+        return "synthetic certificate"
+
+    def install(*args, **kwargs):
+        stages.append(("install", kwargs))
+        return object()
+
+    monkeypatch.setattr(checker, "sign_pending_csr", sign)
+    monkeypatch.setattr(checker, "install_pending_certificate", install)
+    monkeypatch.setattr(checker, "verify_live_https_certificate", lambda *args: None)
+
+    checker.renew_certificate(
+        switch,
+        "user",
+        "password",
+        make_csr_settings(),
+        make_opnsense_settings(),
+        Path("public-ca.pem"),
+        minimum_remaining_days=30,
+    )
+    assert stages == [
+        ("sign", {"minimum_remaining_days": 30}),
+        ("install", {"minimum_remaining_days": 30}),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("mode", "options"),
+    [
+        ("--generate-csr", []),
+        ("--sign-csr", ["--certificate-output", "issued.pem"]),
+        ("--install-certificate", ["--certificate-input", "issued.pem"]),
+    ],
+)
+def test_busy_staged_mutation_does_not_start(monkeypatch, mode, options):
+    config = make_multi_switch_config()
+    switch = config["switches"][0]
+    monkeypatch.setattr(
+        checker.sys,
+        "argv",
+        [
+            "aruba_cert_renewer.py",
+            mode,
+            "--switch",
+            switch["name"],
+            "--certificate-name",
+            "webcert-new",
+            *options,
+        ],
+    )
+    monkeypatch.setattr(checker, "load_config", lambda config_file: config)
+    monkeypatch.setattr(
+        checker,
+        "get_verification_ca_file",
+        lambda config, config_file: Path("public-ca.pem"),
+    )
+    monkeypatch.setattr(
+        checker, "read_certificate_input", lambda path: "synthetic certificate"
+    )
+    monkeypatch.setattr(
+        checker,
+        "get_switch_credentials",
+        lambda *args: pytest.fail("Busy command read credentials"),
+    )
+    monkeypatch.setattr(
+        checker, "generate_csr", lambda *args: pytest.fail("Busy command generated CSR")
+    )
+    monkeypatch.setattr(
+        checker,
+        "sign_pending_csr",
+        lambda *args: pytest.fail("Busy command signed CSR"),
+    )
+    monkeypatch.setattr(
+        checker,
+        "install_pending_certificate",
+        lambda *args: pytest.fail("Busy command installed certificate"),
+    )
+
+    with lifecycle_lock.lifecycle_lock(switch["host"]):
+        assert checker.main() == checker.EXIT_ERROR
+
+
+def test_explicit_operation_oserror_is_not_reported_as_lock_failure(monkeypatch):
+    config = make_multi_switch_config()
+    switch = config["switches"][0]
+    operation_error = OSError("synthetic post-CSR output failure")
+    stages = []
+    monkeypatch.setattr(
+        checker.sys,
+        "argv",
+        ["aruba_cert_renewer.py", "--renew", "--switch", switch["name"]],
+    )
+    monkeypatch.setattr(checker, "load_config", lambda config_file: config)
+    monkeypatch.setattr(
+        checker,
+        "get_verification_ca_file",
+        lambda config, config_file: Path("public-ca.pem"),
+    )
+
+    def fail_after_change(*args):
+        stages.append("CSR creation attempted")
+        raise operation_error
+
+    monkeypatch.setattr(checker, "run_explicit_operation", fail_after_change)
+
+    with pytest.raises(OSError) as raised:
+        checker.main()
+    assert raised.value is operation_error
+    assert stages == ["CSR creation attempted"]
+    with lifecycle_lock.lifecycle_lock(switch["host"]):
+        pass
+
+
+def test_post_csr_oserror_keeps_pending_csr_recovery_classification(
+    monkeypatch, capsys
+):
+    config = make_multi_switch_config()
+    switch = config["switches"][0]
+    stages = []
+    monkeypatch.setattr(
+        checker.sys,
+        "argv",
+        ["aruba_cert_renewer.py", "--renew", "--switch", switch["name"]],
+    )
+    monkeypatch.setattr(checker, "load_config", lambda config_file: config)
+    monkeypatch.setattr(
+        checker,
+        "get_verification_ca_file",
+        lambda config, config_file: Path("public-ca.pem"),
+    )
+    monkeypatch.setattr(
+        checker,
+        "get_switch_credentials",
+        lambda switch, config_file: ("user", "password"),
+    )
+    monkeypatch.setattr(
+        checker,
+        "renewal_preflight",
+        lambda *args, **kwargs: {
+            "active_certificate_name": "current",
+            "new_certificate_name": "webcert-new",
+        },
+    )
+    monkeypatch.setattr(
+        checker, "generate_csr", lambda *args: stages.append("generated")
+    )
+
+    def sign(*args, **kwargs):
+        assert stages == ["generated"]
+        raise OSError("synthetic signing transport failure")
+
+    monkeypatch.setattr(checker, "sign_pending_csr", sign)
+    monkeypatch.setattr(
+        checker,
+        "install_pending_certificate",
+        lambda *args, **kwargs: pytest.fail("Certificate must not be installed"),
+    )
+
+    assert checker.main() == checker.EXIT_ERROR
+    output = capsys.readouterr().err
+    assert stages == ["generated"]
+    assert "CSR signing failed" in output
+    assert "pending CSR remains" in output
+    assert "Lifecycle lock" not in output
+
+
+def test_busy_first_switch_does_not_block_second_switch(monkeypatch, capsys):
+    switches = make_multi_switch_config()["switches"]
+    checked = []
+    renewed = []
+    monkeypatch.setattr(
+        checker,
+        "get_switch_credentials",
+        lambda switch, config_file: ("user", "password"),
+    )
+
+    def check(switch, *args):
+        checked.append(switch["name"])
+        return "renewal_due"
+
+    def renew(switch, *args, **kwargs):
+        renewed.append(switch["name"])
+        with (
+            pytest.raises(lifecycle_lock.LifecycleLockBusy),
+            lifecycle_lock.lifecycle_lock(switch["host"]),
+        ):
+            pytest.fail("Second switch was not locked during renewal")
+
+    monkeypatch.setattr(checker, "check_switch", check)
+    monkeypatch.setattr(checker, "renew_certificate", renew)
+    monkeypatch.setattr(
+        checker,
+        "OPNsenseClient",
+        lambda *args: pytest.fail("Busy switch contacted OPNsense"),
+    )
+
+    with lifecycle_lock.lifecycle_lock(switches[0]["host"]):
+        assert (
+            checker.renew_due_certificates(
+                switches,
+                Path("config.toml"),
+                30,
+                make_csr_settings(),
+                make_opnsense_settings(),
+                Path("public-ca.pem"),
+            )
+            == checker.EXIT_ERROR
+        )
+        with lifecycle_lock.lifecycle_lock(switches[1]["host"]):
+            pass
+
+    assert checked == ["SWITCH-B"]
+    assert renewed == ["SWITCH-B"]
+    assert "already in progress" in capsys.readouterr().out
+    with lifecycle_lock.lifecycle_lock(switches[0]["host"]):
+        pass
+
+
+def test_aging_before_installation_rejects_certificate_at_warning_boundary(monkeypatch):
+    switch = make_config()["switches"][0]
+    first_validation = datetime(2026, 1, 1, tzinfo=UTC)
+    installation_validation = first_validation + timedelta(seconds=1)
+    not_after = installation_validation + timedelta(days=30)
+    csr_pem, csr, certificate_pem = make_test_identity_and_certificate(
+        not_before=not_after - timedelta(days=397), not_after=not_after
+    )
+    checker.validate_issued_certificate(
+        certificate_pem,
+        csr,
+        switch,
+        397,
+        now=first_validation,
+        minimum_remaining_days=30,
+    )
+
+    class InstallationClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            assert tz is UTC
+            return installation_validation
+
+    connection = FakeInstallConnection(csr_pem)
+    monkeypatch.setattr(checker, "datetime", InstallationClock)
+    monkeypatch.setattr(checker, "ConnectHandler", lambda **kwargs: connection)
+
+    with pytest.raises(ValueError, match="remaining validity"):
+        checker.install_pending_certificate(
+            switch,
+            "user",
+            "password",
+            "webcert2027",
+            certificate_pem,
+            make_csr_settings(),
+            397,
+            Path("public-ca.pem"),
+            minimum_remaining_days=30,
+        )
+    assert not connection.entered_config_mode
+    assert all(command.startswith("show ") for command in connection.commands)
