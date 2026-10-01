@@ -380,6 +380,34 @@ preferred production reference. Omitting `ARUBA_CERT_RENEWER_IMAGE`
 intentionally fails validation so copying the example cannot silently select an
 image.
 
+Automatic renewal and local state-changing commands use a per-switch Linux
+`flock` held for the complete operation. The container requires a writable host
+bind mount at `/run/aruba-cert-renewer-lifecycle`; the image contains only a
+read-only mountpoint and does not create a private lock store. On Linux or
+Unraid, provision the host directory before running a container:
+
+```bash
+install -d -m 0770 -o 0 -g 10001 /run/aruba-cert-renewer-lifecycle
+```
+
+The application creates persistent, zero-byte lock files in that directory.
+They are normal and must not be removed between runs. `/run` is usually
+ephemeral, so recreate the directory at host boot before scheduled renewals.
+Every one-shot invocation for a deployment must mount the same host directory.
+Use one external scheduler per switch; the lock prevents accidental overlap on
+one host. Multi-host operation and distributed locking are unsupported. Do not
+place the directory on an untrusted or shared path to simulate distributed
+locking. If the store is missing, unsafe, or another operation holds the same
+switch lock, the command fails closed with exit code 2 for that switch. A busy
+switch is not contacted, and its renewal does not contact OPNsense.
+If a protected check or command body otherwise completes, a close failure raises
+`LifecycleLockReleaseError`; the command reports a post-operation lock-release
+failure alongside the operation outcome. If the body raises, its exception takes
+precedence, so a simultaneous close failure is not separately reported. Inspect
+the reported switch and local lock state before retrying where operation state
+is uncertain. No automatic retry, rollback, lock-file deletion, or cleanup is
+attempted.
+
 On Linux hosts, including Unraid, the Compose example mounts
 `/etc/localtime:/etc/localtime:ro`. This read-only timezone database file lets
 timezone-aware operator timestamps use the host's configured local timezone.
@@ -445,8 +473,9 @@ chmod 0440 secrets/opnsense_api_key
 ```
 
 Alternatively, use owner `10001:10001` and mode `0400`. Apply the same pattern
-to the OPNsense key and secret and each Aruba password file. Keep all mounts
-read-only as shown in the Compose example.
+to the OPNsense key and secret and each Aruba password file. Keep configuration,
+trust, and secret mounts read-only. The lifecycle directory is the only writable
+bind mount in the Compose example.
 
 The Compose file is an example, not the final network deployment. A production
 network policy should allow only required outbound Aruba SSH (TCP/22), Aruba
@@ -735,6 +764,13 @@ remaining lifetime is less than or equal to `settings.warning_days`:
 python src/aruba_cert_renewer.py --renew-due
 ```
 
+For `--renew-due`, configure `0 <= settings.warning_days < opnsense.lifetime_days`.
+The command rejects an impossible threshold before
+switch or OPNsense access. A newly issued certificate must have strictly more
+remaining validity than the warning window when validated after signing and
+again before installation. Forced `--renew` and staged recovery retain their
+existing certificate checks without this automatic minimum.
+
 Add `--switch EXAMPLE-SWITCH` to consider only one switch. Healthy switches do
 not contact OPNsense or perform renewal. Per-switch credential, monitoring, or
 renewal failures are reported and do not prevent later switches from being
@@ -742,7 +778,11 @@ processed; any such error makes the command exit with code 2.
 
 If a pending Web CSR already exists, both renewal modes fail closed without
 resuming, replacing, or clearing it. Use the staged commands to inspect and
-recover the pending state.
+recover the pending state. `--generate-csr`, `--sign-csr`, and
+`--install-certificate` use the same per-switch lock for their individual
+invocations. Separate staged commands do not share a continuous lock; each
+revalidates switch state. The tool performs no automatic cleanup, retry, or
+rollback.
 
 ### Generate a CSR
 
