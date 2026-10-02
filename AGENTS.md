@@ -114,6 +114,11 @@ Preserve validation of the relevant:
 * Certificate signature strength.
 * Relationship between the issued certificate and pending CSR.
 
+Issued leaves must match the configured SANs, exact KU/EKU profile, configured
+digest/signature OID, and exact lifetime. Issuance freshness applies after
+signing; staged manual installation rechecks current validity without the
+five-minute issuance-age requirement.
+
 Legacy RSA/SHA-1 may be accepted only where already documented for verifying the
 proof-of-possession signature of ArubaOS-Switch WC.16.11 CSRs. Do not extend
 that exception to issued HTTPS certificates.

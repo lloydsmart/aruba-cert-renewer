@@ -843,12 +843,20 @@ This operation:
 3. Resolves the configured OPNsense CA description.
 4. Requests a server certificate with exactly the configured DNS and IP SANs.
 5. Retrieves only the public certificate.
-6. Validates the key, subject, CN, SANs, Basic Constraints, serverAuth EKU,
-   validity period, signature strength, and RSA key size.
+6. Validates the key, exact subject/CN and configured DNS/IP SAN identities,
+   Basic Constraints (CA=false), the exact serverAuth plus
+   `1.3.6.1.5.5.8.2.2` EKU profile, Key Usage, exact requested lifetime,
+   requested SHA-256/384/512 digest and supported signature OID, issuance
+   freshness, and RSA key size.
 7. Exclusively creates `--certificate-output` only after validation succeeds.
 
 The command refuses to overwrite an existing output file. It does not install,
 activate, or save the certificate on the Aruba switch.
+
+The issued leaf must start within the preceding five minutes and may not be
+future-dated when retrieved after signing. A later staged installation repeats
+the static policy and current-validity checks against the pending CSR and
+configured CA, without imposing the issuance-freshness window again.
 
 ### Install an Issued Certificate
 

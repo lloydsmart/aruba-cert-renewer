@@ -1103,14 +1103,67 @@ def _public_key_bytes(public_key):
     )
 
 
+ISSUED_SIGNATURE_OIDS = {
+    "sha256": frozenset(
+        (SignatureAlgorithmOID.RSA_WITH_SHA256, SignatureAlgorithmOID.ECDSA_WITH_SHA256)
+    ),
+    "sha384": frozenset(
+        (SignatureAlgorithmOID.RSA_WITH_SHA384, SignatureAlgorithmOID.ECDSA_WITH_SHA384)
+    ),
+    "sha512": frozenset(
+        (SignatureAlgorithmOID.RSA_WITH_SHA512, SignatureAlgorithmOID.ECDSA_WITH_SHA512)
+    ),
+}
+ISSUED_EKU_OIDS = (
+    ExtendedKeyUsageOID.SERVER_AUTH,
+    x509.ObjectIdentifier("1.3.6.1.5.5.8.2.2"),
+)
+ISSUANCE_FRESHNESS_WINDOW = timedelta(minutes=5)
+
+
+def _validate_issued_signature(certificate, digest):
+    allowed_oids = ISSUED_SIGNATURE_OIDS.get(digest)
+    if allowed_oids is None:
+        raise ValueError("Configured issued certificate digest is unsupported")
+
+    try:
+        signature_hash = certificate.signature_hash_algorithm
+    except UnsupportedAlgorithm as error:
+        raise ValueError(
+            "Issued certificate signature hash algorithm is unsupported"
+        ) from error
+
+    if (
+        signature_hash is None
+        or signature_hash.name != digest
+        or certificate.signature_algorithm_oid not in allowed_oids
+    ):
+        raise ValueError("Issued certificate signature does not match opnsense.digest")
+
+
+def _require_current_certificate_validity(certificate, now, minimum_remaining_days):
+    if certificate.not_valid_before_utc > now:
+        raise ValueError("Issued certificate is not yet valid")
+    if certificate.not_valid_after_utc <= now:
+        raise ValueError("Issued certificate has expired")
+    if minimum_remaining_days is not None and certificate.not_valid_after_utc <= (
+        now + timedelta(days=minimum_remaining_days)
+    ):
+        raise ValueError(
+            "Issued certificate does not have enough remaining validity "
+            "to leave the renewal warning window"
+        )
+
+
 def validate_issued_certificate(
     certificate_pem,
     csr,
     switch,
     lifetime_days,
     *,
+    digest,
     now=None,
-    clock_skew=timedelta(minutes=5),
+    require_fresh_issuance=False,
     minimum_remaining_days=None,
 ):
     try:
@@ -1164,7 +1217,7 @@ def validate_issued_certificate(
         raise ValueError("Issued certificate SAN contains an unsupported identity type")
     expected_dns = {name.casefold() for name in identities["dns_names"]}
     actual_dns = {name.casefold() for name in dns_names}
-    if actual_dns != expected_dns:
+    if len(dns_names) != len(expected_dns) or actual_dns != expected_dns:
         raise ValueError(
             "Issued certificate DNS SAN set does not exactly match configured "
             "identities"
@@ -1173,7 +1226,7 @@ def validate_issued_certificate(
     expected_ips = {
         ipaddress.ip_address(address) for address in identities["ip_addresses"]
     }
-    if set(ip_addresses) != expected_ips:
+    if len(ip_addresses) != len(expected_ips) or set(ip_addresses) != expected_ips:
         raise ValueError(
             "Issued certificate IP SAN set does not exactly match configured identities"
         )
@@ -1191,10 +1244,25 @@ def validate_issued_certificate(
         ExtensionOID.EXTENDED_KEY_USAGE,
         "Extended Key Usage",
     )
-    if ExtendedKeyUsageOID.SERVER_AUTH not in extended_key_usage:
+    if len(extended_key_usage) != len(ISSUED_EKU_OIDS) or set(
+        extended_key_usage
+    ) != set(ISSUED_EKU_OIDS):
         raise ValueError(
-            "Issued certificate Extended Key Usage must contain serverAuth"
+            "Issued certificate Extended Key Usage must contain exactly "
+            "serverAuth and 1.3.6.1.5.5.8.2.2"
         )
+
+    key_usage = _require_extension(certificate, ExtensionOID.KEY_USAGE, "Key Usage")
+    if not (
+        key_usage.digital_signature
+        and key_usage.key_encipherment
+        and not key_usage.content_commitment
+        and not key_usage.data_encipherment
+        and not key_usage.key_agreement
+        and not key_usage.key_cert_sign
+        and not key_usage.crl_sign
+    ):
+        raise ValueError("Issued certificate Key Usage does not match server policy")
 
     not_before = certificate.not_valid_before_utc
     not_after = certificate.not_valid_after_utc
@@ -1206,44 +1274,22 @@ def validate_issued_certificate(
     elif now.tzinfo is None:
         raise ValueError("Certificate validation time must be timezone-aware")
 
-    if not_before > now + clock_skew:
-        raise ValueError("Issued certificate is not yet valid")
+    _require_current_certificate_validity(certificate, now, minimum_remaining_days)
 
-    if not_after <= now:
-        raise ValueError("Issued certificate has expired")
-
-    if minimum_remaining_days is not None and not_after <= now + timedelta(
-        days=minimum_remaining_days
-    ):
+    if require_fresh_issuance and not_before < now - ISSUANCE_FRESHNESS_WINDOW:
         raise ValueError(
-            "Issued certificate does not have enough remaining validity "
-            "to leave the renewal warning window"
+            "Issued certificate is older than the issuance freshness window"
         )
 
     actual_lifetime = not_after - not_before
     expected_lifetime = timedelta(days=lifetime_days)
-    lifetime_tolerance = timedelta(days=1)
-    if not (
-        expected_lifetime - lifetime_tolerance
-        <= actual_lifetime
-        <= expected_lifetime + lifetime_tolerance
-    ):
+    if actual_lifetime != expected_lifetime:
         raise ValueError(
             "Issued certificate validity period is inconsistent with "
             "opnsense.lifetime_days"
         )
 
-    try:
-        signature_hash = certificate.signature_hash_algorithm
-    except UnsupportedAlgorithm as error:
-        raise ValueError(
-            "Issued certificate signature hash algorithm is unsupported"
-        ) from error
-
-    if signature_hash is None or signature_hash.digest_size < 32:
-        raise ValueError(
-            "Issued certificate signature hash must be SHA-256 or stronger"
-        )
+    _validate_issued_signature(certificate, digest)
 
     return certificate
 
@@ -1399,6 +1445,8 @@ def sign_pending_csr(
         csr,
         switch,
         opnsense_settings["lifetime_days"],
+        digest=opnsense_settings["digest"],
+        require_fresh_issuance=True,
         minimum_remaining_days=minimum_remaining_days,
     )
     return certificate_pem
@@ -1577,6 +1625,7 @@ def renew_certificate(
             csr_settings,
             opnsense_settings["lifetime_days"],
             verification_ca_file,
+            digest=opnsense_settings["digest"],
             minimum_remaining_days=minimum_remaining_days,
         )
     except CertificateInstallationAttemptError:
@@ -1942,6 +1991,7 @@ def install_pending_certificate(
     lifetime_days,
     verification_ca_file,
     *,
+    digest,
     minimum_remaining_days=None,
 ):
     certificate_name = validate_cli_identifier(
@@ -1974,12 +2024,16 @@ def install_pending_certificate(
                 csr,
                 switch,
                 lifetime_days,
+                digest=digest,
                 minimum_remaining_days=minimum_remaining_days,
             )
             verify_issued_certificate_trust(
                 certificate,
                 switch,
                 verification_ca_file,
+            )
+            _require_current_certificate_validity(
+                certificate, datetime.now(UTC), minimum_remaining_days
             )
 
             install_signed_certificate(
@@ -2436,6 +2490,7 @@ def run_explicit_operation(
                 csr_settings,
                 opnsense_settings["lifetime_days"],
                 verification_ca_file,
+                digest=opnsense_settings["digest"],
             )
 
         except CertificateInstallationAttemptError as error:
