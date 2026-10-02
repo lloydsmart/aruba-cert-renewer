@@ -81,6 +81,15 @@ operations retain their existing validity checks. Existing switch-state
 rechecks and conservative manual recovery remain authoritative; the lock adds
 no cleanup, retry, deletion, or rollback.
 
+Issued leaves must exactly match configured DNS/IP SAN identities without
+duplicates or other GeneralName types, carry the two observed EKU OIDs and
+exact server Key Usage, set Basic Constraints CA=false, and use the configured
+SHA-256/384/512 digest with a supported RSA PKCS#1 v1.5 or ECDSA signature OID.
+The lifetime must equal `opnsense.lifetime_days` exactly. Signing requires a
+notBefore within the preceding five minutes and no future notBefore; manual
+installation revalidates static policy, current validity, and CA/host trust but
+does not reject an otherwise valid leaf for age alone.
+
 ## Local Security-Sensitive File Integrity
 
 The application validates `config.toml`, the dedicated SSH `known_hosts` file,

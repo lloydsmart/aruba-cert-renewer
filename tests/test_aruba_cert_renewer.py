@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec, rsa
+from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
 from cryptography.utils import CryptographyDeprecationWarning
 from cryptography.x509.oid import (
     ExtendedKeyUsageOID,
@@ -30,6 +30,7 @@ from secure_file import SecureFileError
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 KNOWN_HOSTS_FILE = FIXTURES_DIR / "known_hosts"
+OBSERVED_EKU_OID = x509.ObjectIdentifier("1.3.6.1.5.5.8.2.2")
 
 
 def fail_next_lock_close(patch):
@@ -882,6 +883,7 @@ def test_every_aruba_connection_path_uses_common_device_parameters(
                 make_csr_settings(),
                 397,
                 Path("public-ca.pem"),
+                digest="sha256",
             )
 
     assert calls == [(switch, "username", "password")]
@@ -2400,15 +2402,20 @@ def make_opnsense_settings():
 def make_test_identity_and_certificate(
     *,
     common_name="switch.example.com",
+    certificate_organization="Example Organization",
     dns_names=("switch.example.com",),
     ip_addresses=("192.0.2.10",),
     ca=False,
-    eku=(ExtendedKeyUsageOID.SERVER_AUTH,),
+    eku=(ExtendedKeyUsageOID.SERVER_AUTH, OBSERVED_EKU_OID),
+    key_usage=None,
+    additional_general_names=(),
+    extra_extensions=(),
     certificate_key_matches=True,
     not_before=None,
     not_after=None,
     lifetime_days=397,
     signature_hash=None,
+    signature_padding=None,
     authority_cert_serial_number=None,
     issuer_certificate=None,
     issuer_signing_key=None,
@@ -2439,7 +2446,8 @@ def make_test_identity_and_certificate(
     certificate_subject = x509.Name(
         [
             x509.NameAttribute(NameOID.COMMON_NAME, common_name),
-            *list(csr_subject)[1:],
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME, certificate_organization),
+            *list(csr_subject)[2:],
         ]
     )
     certificate_key = csr_key
@@ -2473,6 +2481,7 @@ def make_test_identity_and_certificate(
                         x509.IPAddress(ipaddress.ip_address(address))
                         for address in ip_addresses
                     ],
+                    *additional_general_names,
                 ]
             ),
             critical=False,
@@ -2484,6 +2493,25 @@ def make_test_identity_and_certificate(
         )
     if eku is not None:
         builder = builder.add_extension(x509.ExtendedKeyUsage(eku), critical=False)
+
+    if key_usage is not False:
+        usage = {
+            "digital_signature": True,
+            "content_commitment": False,
+            "key_encipherment": True,
+            "data_encipherment": False,
+            "key_agreement": False,
+            "key_cert_sign": False,
+            "crl_sign": False,
+            "encipher_only": False,
+            "decipher_only": False,
+        }
+        if key_usage is not None:
+            usage.update(key_usage)
+        builder = builder.add_extension(x509.KeyUsage(**usage), critical=False)
+
+    for extension, critical in extra_extensions:
+        builder = builder.add_extension(extension, critical=critical)
 
     if issuer_certificate is not None:
         builder = builder.add_extension(
@@ -2506,7 +2534,10 @@ def make_test_identity_and_certificate(
             critical=False,
         )
 
-    certificate = builder.sign(signing_key, signature_hash)
+    sign_options = {}
+    if signature_padding is not None:
+        sign_options["rsa_padding"] = signature_padding
+    certificate = builder.sign(signing_key, signature_hash, **sign_options)
     return (
         csr.public_bytes(serialization.Encoding.PEM).decode("ascii"),
         csr,
@@ -2514,8 +2545,11 @@ def make_test_identity_and_certificate(
     )
 
 
-def make_test_ca(common_name):
-    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+def make_test_ca(common_name, *, key_type="rsa"):
+    if key_type == "ec":
+        key = ec.generate_private_key(ec.SECP256R1())
+    else:
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common_name)])
     now = datetime.now(UTC)
     certificate = (
@@ -2578,6 +2612,7 @@ def test_verify_issued_certificate_trust_accepts_complete_ca_bundle(tmp_path):
         csr,
         switch,
         397,
+        digest="sha256",
     )
     ca_file = write_test_ca_bundle(
         tmp_path / "ca-bundle.pem",
@@ -2604,6 +2639,7 @@ def test_verify_issued_certificate_trust_accepts_ip_host_identity(tmp_path):
         csr,
         switch,
         397,
+        digest="sha256",
     )
     ca_file = write_test_ca_bundle(tmp_path / "ca.pem", trusted_ca)
 
@@ -2710,6 +2746,7 @@ def test_validate_issued_certificate():
         make_config()["switches"][0],
         397,
         now=datetime(2026, 1, 1, tzinfo=UTC),
+        digest="sha256",
     )
 
     assert certificate.public_key().key_size == 2048
@@ -2752,6 +2789,7 @@ def test_validate_issued_certificate_accepts_exact_configured_identity_sets(
         switch,
         397,
         now=datetime(2026, 1, 1, tzinfo=UTC),
+        digest="sha256",
     )
 
 
@@ -2777,6 +2815,7 @@ def test_validate_issued_certificate_rejects_unexpected_sans(
             make_config()["switches"][0],
             397,
             now=datetime(2026, 1, 1, tzinfo=UTC),
+            digest="sha256",
         )
 
 
@@ -2803,6 +2842,7 @@ def test_validate_issued_certificate_contains_zero_aki_serial_warning():
             make_config()["switches"][0],
             397,
             now=datetime(2026, 1, 1, tzinfo=UTC),
+            digest="sha256",
         )
         authority_key_identifier = checker._require_extension(
             certificate,
@@ -2825,6 +2865,7 @@ def test_validate_issued_certificate_rejects_public_key_mismatch():
             make_config()["switches"][0],
             397,
             now=datetime(2026, 1, 1, tzinfo=UTC),
+            digest="sha256",
         )
 
 
@@ -2839,6 +2880,22 @@ def test_validate_issued_certificate_rejects_incorrect_cn():
             csr,
             make_config()["switches"][0],
             397,
+            now=datetime(2026, 1, 1, tzinfo=UTC),
+            digest="sha256",
+        )
+
+
+def test_validate_issued_certificate_rejects_incorrect_subject():
+    _, csr, certificate_pem = make_test_identity_and_certificate(
+        certificate_organization="Wrong Organization"
+    )
+    with pytest.raises(ValueError, match="subject does not match the CSR"):
+        checker.validate_issued_certificate(
+            certificate_pem,
+            csr,
+            make_config()["switches"][0],
+            397,
+            digest="sha256",
             now=datetime(2026, 1, 1, tzinfo=UTC),
         )
 
@@ -2864,6 +2921,7 @@ def test_validate_issued_certificate_rejects_required_extension_errors(kwargs, m
             make_config()["switches"][0],
             397,
             now=datetime(2026, 1, 1, tzinfo=UTC),
+            digest="sha256",
         )
 
 
@@ -2902,6 +2960,7 @@ def test_validate_issued_certificate_rejects_invalid_validity(
             make_config()["switches"][0],
             397,
             now=datetime(2026, 1, 1, tzinfo=UTC),
+            digest="sha256",
         )
 
 
@@ -2915,32 +2974,333 @@ def test_validate_issued_certificate_rejects_malformed_pem():
             make_config()["switches"][0],
             397,
             now=datetime(2026, 1, 1, tzinfo=UTC),
+            digest="sha256",
         )
 
 
 def test_validate_issued_certificate_rejects_sha1_signature():
-    csr_pem = (FIXTURES_DIR / "rsa_sha1_certificate_csr.pem").read_text(
-        encoding="ascii"
-    )
     certificate_pem = (FIXTURES_DIR / "rsa_sha1_certificate.pem").read_text(
         encoding="ascii"
-    )
-    csr = checker.validate_csr_pem(
-        csr_pem,
-        make_config()["switches"][0],
-        make_csr_settings(),
     )
     certificate = x509.load_pem_x509_certificate(certificate_pem.encode("ascii"))
 
     assert certificate.signature_hash_algorithm.name == "sha1"
-    with pytest.raises(ValueError, match="SHA-256 or stronger"):
+    with pytest.raises(ValueError, match="signature does not match opnsense.digest"):
+        checker._validate_issued_signature(certificate, "sha256")
+
+
+@pytest.mark.parametrize(
+    ("dns_names", "ip_addresses", "additional_general_names", "message"),
+    [
+        (("switch.example.com", "SWITCH.EXAMPLE.COM"), ("192.0.2.10",), (), "DNS SAN"),
+        (("switch.example.com",), ("192.0.2.10", "192.0.2.10"), (), "IP SAN"),
+        (
+            ("switch.example.com",),
+            ("192.0.2.10",),
+            (x509.RFC822Name("user@example.com"),),
+            "unsupported identity type",
+        ),
+    ],
+)
+def test_issued_certificate_rejects_duplicate_or_unsupported_san(
+    dns_names, ip_addresses, additional_general_names, message
+):
+    _, csr, certificate_pem = make_test_identity_and_certificate(
+        dns_names=dns_names,
+        ip_addresses=ip_addresses,
+        additional_general_names=additional_general_names,
+    )
+    with pytest.raises(ValueError, match=message):
         checker.validate_issued_certificate(
             certificate_pem,
             csr,
             make_config()["switches"][0],
             397,
-            now=certificate.not_valid_before_utc + timedelta(minutes=1),
+            digest="sha256",
+            now=datetime(2026, 1, 1, tzinfo=UTC),
         )
+
+
+@pytest.mark.parametrize(
+    "eku",
+    [
+        (ExtendedKeyUsageOID.SERVER_AUTH,),
+        (x509.ObjectIdentifier("1.3.6.1.5.5.8.2.2"),),
+        (
+            ExtendedKeyUsageOID.SERVER_AUTH,
+            x509.ObjectIdentifier("1.3.6.1.5.5.8.2.2"),
+            ExtendedKeyUsageOID.CLIENT_AUTH,
+        ),
+        (ExtendedKeyUsageOID.SERVER_AUTH, ExtendedKeyUsageOID.ANY_EXTENDED_KEY_USAGE),
+        (
+            ExtendedKeyUsageOID.SERVER_AUTH,
+            ExtendedKeyUsageOID.SERVER_AUTH,
+            x509.ObjectIdentifier("1.3.6.1.5.5.8.2.2"),
+        ),
+    ],
+)
+def test_issued_certificate_rejects_nonexact_eku(eku):
+    _, csr, certificate_pem = make_test_identity_and_certificate(eku=eku)
+    with pytest.raises(ValueError, match="Extended Key Usage must contain exactly"):
+        checker.validate_issued_certificate(
+            certificate_pem,
+            csr,
+            make_config()["switches"][0],
+            397,
+            digest="sha256",
+            now=datetime(2026, 1, 1, tzinfo=UTC),
+        )
+
+
+@pytest.mark.parametrize(
+    "key_usage",
+    [
+        False,
+        {"digital_signature": False},
+        {"key_encipherment": False},
+        {"content_commitment": True},
+        {"data_encipherment": True},
+        {"key_agreement": True},
+        {"key_cert_sign": True},
+        {"crl_sign": True},
+    ],
+)
+def test_issued_certificate_rejects_nonexact_key_usage(key_usage):
+    _, csr, certificate_pem = make_test_identity_and_certificate(key_usage=key_usage)
+    with pytest.raises(ValueError, match="Key Usage"):
+        checker.validate_issued_certificate(
+            certificate_pem,
+            csr,
+            make_config()["switches"][0],
+            397,
+            digest="sha256",
+            now=datetime(2026, 1, 1, tzinfo=UTC),
+        )
+
+
+@pytest.mark.parametrize(
+    ("digest", "hash_algorithm", "issuer_key_type"),
+    [
+        ("sha256", hashes.SHA256(), "rsa"),
+        ("sha256", hashes.SHA256(), "ec"),
+        ("sha384", hashes.SHA384(), "rsa"),
+        ("sha384", hashes.SHA384(), "ec"),
+        ("sha512", hashes.SHA512(), "rsa"),
+        ("sha512", hashes.SHA512(), "ec"),
+    ],
+)
+def test_issued_signature_accepts_configured_digest_and_issuer_family(
+    tmp_path, digest, hash_algorithm, issuer_key_type
+):
+    issuer_key, issuer_certificate = make_test_ca(
+        "Synthetic Issuer", key_type=issuer_key_type
+    )
+    _, csr, certificate_pem = make_test_identity_and_certificate(
+        not_before=datetime.now(UTC) - timedelta(minutes=1),
+        issuer_certificate=issuer_certificate,
+        issuer_signing_key=issuer_key,
+        signature_hash=hash_algorithm,
+    )
+    certificate = checker.validate_issued_certificate(
+        certificate_pem,
+        csr,
+        make_config()["switches"][0],
+        397,
+        digest=digest,
+        require_fresh_issuance=True,
+    )
+    ca_file = write_test_ca_bundle(tmp_path / "issuer.pem", issuer_certificate)
+    checker.verify_issued_certificate_trust(
+        certificate, make_config()["switches"][0], ca_file
+    )
+
+
+@pytest.mark.parametrize(
+    ("configured_digest", "signature_hash"),
+    [
+        ("sha256", hashes.SHA384()),
+        ("sha256", hashes.SHA3_256()),
+        ("sha384", hashes.SHA512()),
+    ],
+)
+def test_issued_signature_rejects_unrequested_hash(configured_digest, signature_hash):
+    _, csr, certificate_pem = make_test_identity_and_certificate(
+        signature_hash=signature_hash
+    )
+    with pytest.raises(ValueError, match="signature does not match opnsense.digest"):
+        checker.validate_issued_certificate(
+            certificate_pem,
+            csr,
+            make_config()["switches"][0],
+            397,
+            digest=configured_digest,
+            now=datetime(2026, 1, 1, tzinfo=UTC),
+        )
+
+
+def test_issued_signature_rejects_rsa_pss():
+    _, csr, certificate_pem = make_test_identity_and_certificate(
+        signature_padding=padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=32)
+    )
+    with pytest.raises(ValueError, match="signature does not match opnsense.digest"):
+        checker.validate_issued_certificate(
+            certificate_pem,
+            csr,
+            make_config()["switches"][0],
+            397,
+            digest="sha256",
+            now=datetime(2026, 1, 1, tzinfo=UTC),
+        )
+
+
+@pytest.mark.parametrize(
+    "signature_oid",
+    [x509.ObjectIdentifier("1.2.3.4"), checker.SignatureAlgorithmOID.RSA_WITH_SHA384],
+)
+def test_issued_signature_rejects_unknown_or_mismatched_oid(signature_oid):
+    certificate = SimpleNamespace(
+        signature_hash_algorithm=hashes.SHA256(),
+        signature_algorithm_oid=signature_oid,
+    )
+    with pytest.raises(ValueError, match="signature does not match opnsense.digest"):
+        checker._validate_issued_signature(certificate, "sha256")
+
+
+@pytest.mark.parametrize(
+    ("lifetime_adjustment", "accepted"),
+    [(0, True), (-1, False), (1, False)],
+)
+def test_issued_certificate_requires_exact_lifetime_seconds(
+    lifetime_adjustment, accepted
+):
+    not_before = datetime(2026, 1, 1, tzinfo=UTC)
+    _, csr, certificate_pem = make_test_identity_and_certificate(
+        not_before=not_before,
+        not_after=not_before + timedelta(days=397, seconds=lifetime_adjustment),
+    )
+    if accepted:
+        checker.validate_issued_certificate(
+            certificate_pem,
+            csr,
+            make_config()["switches"][0],
+            397,
+            digest="sha256",
+            now=not_before,
+        )
+    else:
+        with pytest.raises(ValueError, match="opnsense.lifetime_days"):
+            checker.validate_issued_certificate(
+                certificate_pem,
+                csr,
+                make_config()["switches"][0],
+                397,
+                digest="sha256",
+                now=not_before,
+            )
+
+
+@pytest.mark.parametrize(
+    ("offset_seconds", "accepted"),
+    [(-301, False), (-300, True), (0, True), (1, False)],
+)
+def test_issued_certificate_freshness_boundary(offset_seconds, accepted):
+    reference = datetime(2026, 1, 1, tzinfo=UTC)
+    _, csr, certificate_pem = make_test_identity_and_certificate(
+        not_before=reference + timedelta(seconds=offset_seconds)
+    )
+    if accepted:
+        checker.validate_issued_certificate(
+            certificate_pem,
+            csr,
+            make_config()["switches"][0],
+            397,
+            digest="sha256",
+            now=reference,
+            require_fresh_issuance=True,
+        )
+    else:
+        with pytest.raises(ValueError, match="freshness window|not yet valid"):
+            checker.validate_issued_certificate(
+                certificate_pem,
+                csr,
+                make_config()["switches"][0],
+                397,
+                digest="sha256",
+                now=reference,
+                require_fresh_issuance=True,
+            )
+
+
+def test_issued_certificate_uses_one_freshness_reference(monkeypatch):
+    reference = datetime(2026, 1, 1, tzinfo=UTC)
+    _, csr, certificate_pem = make_test_identity_and_certificate(
+        not_before=reference - timedelta(minutes=5)
+    )
+
+    class CountingClock(datetime):
+        calls = 0
+
+        @classmethod
+        def now(cls, tz=None):
+            assert tz is UTC
+            cls.calls += 1
+            return reference
+
+    monkeypatch.setattr(checker, "datetime", CountingClock)
+    checker.validate_issued_certificate(
+        certificate_pem,
+        csr,
+        make_config()["switches"][0],
+        397,
+        digest="sha256",
+        require_fresh_issuance=True,
+    )
+    assert CountingClock.calls == 1
+
+
+def test_issued_certificate_rejects_expiry_at_current_time():
+    reference = datetime(2026, 1, 1, tzinfo=UTC)
+    _, csr, certificate_pem = make_test_identity_and_certificate(
+        not_before=reference - timedelta(days=397), not_after=reference
+    )
+    with pytest.raises(ValueError, match="expired"):
+        checker.validate_issued_certificate(
+            certificate_pem,
+            csr,
+            make_config()["switches"][0],
+            397,
+            digest="sha256",
+            now=reference,
+        )
+
+
+def test_issued_certificate_allows_noncritical_opnsense_extensions():
+    extras = (
+        (x509.SubjectKeyIdentifier(b"synthetic-key-id"), False),
+        (
+            x509.UnrecognizedExtension(
+                x509.ObjectIdentifier("2.16.840.1.113730.1.1"), b"\x03\x02\x00\x40"
+            ),
+            False,
+        ),
+        (
+            x509.UnrecognizedExtension(
+                x509.ObjectIdentifier("2.16.840.1.113730.1.13"), b"\x16\x04test"
+            ),
+            False,
+        ),
+    )
+    _, csr, certificate_pem = make_test_identity_and_certificate(
+        extra_extensions=extras
+    )
+    checker.validate_issued_certificate(
+        certificate_pem,
+        csr,
+        make_config()["switches"][0],
+        397,
+        digest="sha256",
+        now=datetime(2026, 1, 1, tzinfo=UTC),
+    )
 
 
 @pytest.mark.parametrize(
@@ -3109,6 +3469,62 @@ def test_sign_csr_does_not_write_output_when_validation_fails(monkeypatch, tmp_p
         lambda *args, **kwargs: (_ for _ in ()).throw(
             ValueError("issued certificate validation failed")
         ),
+    )
+
+    assert checker.main() == checker.EXIT_ERROR
+    assert not output_file.exists()
+
+
+@pytest.mark.parametrize("failure", ["eku", "freshness"])
+def test_sign_csr_nonconforming_leaf_is_rejected_before_output(
+    monkeypatch, tmp_path, failure
+):
+    config_file = tmp_path / "config.toml"
+    output_file = tmp_path / "certificate.pem"
+    config_file.write_text(signing_config_text(), encoding="utf-8")
+    certificate_kwargs = {"not_before": datetime.now(UTC) - timedelta(minutes=1)}
+    if failure == "eku":
+        certificate_kwargs["eku"] = (ExtendedKeyUsageOID.SERVER_AUTH,)
+    else:
+        certificate_kwargs["not_before"] = datetime.now(UTC) - timedelta(minutes=6)
+    csr_pem, _, certificate_pem = make_test_identity_and_certificate(
+        **certificate_kwargs
+    )
+
+    class FakeOPNsenseClient:
+        def __init__(self, base_url):
+            pass
+
+        def resolve_ca(self, description):
+            return "synthetic-ca-ref"
+
+        def sign_csr(self, supplied_csr, **kwargs):
+            assert supplied_csr == csr_pem
+            return "12345678-1234-4234-9234-123456789abc"
+
+        def get_certificate(self, certificate_uuid):
+            return certificate_pem
+
+    monkeypatch.setattr(checker, "OPNsenseClient", FakeOPNsenseClient)
+    monkeypatch.setattr(checker, "retrieve_csr", lambda *args: csr_pem)
+    monkeypatch.setattr(
+        checker, "get_switch_credentials", lambda *args: ("username", "password")
+    )
+    monkeypatch.setattr(
+        checker.sys,
+        "argv",
+        [
+            "aruba_cert_renewer.py",
+            "--config",
+            str(config_file),
+            "--sign-csr",
+            "--switch",
+            "EXAMPLE-SWITCH",
+            "--certificate-name",
+            "webcert2027",
+            "--certificate-output",
+            str(output_file),
+        ],
     )
 
     assert checker.main() == checker.EXIT_ERROR
@@ -3474,6 +3890,7 @@ def test_wrong_ca_fails_before_any_installation_command(monkeypatch, tmp_path):
         csr,
         switch,
         397,
+        digest="sha256",
     )
     assert certificate.issuer == unexpected_ca.subject
     assert checker._public_key_bytes(
@@ -3494,6 +3911,7 @@ def test_wrong_ca_fails_before_any_installation_command(monkeypatch, tmp_path):
             make_csr_settings(),
             397,
             ca_file,
+            digest="sha256",
         )
 
     assert not connection.entered_config_mode
@@ -3516,6 +3934,7 @@ def test_invalid_signature_with_trusted_issuer_name_fails_before_installation(
         csr,
         switch,
         397,
+        digest="sha256",
     )
     assert certificate.issuer == trusted_ca.subject
 
@@ -3533,6 +3952,7 @@ def test_invalid_signature_with_trusted_issuer_name_fails_before_installation(
             make_csr_settings(),
             397,
             ca_file,
+            digest="sha256",
         )
 
     assert not connection.entered_config_mode
@@ -3573,6 +3993,7 @@ def test_install_pending_certificate_accepts_real_detail_shape_and_uses_guarded_
         make_csr_settings(),
         397,
         Path("public-ca.pem"),
+        digest="sha256",
     )
 
     assert connection.entered_config_mode
@@ -3617,7 +4038,7 @@ def test_install_pending_certificate_accepts_real_detail_shape_and_uses_guarded_
 
 
 def prepare_explicit_install(
-    monkeypatch, tmp_path, live_verifier, *, trusted_issuer=True
+    monkeypatch, tmp_path, live_verifier, *, trusted_issuer=True, not_before=None
 ):
     trusted_key, trusted_ca = make_test_ca("Trusted Test CA")
     issuer_key = trusted_key
@@ -3625,7 +4046,7 @@ def prepare_explicit_install(
     if not trusted_issuer:
         issuer_key, issuer_certificate = make_test_ca("Unexpected Test CA")
     csr_pem, _, certificate_pem = make_test_identity_and_certificate(
-        not_before=datetime.now(UTC) - timedelta(minutes=1),
+        not_before=not_before or datetime.now(UTC) - timedelta(minutes=1),
         issuer_certificate=issuer_certificate,
         issuer_signing_key=issuer_key,
     )
@@ -3677,6 +4098,19 @@ def test_explicit_install_trust_success_still_invokes_live_https(monkeypatch, tm
     assert "crypto pki install-signed-certificate" in connection.commands
     assert len(live_calls) == 1
     assert live_calls[0][0:2] == (make_config()["switches"][0], ca_file)
+
+
+def test_staged_install_accepts_old_valid_leaf(monkeypatch, tmp_path):
+    live_calls = []
+    connection, _ = prepare_explicit_install(
+        monkeypatch,
+        tmp_path,
+        lambda *args: live_calls.append(args),
+        not_before=datetime.now(UTC) - timedelta(days=1),
+    )
+    assert checker.main() == checker.EXIT_OK
+    assert connection.entered_config_mode
+    assert len(live_calls) == 1
 
 
 def test_explicit_install_live_https_failure_remains_post_install(
@@ -3801,6 +4235,7 @@ def test_bad_paste_prompt_never_sends_certificate(
             make_csr_settings(),
             397,
             Path("public-ca.pem"),
+            digest="sha256",
         )
 
     assert connection.exited_config_mode
@@ -3842,6 +4277,7 @@ def test_bad_replacement_prompt_never_sends_confirmation(
             make_csr_settings(),
             397,
             Path("public-ca.pem"),
+            digest="sha256",
         )
 
     assert connection.exited_config_mode
@@ -3856,6 +4292,10 @@ def test_bad_replacement_prompt_never_sends_confirmation(
         {"certificate_key_matches": False},
         {"common_name": "wrong.example.com"},
         {"dns_names": ()},
+        {"eku": (ExtendedKeyUsageOID.SERVER_AUTH,)},
+        {"key_usage": {"digital_signature": False}},
+        {"signature_hash": hashes.SHA384()},
+        {"lifetime_days": 398},
     ],
 )
 def test_certificate_validation_failure_sends_no_configuration_command(
@@ -3878,6 +4318,7 @@ def test_certificate_validation_failure_sends_no_configuration_command(
             make_csr_settings(),
             397,
             Path("public-ca.pem"),
+            digest="sha256",
         )
 
     assert not connection.entered_config_mode
@@ -3902,6 +4343,7 @@ def test_installed_certificate_name_is_rejected_before_config_mode(monkeypatch):
             make_csr_settings(),
             397,
             Path("public-ca.pem"),
+            digest="sha256",
         )
 
     assert not connection.entered_config_mode
@@ -3934,6 +4376,7 @@ def test_post_install_summary_must_show_installed_web_certificate(
             make_csr_settings(),
             397,
             Path("public-ca.pem"),
+            digest="sha256",
         )
 
 
@@ -3966,6 +4409,7 @@ def test_post_install_detail_rejects_cli_errors_or_missing_success_marker(
             make_csr_settings(),
             397,
             Path("public-ca.pem"),
+            digest="sha256",
         )
 
 
@@ -3996,6 +4440,7 @@ def test_context_exit_error_after_install_is_post_install_failure(
             make_csr_settings(),
             397,
             Path("public-ca.pem"),
+            digest="sha256",
         )
 
     assert "may already have changed the switch" in str(raised.value)
@@ -4074,6 +4519,7 @@ def test_pre_install_valueerror_and_oserror_remain_safe(monkeypatch, pre_install
             make_csr_settings(),
             397,
             Path("public-ca.pem"),
+            digest="sha256",
         )
 
     assert not isinstance(raised.value, checker.CertificateInstallationAttemptError)
@@ -5736,13 +6182,18 @@ def test_issued_certificate_requires_strict_remaining_window(
     args = (certificate_pem, csr, make_config()["switches"][0], 397)
 
     if accepted:
-        checker.validate_issued_certificate(*args, now=now, minimum_remaining_days=30)
+        checker.validate_issued_certificate(
+            *args, now=now, minimum_remaining_days=30, digest="sha256"
+        )
     else:
         with pytest.raises(ValueError, match="remaining validity"):
             checker.validate_issued_certificate(
-                *args, now=now, minimum_remaining_days=30
+                *args,
+                now=now,
+                minimum_remaining_days=30,
+                digest="sha256",
             )
-        checker.validate_issued_certificate(*args, now=now)
+        checker.validate_issued_certificate(*args, now=now, digest="sha256")
 
 
 def test_automatic_short_lived_certificate_never_reaches_install(monkeypatch):
@@ -5770,6 +6221,7 @@ def test_automatic_short_lived_certificate_never_reaches_install(monkeypatch):
             397,
             now=now,
             minimum_remaining_days=kwargs["minimum_remaining_days"],
+            digest="sha256",
         )
         return certificate_pem
 
@@ -5828,7 +6280,7 @@ def test_automatic_minimum_reaches_signing_and_preinstallation(monkeypatch):
     )
     assert stages == [
         ("sign", {"minimum_remaining_days": 30}),
-        ("install", {"minimum_remaining_days": 30}),
+        ("install", {"digest": "sha256", "minimum_remaining_days": 30}),
     ]
 
 
@@ -6039,6 +6491,7 @@ def test_aging_before_installation_rejects_certificate_at_warning_boundary(monke
         397,
         now=first_validation,
         minimum_remaining_days=30,
+        digest="sha256",
     )
 
     class InstallationClock(datetime):
@@ -6062,7 +6515,49 @@ def test_aging_before_installation_rejects_certificate_at_warning_boundary(monke
             397,
             Path("public-ca.pem"),
             minimum_remaining_days=30,
+            digest="sha256",
         )
+    assert not connection.entered_config_mode
+    assert all(command.startswith("show ") for command in connection.commands)
+
+
+def test_aging_during_trust_check_rejects_before_installation(monkeypatch):
+    switch = make_config()["switches"][0]
+    first_validation = datetime(2026, 1, 1, tzinfo=UTC)
+    pre_install_validation = first_validation + timedelta(seconds=1)
+    not_after = pre_install_validation + timedelta(days=30)
+    csr_pem, _, certificate_pem = make_test_identity_and_certificate(
+        not_before=not_after - timedelta(days=397), not_after=not_after
+    )
+
+    class AdvancingClock(datetime):
+        calls = 0
+
+        @classmethod
+        def now(cls, tz=None):
+            assert tz is UTC
+            cls.calls += 1
+            return first_validation if cls.calls == 1 else pre_install_validation
+
+    connection = FakeInstallConnection(csr_pem)
+    monkeypatch.setattr(checker, "datetime", AdvancingClock)
+    monkeypatch.setattr(checker, "ConnectHandler", lambda **kwargs: connection)
+    monkeypatch.setattr(checker, "verify_issued_certificate_trust", lambda *args: None)
+
+    with pytest.raises(ValueError, match="remaining validity"):
+        checker.install_pending_certificate(
+            switch,
+            "user",
+            "password",
+            "webcert2027",
+            certificate_pem,
+            make_csr_settings(),
+            397,
+            Path("public-ca.pem"),
+            digest="sha256",
+            minimum_remaining_days=30,
+        )
+    assert AdvancingClock.calls == 2
     assert not connection.entered_config_mode
     assert all(command.startswith("show ") for command in connection.commands)
 
