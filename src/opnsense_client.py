@@ -125,16 +125,6 @@ def _validate_url_hostname(hostname, *, bracketed):
     for label in hostname.split("."):
         if _DNS_LABEL_RE.fullmatch(label) is None:
             raise ValueError("opnsense.base_url contains an invalid hostname")
-        if label.casefold().startswith("xn--"):
-            try:
-                decoded = label.lower().encode("ascii").decode("idna")
-                encoded = decoded.encode("idna").decode("ascii")
-            except UnicodeError:
-                raise ValueError(
-                    "opnsense.base_url contains an invalid hostname"
-                ) from None
-            if decoded.isascii() or encoded.casefold() != label.casefold():
-                raise ValueError("opnsense.base_url contains an invalid hostname")
 
 
 def _read_secret_file(configured_path, source_name):

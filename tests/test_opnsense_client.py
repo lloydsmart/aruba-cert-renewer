@@ -761,6 +761,7 @@ def test_get_certificate_rejects_malformed_response(monkeypatch, response):
         ("https://opnsense.example.com", "https://opnsense.example.com"),
         ("https://opnsense.example.com/", "https://opnsense.example.com"),
         ("https://OpnSense.Example.COM", "https://OpnSense.Example.COM"),
+        ("https://xn--fa-hia.de", "https://xn--fa-hia.de"),
         ("https://xn--bcher-kva.example", "https://xn--bcher-kva.example"),
         ("https://XN--BCHER-KVA.example", "https://XN--BCHER-KVA.example"),
         ("https://opnsense.123.example", "https://opnsense.123.example"),
@@ -774,6 +775,13 @@ def test_get_certificate_rejects_malformed_response(monkeypatch, response):
 )
 def test_base_url_accepts_only_normalized_https_origins(base_url, expected):
     assert opnsense_client.validate_base_url(base_url) == expected
+
+
+def test_ascii_xn_label_is_preserved_without_unicode_conversion():
+    assert (
+        opnsense_client.validate_base_url("https://xn--fa-hia.de")
+        == "https://xn--fa-hia.de"
+    )
 
 
 @pytest.mark.parametrize(
@@ -812,6 +820,7 @@ def test_base_url_accepts_only_normalized_https_origins(base_url, expected):
         "https://opnsense.example.com?query=yes",
         "https://opnsense.example.com#",
         "https://opnsense.example.com#fragment",
+        "https://fa\u00df.de",
         "https://b\u00fccher.example",
         "https://\u212a.example",
         "https://\u00e9.example",
@@ -821,11 +830,6 @@ def test_base_url_accepts_only_normalized_https_origins(base_url, expected):
         "https://127.1",
         "https://0177.0.0.1",
         "https://999.999.999.999",
-        "https://xn--a.example",
-        "https://XN--A.example",
-        "https://xn--.example",
-        "https://xn--abc.example",
-        "https://xn--a-.example",
         "https://[192.0.2.10]",
         "https://2001:db8::10",
         "https://*.example.com",
@@ -843,7 +847,8 @@ def test_base_url_rejects_ambiguous_or_unsafe_origins(base_url):
 
 
 @pytest.mark.parametrize(
-    "base_url", ["https://\u212a.example", "https://\u00e9.example"]
+    "base_url",
+    ["https://fa\u00df.de", "https://b\u00fccher.example", "https://\u212a.example"],
 )
 def test_unicode_origin_rejected_before_credentials_are_loaded(monkeypatch, base_url):
     monkeypatch.setattr(
