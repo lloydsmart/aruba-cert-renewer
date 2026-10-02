@@ -52,6 +52,15 @@ There is one user-facing orchestration command:
 - `src/opnsense_client.py` contains only the narrowly scoped OPNsense HTTP/JSON
   interaction.
 
+`opnsense.base_url` must be one explicit HTTPS origin: an ASCII DNS hostname,
+strict IPv4 address, or bracketed IPv6 address, with an optional port from 1 to
+65535. One trailing slash is accepted and removed. Raw Unicode hostnames are
+rejected; the renewer performs no IDNA conversion or Unicode hostname
+normalization. Whitespace, userinfo, other paths, query strings, and fragments
+are rejected.
+OPNsense API requests ignore environment and system proxy settings; their route
+comes from this configured origin.
+
 The OPNsense client is restricted to these routes:
 
 - `GET /api/trust/cert/ca_list`

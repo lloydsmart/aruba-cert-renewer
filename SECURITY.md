@@ -611,6 +611,8 @@ The automation is limited to CA description lookup, CSR signing, and public-cert
 * Supply OPNsense credentials through `OPNSENSE_API_KEY` and `OPNSENSE_API_SECRET`, or reference mounted secret files
   through `OPNSENSE_API_KEY_FILE` and `OPNSENSE_API_SECRET_FILE`; do not put credentials in TOML or CLI arguments.
 * Keep TLS certificate and hostname verification enabled for every OPNsense request.
+* Accept only an explicit HTTPS origin in `opnsense.base_url`; ignore ambient environment and system proxies for
+  OPNsense API routing.
 
 Aruba certificate private keys are generated and stored on the switch. They must not be exported to or retrieved from
 OPNsense. A pending CSR represents the valuable association with its switch-held private key and must not be cleared,
