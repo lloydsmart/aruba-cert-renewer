@@ -1,10 +1,11 @@
 import base64
 import json
 import ssl
+import urllib.request as urllib_request
 from email.message import Message
 from io import BytesIO
 from urllib.error import HTTPError, URLError
-from urllib.request import HTTPSHandler
+from urllib.request import HTTPSHandler, ProxyHandler, Request
 from urllib.response import addinfourl
 
 import pytest
@@ -755,15 +756,154 @@ def test_get_certificate_rejects_malformed_response(monkeypatch, response):
 
 
 @pytest.mark.parametrize(
+    ("base_url", "expected"),
+    [
+        ("https://opnsense.example.com", "https://opnsense.example.com"),
+        ("https://opnsense.example.com/", "https://opnsense.example.com"),
+        ("https://OpnSense.Example.COM", "https://OpnSense.Example.COM"),
+        ("https://xn--bcher-kva.example", "https://xn--bcher-kva.example"),
+        ("https://XN--BCHER-KVA.example", "https://XN--BCHER-KVA.example"),
+        ("https://opnsense.123.example", "https://opnsense.123.example"),
+        ("https://192.0.2.10", "https://192.0.2.10"),
+        ("https://[2001:db8::10]", "https://[2001:db8::10]"),
+        ("https://[2001:db8::10]/", "https://[2001:db8::10]"),
+        ("https://opnsense.example.com:1", "https://opnsense.example.com:1"),
+        ("https://opnsense.example.com:65535/", "https://opnsense.example.com:65535"),
+        ("https://[2001:db8::10]:8443", "https://[2001:db8::10]:8443"),
+    ],
+)
+def test_base_url_accepts_only_normalized_https_origins(base_url, expected):
+    assert opnsense_client.validate_base_url(base_url) == expected
+
+
+@pytest.mark.parametrize(
     "base_url",
     [
+        None,
+        123,
+        "",
+        " \t ",
+        " https://opnsense.example.com",
+        "https://opnsense.example.com ",
+        "https://opn sense.example.com",
+        "https://opnsense.example.com\n",
+        "https://opnsense.example.com\x00",
+        "https://opnsense.example.com\x7f",
+        "https://opnsense.example.com\x85",
+        "https://opnsense.example.com\u200e",
         "http://opnsense.example.com",
+        "https://",
+        "https:///missing-host",
+        "https://@opnsense.example.com",
+        "https://user@opnsense.example.com",
         "https://user:password@opnsense.example.com",
-        "https://opnsense.example.com?query=yes",
+        "https://opnsense.example.com:",
+        "https://opnsense.example.com:0",
+        "https://opnsense.example.com:65536",
+        "https://opnsense.example.com:-1",
+        "https://opnsense.example.com:+1",
+        "https://opnsense.example.com:abc",
+        "https://opnsense.example.com:1.5",
+        "https://opnsense.example.com:１２",
+        "https://opnsense.example.com//",
+        "https://opnsense.example.com///",
         "https://opnsense.example.com/unexpected/path",
+        "https://opnsense.example.com?",
+        "https://opnsense.example.com?query=yes",
+        "https://opnsense.example.com#",
+        "https://opnsense.example.com#fragment",
+        "https://b\u00fccher.example",
+        "https://\u212a.example",
+        "https://\u00e9.example",
+        "https://[fe80::1%25eth0]",
+        "https://2130706433",
+        "https://0x7f.0.0.1",
+        "https://127.1",
+        "https://0177.0.0.1",
+        "https://999.999.999.999",
+        "https://xn--a.example",
+        "https://XN--A.example",
+        "https://xn--.example",
+        "https://xn--abc.example",
+        "https://xn--a-.example",
+        "https://[192.0.2.10]",
+        "https://2001:db8::10",
+        "https://*.example.com",
+        "https://opnsense..example.com",
+        "https://-opnsense.example.com",
+        "https://opnsense-.example.com",
+        f"https://{'a' * 64}.example.com",
+        f"https://{'a' * 63}.{'b' * 63}.{'c' * 63}.{'d' * 62}",
         "not a URL",
     ],
 )
-def test_base_url_requires_safe_verified_https(base_url):
+def test_base_url_rejects_ambiguous_or_unsafe_origins(base_url):
+    with pytest.raises(ValueError, match="opnsense.base_url"):
+        opnsense_client.validate_base_url(base_url)
+
+
+@pytest.mark.parametrize(
+    "base_url", ["https://\u212a.example", "https://\u00e9.example"]
+)
+def test_unicode_origin_rejected_before_credentials_are_loaded(monkeypatch, base_url):
+    monkeypatch.setattr(
+        opnsense_client.OPNsenseClient,
+        "_load_authorization",
+        staticmethod(lambda: pytest.fail("credentials must not be loaded")),
+    )
+
     with pytest.raises(ValueError, match="opnsense.base_url"):
         opnsense_client.OPNsenseClient(base_url)
+
+
+def test_opener_ignores_ambient_and_platform_proxies(monkeypatch):
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"):
+        monkeypatch.setenv(name, "http://hostile-proxy.example:8080")
+
+    discovery_calls = []
+
+    def hostile_platform_proxies():
+        discovery_calls.append(True)
+        return {"https": "http://platform-proxy.example:8080"}
+
+    monkeypatch.setattr(urllib_request, "getproxies", hostile_platform_proxies)
+    original_build_opener = opnsense_client.build_opener
+    captured = {}
+
+    def capture_opener(*handlers):
+        captured["passed_handlers"] = handlers
+        opener = original_build_opener(*handlers)
+        captured["handlers"] = opener.handlers
+        opener.open = lambda request, timeout: captured.update(
+            request=request, timeout=timeout
+        )
+        return opener
+
+    monkeypatch.setattr(opnsense_client, "build_opener", capture_opener)
+    context = ssl.create_default_context()
+    request = Request(BASE_URL + opnsense_client.CA_LIST_PATH)
+
+    opnsense_client._open_url(request, timeout=30, ssl_context=context)
+
+    assert discovery_calls == []
+    proxy_handlers = [
+        handler
+        for handler in captured["passed_handlers"]
+        if isinstance(handler, ProxyHandler)
+    ]
+    assert len(proxy_handlers) == 1
+    assert proxy_handlers[0].proxies == {}
+    assert not hasattr(proxy_handlers[0], "https_open")
+    assert not any(
+        isinstance(handler, ProxyHandler) for handler in captured["handlers"]
+    )
+    assert any(
+        isinstance(handler, opnsense_client.RejectRedirectHandler)
+        for handler in captured["handlers"]
+    )
+    assert any(
+        isinstance(handler, HTTPSHandler) and handler._context is context
+        for handler in captured["handlers"]
+    )
+    assert captured["request"] is request
+    assert captured["timeout"] == 30
