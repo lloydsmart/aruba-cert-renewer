@@ -60,6 +60,10 @@ normalization. Whitespace, userinfo, other paths, query strings, and fragments
 are rejected.
 OPNsense API requests ignore environment and system proxy settings; their route
 comes from this configured origin.
+The client rejects duplicate keys anywhere in API JSON, validates CA lookup and
+CSR-signing inputs before requests, and limits returned public certificate PEM to
+64 KiB. It accepts up to 101 unique DNS/IP SANs, matching one switch host plus
+100 configured additional SAN inputs.
 
 The OPNsense client is restricted to these routes:
 

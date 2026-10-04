@@ -2,6 +2,7 @@
 
 import base64
 import json
+import math
 import os
 import re
 import unicodedata
@@ -24,14 +25,97 @@ CA_LIST_PATH = "/api/trust/cert/ca_list"
 CERT_ADD_PATH = "/api/trust/cert/add"
 CERTIFICATE_PATH = "/api/trust/cert/generate_file/{uuid}/crt"
 MAX_RESPONSE_BYTES = 1024 * 1024
+MAX_CERTIFICATE_PEM_BYTES = 64 * 1024
 MAX_SECRET_FILE_BYTES = 16 * 1024
+MAX_DESCRIPTION_CHARS = 255
+MAX_SAN_ENTRIES = 101
 _DNS_LABEL_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\Z")
 _NUMERIC_HOST_COMPONENT_RE = re.compile(r"(?:[0-9]+|0[xX][0-9A-Fa-f]+)\Z")
 _UNSAFE_URL_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp"})
+_UNSAFE_TEXT_CATEGORIES = _UNSAFE_URL_CATEGORIES
+_CA_REFERENCE_RE = re.compile(r"[0-9a-f]{13}\Z")
 
 
 class OPNsenseAPIError(ValueError):
     """A safe-to-display OPNsense API or response error."""
+
+
+class _DuplicateJSONKeyError(ValueError):
+    """A JSON object contains an ambiguous repeated key."""
+
+
+def _json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise _DuplicateJSONKeyError
+        result[key] = value
+    return result
+
+
+def _validate_timeout(timeout):
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+        raise ValueError("OPNsense timeout must be a positive finite number")
+    try:
+        valid = math.isfinite(timeout) and timeout > 0
+    except OverflowError:
+        valid = False
+    if not valid:
+        raise ValueError("OPNsense timeout must be a positive finite number")
+    return timeout
+
+
+def _validate_safe_text(value, label):
+    if not isinstance(value, str):
+        raise OPNsenseAPIError(f"{label} must be non-empty text")
+    if len(value) > MAX_DESCRIPTION_CHARS:
+        raise OPNsenseAPIError(f"{label} exceeds the size limit")
+    if not value.strip():
+        raise OPNsenseAPIError(f"{label} must be non-empty text")
+    if any(
+        unicodedata.category(character) in _UNSAFE_TEXT_CATEGORIES
+        for character in value
+    ):
+        raise OPNsenseAPIError(f"{label} contains unsafe characters")
+    return value
+
+
+def _validate_sans(dns_names, ip_addresses):
+    if not isinstance(dns_names, (list, tuple)) or not isinstance(
+        ip_addresses, (list, tuple)
+    ):
+        raise OPNsenseAPIError("DNS and IP SANs must be lists or tuples")
+    if not 1 <= len(dns_names) + len(ip_addresses) <= MAX_SAN_ENTRIES:
+        raise OPNsenseAPIError("SAN count must be between 1 and 101")
+
+    seen_dns = set()
+    for name in dns_names:
+        if not isinstance(name, str) or not name or len(name) > 253:
+            raise OPNsenseAPIError("DNS SAN is invalid")
+        if re.fullmatch(r"[0-9.]+", name) or any(
+            _DNS_LABEL_RE.fullmatch(label) is None for label in name.split(".")
+        ):
+            raise OPNsenseAPIError("DNS SAN is invalid")
+        canonical = name.lower()
+        if canonical in seen_dns:
+            raise OPNsenseAPIError("DNS SAN is duplicated")
+        seen_dns.add(canonical)
+
+    canonical_ips = []
+    seen_ips = set()
+    for value in ip_addresses:
+        if not isinstance(value, str) or not value or len(value) > 64 or "%" in value:
+            raise OPNsenseAPIError("IP SAN is invalid")
+        try:
+            canonical = str(ip_address(value))
+        except ValueError:
+            raise OPNsenseAPIError("IP SAN is invalid") from None
+        if canonical in seen_ips:
+            raise OPNsenseAPIError("IP SAN is duplicated")
+        seen_ips.add(canonical)
+        canonical_ips.append(canonical)
+
+    return tuple(dns_names), tuple(canonical_ips)
 
 
 class RejectRedirectHandler(HTTPRedirectHandler):
@@ -188,7 +272,7 @@ class OPNsenseClient:
 
     def __init__(self, base_url, *, timeout=30):
         self.base_url = validate_base_url(base_url)
-        self.timeout = timeout
+        self.timeout = _validate_timeout(timeout)
         self._authorization = self._load_authorization()
         self._ssl_context = create_client_tls_context()
 
@@ -243,8 +327,10 @@ class OPNsenseClient:
             raise OPNsenseAPIError("OPNsense API response is too large")
 
         try:
-            result = json.loads(response_data.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
+            result = json.loads(
+                response_data.decode("utf-8"), object_pairs_hook=_json_object
+            )
+        except (ValueError, RecursionError):
             raise OPNsenseAPIError("OPNsense API returned malformed JSON") from None
 
         if not isinstance(result, dict):
@@ -253,6 +339,7 @@ class OPNsenseClient:
         return result
 
     def resolve_ca(self, description):
+        description = _validate_safe_text(description, "OPNsense CA description")
         response = self._request_json("GET", CA_LIST_PATH)
         rows = response.get("rows")
         count = response.get("count")
@@ -279,17 +366,13 @@ class OPNsenseClient:
                 matches.append(caref)
 
         if not matches:
-            raise OPNsenseAPIError(
-                f"OPNsense CA description was not found: {description}"
-            )
+            raise OPNsenseAPIError("OPNsense CA description was not found")
 
         if len(matches) != 1:
-            raise OPNsenseAPIError(
-                f"OPNsense CA description is not unique: {description}"
-            )
+            raise OPNsenseAPIError("OPNsense CA description is not unique")
 
         caref = matches[0]
-        if not re.fullmatch(r"[0-9a-f]{13}", caref):
+        if _CA_REFERENCE_RE.fullmatch(caref) is None:
             raise OPNsenseAPIError("OPNsense returned an invalid CA reference")
 
         return caref
@@ -305,6 +388,32 @@ class OPNsenseClient:
         ip_addresses,
         description,
     ):
+        if not isinstance(csr_pem, str):
+            raise OPNsenseAPIError("CSR PEM must be text")
+        if not csr_pem.isascii():
+            raise OPNsenseAPIError("CSR PEM must be ASCII")
+        if (
+            re.fullmatch(
+                r"-----BEGIN CERTIFICATE REQUEST-----\r?\n"
+                r"[A-Za-z0-9+/=]+(?:\r?\n[A-Za-z0-9+/=]+)*\r?\n"
+                r"-----END CERTIFICATE REQUEST-----\r?\n",
+                csr_pem,
+            )
+            is None
+        ):
+            raise OPNsenseAPIError("CSR PEM is malformed")
+        if not isinstance(caref, str) or _CA_REFERENCE_RE.fullmatch(caref) is None:
+            raise OPNsenseAPIError("OPNsense CA reference is invalid")
+        if not isinstance(digest, str) or digest not in {"sha256", "sha384", "sha512"}:
+            raise OPNsenseAPIError("OPNsense digest is unsupported")
+        if (
+            not isinstance(lifetime_days, int)
+            or isinstance(lifetime_days, bool)
+            or not 1 <= lifetime_days <= 3650
+        ):
+            raise OPNsenseAPIError("OPNsense lifetime must be between 1 and 3650 days")
+        description = _validate_safe_text(description, "Certificate description")
+        dns_names, ip_addresses = _validate_sans(dns_names, ip_addresses)
         response = self._request_json(
             "POST",
             CERT_ADD_PATH,
@@ -359,7 +468,14 @@ class OPNsenseClient:
         if response.get("status") != "ok" or not isinstance(certificate_pem, str):
             raise OPNsenseAPIError("OPNsense public certificate response is malformed")
 
+        if not certificate_pem.isascii():
+            raise OPNsenseAPIError("OPNsense public certificate response is not ASCII")
         if not certificate_pem.strip():
             raise OPNsenseAPIError("OPNsense public certificate response is malformed")
 
-        return certificate_pem.strip() + "\n"
+        certificate_pem = certificate_pem.strip() + "\n"
+        if len(certificate_pem) > MAX_CERTIFICATE_PEM_BYTES:
+            raise OPNsenseAPIError(
+                "OPNsense public certificate payload exceeds the size limit"
+            )
+        return certificate_pem
