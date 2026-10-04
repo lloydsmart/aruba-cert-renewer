@@ -896,9 +896,11 @@ Live HTTPS verification is mandatory. The tool opens a new connection to the
 configured `host` on TCP/443 and uses that same DNS name or IP address as
 `server_hostname`; `additional_sans` never change the endpoint. Python's normal
 CA and identity verification must succeed, and the live peer certificate's DER
-bytes must exactly match the supplied certificate. Transient connection,
-handshake, and old-certificate results are retried for a bounded window of about
-30 seconds.
+bytes must exactly match the supplied certificate. The approximately 30-second
+post-install window includes bounded DNS resolution, connection, TLS handshake,
+certificate comparison, and retry delays. Transient connection failures, timeouts, and an
+authenticated previous certificate may be retried during that window. Certificate
+or hostname verification failures and other TLS handshake failures stop immediately.
 
 The pre-install check authenticates the certificate that is about to be sent to
 the switch. The post-install check remains a separate mandatory control because

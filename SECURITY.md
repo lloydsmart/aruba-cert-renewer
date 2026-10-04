@@ -695,6 +695,15 @@ retries. The live check remains mandatory because it verifies what the switch
 actually serves, including exact certificate equality; pre-install path
 verification does not replace it.
 
+The live verification window uses a monotonic deadline across DNS resolution,
+TCP connection, TLS handshake, exact-leaf comparison, and retry delays. Hostname
+resolution runs in a short-lived child process that is killed if it exceeds the
+remaining budget; IP literals skip resolution. TCP connects use only resolved
+numeric addresses, and socket timeouts are clipped to the remaining budget.
+Transient pre-authentication connection failures and timeouts may retry, as may an
+authenticated previous certificate during propagation. Certificate/hostname
+verification failures and other TLS handshake errors fail immediately.
+
 An installation or verification error after the Aruba installation command may
 mean that the new certificate is already active. The tool must report that state
 clearly and must not attempt automatic rollback or other recovery changes.
