@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 
 import argparse
+import errno
 import getpass
 import ipaddress
 import logging
+import math
+import multiprocessing
 import os
 import re
 import socket
@@ -54,6 +57,7 @@ MAX_ADDITIONAL_SANS = 100
 HTTPS_VERIFICATION_WINDOW_SECONDS = 30
 HTTPS_RETRY_DELAY_SECONDS = 2
 HTTPS_SOCKET_TIMEOUT_SECONDS = 5
+HTTPS_RESOLVER_CLEANUP_SECONDS = 0.1
 
 CERTIFICATE_PASTE_PROMPT = "Paste the certificate here and enter:"
 CERTIFICATE_REPLACEMENT_PROMPT = (
@@ -2088,6 +2092,20 @@ def verify_live_https_certificate(
     retry_delay=HTTPS_RETRY_DELAY_SECONDS,
     socket_timeout=HTTPS_SOCKET_TIMEOUT_SECONDS,
 ):
+    for value, name, zero_allowed in (
+        (verification_window, "verification window", False),
+        (retry_delay, "retry delay", True),
+        (socket_timeout, "socket timeout", False),
+    ):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"Invalid live HTTPS {name}")
+        try:
+            finite = math.isfinite(value)
+        except OverflowError:
+            finite = False
+        if not finite or value < 0 or (value == 0 and not zero_allowed):
+            raise ValueError(f"Invalid live HTTPS {name}")
+
     host = validate_switch_signing_identity(switch)["common_name"]
     expected_der = expected_certificate.public_bytes(serialization.Encoding.DER)
     with open_secure_file(ca_file, source_name="verification.ca_file"):
@@ -2098,40 +2116,171 @@ def verify_live_https_certificate(
         raise ValueError("TLS verification context is not securely configured")
 
     deadline = time.monotonic() + verification_window
-    last_error = None
+    if not math.isfinite(deadline):
+        raise ValueError("Invalid live HTTPS verification window")
+    addresses = _resolve_live_https_addresses(host, deadline)
+    last_error = "HTTPS endpoint did not become ready"
 
     while True:
+        if deadline - time.monotonic() <= 0:
+            break
         try:
-            with (
-                socket.create_connection(
-                    (host, 443),
-                    timeout=socket_timeout,
-                ) as tcp_socket,
-                context.wrap_socket(
-                    tcp_socket,
-                    server_hostname=host,
-                ) as tls_socket,
-            ):
-                peer_der = tls_socket.getpeercert(binary_form=True)
-
-            if peer_der == expected_der:
-                return
-
-            last_error = ValueError(
-                "Live HTTPS service presented a different valid certificate"
+            peer_der = _read_live_https_leaf(
+                addresses, host, context, deadline, socket_timeout
             )
-
-        except (OSError, ssl.SSLError) as error:
-            last_error = error
-
-        now = time.monotonic()
-        if now >= deadline:
+            if peer_der == expected_der:
+                if deadline - time.monotonic() <= 0:
+                    last_error = "HTTPS verification deadline expired"
+                    break
+                return
+            last_error = "HTTPS service presented a different valid certificate"
+        except ssl.SSLCertVerificationError:
             raise ValueError(
-                "Expected certificate was not verified over live HTTPS within "
-                f"{verification_window} seconds: {last_error}"
-            ) from last_error
+                "Live HTTPS certificate or hostname verification failed"
+            ) from None
+        except ssl.SSLError:
+            raise ValueError("Live HTTPS TLS handshake failed") from None
+        except OSError as error:
+            if not _is_retryable_live_https_error(error):
+                raise ValueError("Live HTTPS connection failed") from None
+            last_error = "HTTPS endpoint did not become ready"
 
-        time.sleep(min(retry_delay, deadline - now))
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(retry_delay, remaining))
+
+    raise ValueError(
+        "Expected certificate was not verified over live HTTPS within "
+        f"{verification_window} seconds: {last_error}"
+    )
+
+
+def _resolve_hostname_worker(connection, host):
+    try:
+        # Only small numeric socket addresses cross the process boundary.
+        results = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+        addresses = []
+        for family, socktype, _protocol, _canonical, sockaddr in results:
+            if (
+                family in (socket.AF_INET, socket.AF_INET6)
+                and socktype == socket.SOCK_STREAM
+            ):
+                addresses.append((family, sockaddr))
+                if len(addresses) == 16:
+                    break
+        connection.send(addresses)
+    except (OSError, OverflowError):
+        connection.send([])
+    finally:
+        connection.close()
+
+
+def _resolve_live_https_addresses(host, deadline):
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    else:
+        family = socket.AF_INET6 if address.version == 6 else socket.AF_INET
+        sockaddr = (host, 443, 0, 0) if address.version == 6 else (host, 443)
+        return [(family, sockaddr)]
+
+    remaining = deadline - time.monotonic()
+    if remaining <= HTTPS_RESOLVER_CLEANUP_SECONDS:
+        raise ValueError("Live HTTPS hostname resolution exceeded verification window")
+
+    context = multiprocessing.get_context("spawn")
+    try:
+        receiver, sender = context.Pipe(duplex=False)
+    except OSError:
+        raise ValueError("Live HTTPS hostname resolution could not start") from None
+    try:
+        process = context.Process(target=_resolve_hostname_worker, args=(sender, host))
+    except OSError:
+        receiver.close()
+        sender.close()
+        raise ValueError("Live HTTPS hostname resolution could not start") from None
+    process.daemon = True
+    try:
+        try:
+            process.start()
+        except OSError:
+            raise ValueError("Live HTTPS hostname resolution could not start") from None
+        sender.close()
+        wait = max(0.0, deadline - time.monotonic() - HTTPS_RESOLVER_CLEANUP_SECONDS)
+        if not receiver.poll(wait):
+            raise ValueError(
+                "Live HTTPS hostname resolution exceeded verification window"
+            )
+        try:
+            addresses = receiver.recv()
+        except EOFError:
+            addresses = []
+        if not addresses:
+            raise ValueError("Live HTTPS hostname resolution failed")
+        if time.monotonic() >= deadline:
+            raise ValueError(
+                "Live HTTPS hostname resolution exceeded verification window"
+            )
+        return addresses
+    finally:
+        receiver.close()
+        sender.close()
+        if process.pid is not None:
+            if process.is_alive():
+                process.kill()
+            process.join(timeout=HTTPS_RESOLVER_CLEANUP_SECONDS)
+            if process.is_alive():
+                raise ValueError("Live HTTPS hostname resolver could not stop")
+            process.close()
+
+
+def _read_live_https_leaf(addresses, host, context, deadline, socket_timeout):
+    last_error = None
+    for family, sockaddr in addresses:
+        try:
+            with socket.socket(family, socket.SOCK_STREAM) as tcp_socket:
+                tcp_socket.settimeout(_live_https_timeout(deadline, socket_timeout))
+                tcp_socket.connect(sockaddr)
+                tcp_socket.settimeout(_live_https_timeout(deadline, socket_timeout))
+                with context.wrap_socket(
+                    tcp_socket, server_hostname=host
+                ) as tls_socket:
+                    peer_der = tls_socket.getpeercert(binary_form=True)
+            _live_https_timeout(deadline, socket_timeout)
+            return peer_der
+        except ssl.SSLError:
+            raise
+        except OSError as error:
+            if not _is_retryable_live_https_error(error):
+                raise
+            last_error = error
+            if deadline - time.monotonic() <= 0:
+                break
+    if last_error is not None:
+        raise last_error
+    raise TimeoutError
+
+
+def _is_retryable_live_https_error(error):
+    # ConnectionError and TimeoutError are OSError subclasses. SSL errors are
+    # always handled separately as hard failures before this classification.
+    return isinstance(error, (ConnectionError, TimeoutError)) or error.errno in {
+        errno.ECONNREFUSED,
+        errno.ECONNRESET,
+        errno.ECONNABORTED,
+        errno.ENETUNREACH,
+        errno.EHOSTUNREACH,
+        errno.ETIMEDOUT,
+    }
+
+
+def _live_https_timeout(deadline, socket_timeout):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError
+    return min(socket_timeout, remaining)
 
 
 def check_switch(switch, username, password, warning_days):

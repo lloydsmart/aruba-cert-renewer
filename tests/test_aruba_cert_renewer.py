@@ -1,4 +1,5 @@
 import base64
+import errno
 import ipaddress
 import logging
 import re
@@ -4540,6 +4541,40 @@ class FakeTLSSocket:
         return self.peer_der
 
 
+class FakeTCPSocket:
+    def __init__(self, result=None):
+        self.result = result
+        self.timeouts = []
+        self.addresses = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        return False
+
+    def settimeout(self, value):
+        self.timeouts.append(value)
+
+    def connect(self, address):
+        self.addresses.append(address)
+        if isinstance(self.result, Exception):
+            raise self.result
+
+
+class FakeMonotonicClock:
+    def __init__(self, now=0):
+        self.now = now
+        self.sleeps = []
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
 class FakeVerifyingSSLContext:
     check_hostname = True
     verify_mode = checker.ssl.CERT_REQUIRED
@@ -4566,27 +4601,38 @@ def secure_ca_file(tmp_path):
     return ca_file
 
 
+@pytest.fixture
+def live_https_setup(monkeypatch):
+    sockets = []
+    monkeypatch.setattr(
+        checker,
+        "_resolve_live_https_addresses",
+        lambda host, deadline: [(checker.socket.AF_INET, ("192.0.2.10", 443))],
+    )
+
+    def socket_factory(family, socktype):
+        assert family == checker.socket.AF_INET
+        assert socktype == checker.socket.SOCK_STREAM
+        result = FakeTCPSocket()
+        sockets.append(result)
+        return result
+
+    monkeypatch.setattr(checker.socket, "socket", socket_factory)
+    return sockets
+
+
 def test_verify_live_https_uses_verified_hostname_and_exact_der(
-    monkeypatch, secure_ca_file
+    monkeypatch, secure_ca_file, live_https_setup
 ):
     _, _, certificate_pem = make_test_identity_and_certificate()
     certificate = x509.load_pem_x509_certificate(certificate_pem.encode("ascii"))
     expected_der = certificate.public_bytes(serialization.Encoding.DER)
     context = FakeVerifyingSSLContext([expected_der])
-    tcp_socket = FakeTLSSocket()
     context_calls = []
-    connection_calls = []
     monkeypatch.setattr(
         checker,
         "create_client_tls_context",
         lambda *, cafile: context_calls.append(cafile) or context,
-    )
-    monkeypatch.setattr(
-        checker.socket,
-        "create_connection",
-        lambda address, *, timeout: (
-            connection_calls.append((address, timeout)) or tcp_socket
-        ),
     )
 
     checker.verify_live_https_certificate(
@@ -4596,8 +4642,9 @@ def test_verify_live_https_uses_verified_hostname_and_exact_der(
     )
 
     assert context_calls == [str(secure_ca_file)]
-    assert connection_calls == [(("switch.example.com", 443), 5)]
-    assert context.wrap_calls == [(tcp_socket, "switch.example.com")]
+    assert live_https_setup[0].addresses == [("192.0.2.10", 443)]
+    assert 0 < live_https_setup[0].timeouts[0] <= 5
+    assert context.wrap_calls == [(live_https_setup[0], "switch.example.com")]
     assert context.check_hostname is True
     assert context.verify_mode == checker.ssl.CERT_REQUIRED
     assert context.minimum_version == checker.ssl.TLSVersion.TLSv1_2
@@ -4612,16 +4659,21 @@ def test_verify_live_https_uses_ip_host_for_connection_and_identity(
     certificate = x509.load_pem_x509_certificate(certificate_pem.encode("ascii"))
     expected_der = certificate.public_bytes(serialization.Encoding.DER)
     context = FakeVerifyingSSLContext([expected_der])
-    connection_calls = []
+    connections = []
     monkeypatch.setattr(
         checker.ssl, "create_default_context", lambda *, cafile: context
     )
+
+    def socket_factory(family, socktype):
+        result = FakeTCPSocket()
+        connections.append((family, socktype, result))
+        return result
+
+    monkeypatch.setattr(checker.socket, "socket", socket_factory)
     monkeypatch.setattr(
-        checker.socket,
-        "create_connection",
-        lambda address, *, timeout: (
-            connection_calls.append((address, timeout)) or FakeTLSSocket()
-        ),
+        checker.multiprocessing,
+        "get_context",
+        lambda method: pytest.fail("IP literal must not start DNS resolution"),
     )
 
     checker.verify_live_https_certificate(
@@ -4630,31 +4682,23 @@ def test_verify_live_https_uses_ip_host_for_connection_and_identity(
         certificate,
     )
 
-    assert connection_calls == [((host, 443), 5)]
+    assert connections[0][2].addresses == [
+        (host, 443, 0, 0) if ":" in host else (host, 443)
+    ]
     assert context.wrap_calls[0][1] == host
 
 
 def test_verify_live_https_retries_until_expected_certificate_appears(
-    monkeypatch, secure_ca_file
+    monkeypatch, secure_ca_file, live_https_setup
 ):
     _, _, certificate_pem = make_test_identity_and_certificate()
     certificate = x509.load_pem_x509_certificate(certificate_pem.encode("ascii"))
     expected_der = certificate.public_bytes(serialization.Encoding.DER)
     context = FakeVerifyingSSLContext([b"previous certificate", expected_der])
-    connection_calls = []
     sleep_calls = []
-    monotonic_values = iter([0, 1])
     monkeypatch.setattr(
         checker.ssl, "create_default_context", lambda *, cafile: context
     )
-    monkeypatch.setattr(
-        checker.socket,
-        "create_connection",
-        lambda address, *, timeout: (
-            connection_calls.append((address, timeout)) or FakeTLSSocket()
-        ),
-    )
-    monkeypatch.setattr(checker.time, "monotonic", lambda: next(monotonic_values))
     monkeypatch.setattr(checker.time, "sleep", sleep_calls.append)
 
     checker.verify_live_https_certificate(
@@ -4665,8 +4709,9 @@ def test_verify_live_https_retries_until_expected_certificate_appears(
         retry_delay=2,
     )
 
-    assert len(connection_calls) == 2
-    assert sleep_calls == [2]
+    assert len(live_https_setup) == 2
+    assert len(sleep_calls) == 1
+    assert 0 < sleep_calls[0] <= 2
 
 
 @pytest.mark.parametrize(
@@ -4677,52 +4722,63 @@ def test_verify_live_https_retries_until_expected_certificate_appears(
     ],
 )
 def test_verify_live_https_rejects_wrong_or_unverified_certificate(
-    monkeypatch, secure_ca_file, tls_result
+    monkeypatch, secure_ca_file, live_https_setup, tls_result
 ):
     _, _, certificate_pem = make_test_identity_and_certificate()
     certificate = x509.load_pem_x509_certificate(certificate_pem.encode("ascii"))
     context = FakeVerifyingSSLContext([tls_result])
-    monotonic_values = iter([0, 0])
     monkeypatch.setattr(
         checker.ssl, "create_default_context", lambda *, cafile: context
     )
-    monkeypatch.setattr(
-        checker.socket,
-        "create_connection",
-        lambda address, *, timeout: FakeTLSSocket(),
-    )
-    monkeypatch.setattr(checker.time, "monotonic", lambda: next(monotonic_values))
 
-    with pytest.raises(ValueError, match="not verified"):
+    class FakeClock:
+        now = 0
+
+        def monotonic(self):
+            return self.now
+
+        def sleep(self, seconds):
+            self.now += seconds
+
+    clock = FakeClock()
+    monkeypatch.setattr(checker.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(checker.time, "sleep", clock.sleep)
+
+    message = (
+        "different valid certificate"
+        if isinstance(tls_result, bytes)
+        else "certificate or hostname verification failed"
+    )
+    with pytest.raises(ValueError, match=message):
         checker.verify_live_https_certificate(
             make_config()["switches"][0],
             secure_ca_file,
             certificate,
-            verification_window=0,
+            verification_window=1,
         )
+    assert len(live_https_setup) == 1
 
 
 def test_verify_live_https_retries_transient_connection_failure(
-    monkeypatch, secure_ca_file
+    monkeypatch, secure_ca_file, live_https_setup
 ):
     _, _, certificate_pem = make_test_identity_and_certificate()
     certificate = x509.load_pem_x509_certificate(certificate_pem.encode("ascii"))
     expected_der = certificate.public_bytes(serialization.Encoding.DER)
     context = FakeVerifyingSSLContext([expected_der])
-    results = iter([ConnectionRefusedError("restarting"), FakeTLSSocket()])
-    monotonic_values = iter([0, 1])
     monkeypatch.setattr(
         checker.ssl, "create_default_context", lambda *, cafile: context
     )
 
-    def create_connection(address, *, timeout):
-        result = next(results)
-        if isinstance(result, Exception):
-            raise result
+    original_socket = checker.socket.socket
+
+    def socket_factory(family, socktype):
+        result = original_socket(family, socktype)
+        if len(live_https_setup) == 1:
+            result.result = ConnectionRefusedError("restarting")
         return result
 
-    monkeypatch.setattr(checker.socket, "create_connection", create_connection)
-    monkeypatch.setattr(checker.time, "monotonic", lambda: next(monotonic_values))
+    monkeypatch.setattr(checker.socket, "socket", socket_factory)
     monkeypatch.setattr(checker.time, "sleep", lambda seconds: None)
 
     checker.verify_live_https_certificate(
@@ -4730,6 +4786,439 @@ def test_verify_live_https_retries_transient_connection_failure(
         secure_ca_file,
         certificate,
     )
+    assert len(live_https_setup) == 2
+
+
+@pytest.mark.parametrize(
+    ("first_error", "second_allowed"),
+    [
+        (ConnectionRefusedError("restarting"), True),
+        (PermissionError(errno.EACCES, "denied"), False),
+    ],
+)
+def test_verify_live_https_classifies_each_address_before_fallback(
+    monkeypatch, secure_ca_file, live_https_setup, first_error, second_allowed
+):
+    _, _, certificate_pem = make_test_identity_and_certificate()
+    certificate = x509.load_pem_x509_certificate(certificate_pem.encode("ascii"))
+    expected_der = certificate.public_bytes(serialization.Encoding.DER)
+    context = FakeVerifyingSSLContext([expected_der])
+    monkeypatch.setattr(checker, "create_client_tls_context", lambda *, cafile: context)
+    monkeypatch.setattr(
+        checker,
+        "_resolve_live_https_addresses",
+        lambda host, deadline: [
+            (checker.socket.AF_INET, ("192.0.2.10", 443)),
+            (checker.socket.AF_INET, ("192.0.2.11", 443)),
+        ],
+    )
+    original_connect = FakeTCPSocket.connect
+
+    def connect(self, address):
+        if address[0] == "192.0.2.10":
+            self.addresses.append(address)
+            raise first_error
+        original_connect(self, address)
+
+    monkeypatch.setattr(FakeTCPSocket, "connect", connect)
+    if second_allowed:
+        checker.verify_live_https_certificate(
+            make_config()["switches"][0], secure_ca_file, certificate
+        )
+        assert len(live_https_setup) == 2
+        assert context.wrap_calls == [(live_https_setup[1], "switch.example.com")]
+    else:
+        with pytest.raises(ValueError, match="Live HTTPS connection failed"):
+            checker.verify_live_https_certificate(
+                make_config()["switches"][0], secure_ca_file, certificate
+            )
+        assert len(live_https_setup) == 1
+        assert context.wrap_calls == []
+
+
+def test_verify_live_https_all_addresses_retry_only_within_deadline(
+    monkeypatch, secure_ca_file, live_https_setup
+):
+    _, _, certificate_pem = make_test_identity_and_certificate()
+    certificate = x509.load_pem_x509_certificate(certificate_pem.encode("ascii"))
+    clock = FakeMonotonicClock()
+    monkeypatch.setattr(checker.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(checker.time, "sleep", clock.sleep)
+    monkeypatch.setattr(
+        checker,
+        "create_client_tls_context",
+        lambda *, cafile: FakeVerifyingSSLContext([]),
+    )
+    monkeypatch.setattr(
+        checker,
+        "_resolve_live_https_addresses",
+        lambda host, deadline: [
+            (checker.socket.AF_INET, ("192.0.2.10", 443)),
+            (checker.socket.AF_INET, ("192.0.2.11", 443)),
+        ],
+    )
+
+    def refuse(self, address):
+        self.addresses.append(address)
+        raise ConnectionRefusedError("restarting")
+
+    monkeypatch.setattr(FakeTCPSocket, "connect", refuse)
+    with pytest.raises(ValueError, match="did not become ready"):
+        checker.verify_live_https_certificate(
+            make_config()["switches"][0],
+            secure_ca_file,
+            certificate,
+            verification_window=1,
+            retry_delay=0.6,
+        )
+    assert [item.addresses[0][0] for item in live_https_setup] == [
+        "192.0.2.10",
+        "192.0.2.11",
+        "192.0.2.10",
+        "192.0.2.11",
+    ]
+    assert clock.sleeps == pytest.approx([0.6, 0.4])
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"verification_window": 0}, "verification window"),
+        ({"verification_window": -1}, "verification window"),
+        ({"retry_delay": -1}, "retry delay"),
+        ({"socket_timeout": 0}, "socket timeout"),
+        ({"socket_timeout": float("inf")}, "socket timeout"),
+        ({"verification_window": 10**1000}, "verification window"),
+    ],
+)
+def test_verify_live_https_rejects_invalid_deadline_policy(
+    secure_ca_file, kwargs, message
+):
+    _, _, pem = make_test_identity_and_certificate()
+    certificate = x509.load_pem_x509_certificate(pem.encode("ascii"))
+    with pytest.raises(ValueError, match=message):
+        checker.verify_live_https_certificate(
+            make_config()["switches"][0], secure_ca_file, certificate, **kwargs
+        )
+
+
+def test_verify_live_https_clips_connect_and_handshake_to_remaining_time(
+    monkeypatch, secure_ca_file, live_https_setup
+):
+    _, _, pem = make_test_identity_and_certificate()
+    certificate = x509.load_pem_x509_certificate(pem.encode("ascii"))
+    expected = certificate.public_bytes(serialization.Encoding.DER)
+    clock = FakeMonotonicClock()
+
+    def resolve(host, deadline):
+        clock.now = 8.8
+        return [(checker.socket.AF_INET, ("192.0.2.10", 443))]
+
+    monkeypatch.setattr(checker, "_resolve_live_https_addresses", resolve)
+    monkeypatch.setattr(checker.time, "monotonic", clock.monotonic)
+    context = FakeVerifyingSSLContext([expected])
+    monkeypatch.setattr(checker, "create_client_tls_context", lambda *, cafile: context)
+    original_connect = FakeTCPSocket.connect
+
+    def slow_connect(self, address):
+        original_connect(self, address)
+        clock.now += 0.4
+
+    monkeypatch.setattr(FakeTCPSocket, "connect", slow_connect)
+    checker.verify_live_https_certificate(
+        make_config()["switches"][0],
+        secure_ca_file,
+        certificate,
+        verification_window=10,
+        socket_timeout=5,
+    )
+    connect_timeout, handshake_timeout = live_https_setup[0].timeouts
+    assert 1.1 < connect_timeout <= 1.2
+    assert 0.7 < handshake_timeout <= 0.8
+
+
+def test_verify_live_https_slow_connect_cannot_start_handshake_after_deadline(
+    monkeypatch, secure_ca_file, live_https_setup
+):
+    _, _, pem = make_test_identity_and_certificate()
+    certificate = x509.load_pem_x509_certificate(pem.encode("ascii"))
+    clock = FakeMonotonicClock()
+    monkeypatch.setattr(checker.time, "monotonic", clock.monotonic)
+    context = FakeVerifyingSSLContext([])
+    monkeypatch.setattr(checker, "create_client_tls_context", lambda *, cafile: context)
+
+    def slow_connect(self, address):
+        self.addresses.append(address)
+        clock.now = 1.1
+
+    monkeypatch.setattr(FakeTCPSocket, "connect", slow_connect)
+    with pytest.raises(ValueError, match="did not become ready"):
+        checker.verify_live_https_certificate(
+            make_config()["switches"][0],
+            secure_ca_file,
+            certificate,
+            verification_window=1,
+        )
+    assert live_https_setup[0].timeouts == [1]
+    assert context.wrap_calls == []
+
+
+def test_verify_live_https_clips_retry_sleep_and_stops_at_boundary(
+    monkeypatch, secure_ca_file, live_https_setup
+):
+    _, _, pem = make_test_identity_and_certificate()
+    certificate = x509.load_pem_x509_certificate(pem.encode("ascii"))
+    clock = FakeMonotonicClock()
+    monkeypatch.setattr(checker.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(checker.time, "sleep", clock.sleep)
+    context = FakeVerifyingSSLContext([b"old valid leaf"])
+    monkeypatch.setattr(checker, "create_client_tls_context", lambda *, cafile: context)
+
+    with pytest.raises(ValueError, match="different valid certificate"):
+        checker.verify_live_https_certificate(
+            make_config()["switches"][0],
+            secure_ca_file,
+            certificate,
+            verification_window=1,
+            retry_delay=2,
+        )
+    assert clock.sleeps == [1]
+    assert len(live_https_setup) == 1
+
+
+def test_verify_live_https_accepts_expected_leaf_on_final_legal_attempt(
+    monkeypatch, secure_ca_file, live_https_setup
+):
+    _, _, pem = make_test_identity_and_certificate()
+    certificate = x509.load_pem_x509_certificate(pem.encode("ascii"))
+    expected = certificate.public_bytes(serialization.Encoding.DER)
+    clock = FakeMonotonicClock()
+    monkeypatch.setattr(checker.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(checker.time, "sleep", clock.sleep)
+    context = FakeVerifyingSSLContext([b"old valid leaf", expected])
+    monkeypatch.setattr(checker, "create_client_tls_context", lambda *, cafile: context)
+
+    checker.verify_live_https_certificate(
+        make_config()["switches"][0],
+        secure_ca_file,
+        certificate,
+        verification_window=1,
+        retry_delay=0.9,
+    )
+    assert len(live_https_setup) == 2
+    assert clock.now == 0.9
+    assert 0 < live_https_setup[1].timeouts[0] <= 0.1
+
+
+def test_verify_live_https_rejects_expected_leaf_completed_after_deadline(
+    monkeypatch, secure_ca_file, live_https_setup
+):
+    _, _, pem = make_test_identity_and_certificate()
+    certificate = x509.load_pem_x509_certificate(pem.encode("ascii"))
+    expected = certificate.public_bytes(serialization.Encoding.DER)
+    clock = FakeMonotonicClock()
+    monkeypatch.setattr(checker.time, "monotonic", clock.monotonic)
+    context = FakeVerifyingSSLContext([expected])
+    monkeypatch.setattr(checker, "create_client_tls_context", lambda *, cafile: context)
+    original_getpeercert = FakeTLSSocket.getpeercert
+
+    def slow_getpeercert(self, *, binary_form):
+        result = original_getpeercert(self, binary_form=binary_form)
+        clock.now = 1.1
+        return result
+
+    monkeypatch.setattr(FakeTLSSocket, "getpeercert", slow_getpeercert)
+    with pytest.raises(ValueError, match="did not become ready"):
+        checker.verify_live_https_certificate(
+            make_config()["switches"][0],
+            secure_ca_file,
+            certificate,
+            verification_window=1,
+        )
+    assert len(live_https_setup) == 1
+
+
+def test_verify_live_https_rejects_exact_leaf_compared_at_deadline(
+    monkeypatch, secure_ca_file, live_https_setup
+):
+    _, _, pem = make_test_identity_and_certificate()
+    certificate = x509.load_pem_x509_certificate(pem.encode("ascii"))
+    expected = certificate.public_bytes(serialization.Encoding.DER)
+    clock = FakeMonotonicClock()
+    comparisons = []
+
+    class TimedPeerDER(bytes):
+        def __eq__(self, other):
+            comparisons.append(other)
+            clock.now = 1
+            return super().__eq__(other)
+
+    monkeypatch.setattr(checker.time, "monotonic", clock.monotonic)
+    context = FakeVerifyingSSLContext([TimedPeerDER(expected)])
+    monkeypatch.setattr(checker, "create_client_tls_context", lambda *, cafile: context)
+
+    with pytest.raises(ValueError, match="verification deadline expired"):
+        checker.verify_live_https_certificate(
+            make_config()["switches"][0],
+            secure_ca_file,
+            certificate,
+            verification_window=1,
+        )
+    assert comparisons == [expected]
+    assert len(live_https_setup) == 1
+
+
+def test_verify_live_https_connection_refusal_until_deadline(
+    monkeypatch, secure_ca_file, live_https_setup
+):
+    _, _, pem = make_test_identity_and_certificate()
+    certificate = x509.load_pem_x509_certificate(pem.encode("ascii"))
+    clock = FakeMonotonicClock()
+    monkeypatch.setattr(checker.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(checker.time, "sleep", clock.sleep)
+    monkeypatch.setattr(
+        checker,
+        "create_client_tls_context",
+        lambda *, cafile: FakeVerifyingSSLContext([]),
+    )
+
+    def refuse(self, address):
+        raise ConnectionRefusedError("restarting")
+
+    monkeypatch.setattr(FakeTCPSocket, "connect", refuse)
+    with pytest.raises(ValueError, match="did not become ready"):
+        checker.verify_live_https_certificate(
+            make_config()["switches"][0],
+            secure_ca_file,
+            certificate,
+            verification_window=1,
+            retry_delay=0.4,
+        )
+    assert len(live_https_setup) == 3
+    assert clock.sleeps == [0.4, 0.4, pytest.approx(0.2)]
+
+
+def test_verify_live_https_does_not_connect_after_resolution_uses_deadline(
+    monkeypatch, secure_ca_file, live_https_setup
+):
+    _, _, pem = make_test_identity_and_certificate()
+    certificate = x509.load_pem_x509_certificate(pem.encode("ascii"))
+    clock = FakeMonotonicClock()
+    monkeypatch.setattr(checker.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(
+        checker,
+        "create_client_tls_context",
+        lambda *, cafile: FakeVerifyingSSLContext([]),
+    )
+
+    def resolve(host, deadline):
+        clock.now = deadline
+        return [(checker.socket.AF_INET, ("192.0.2.10", 443))]
+
+    monkeypatch.setattr(checker, "_resolve_live_https_addresses", resolve)
+    with pytest.raises(ValueError, match="did not become ready"):
+        checker.verify_live_https_certificate(
+            make_config()["switches"][0],
+            secure_ca_file,
+            certificate,
+            verification_window=1,
+        )
+    assert live_https_setup == []
+
+
+def test_verify_live_https_tls_handshake_failures_are_hard_except_timeout(
+    monkeypatch, secure_ca_file, live_https_setup
+):
+    _, _, pem = make_test_identity_and_certificate()
+    certificate = x509.load_pem_x509_certificate(pem.encode("ascii"))
+    clock = FakeMonotonicClock()
+    monkeypatch.setattr(checker.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(checker.time, "sleep", clock.sleep)
+    context = FakeVerifyingSSLContext([checker.ssl.SSLError("bad handshake")])
+    monkeypatch.setattr(checker, "create_client_tls_context", lambda *, cafile: context)
+    with pytest.raises(ValueError, match="TLS handshake failed"):
+        checker.verify_live_https_certificate(
+            make_config()["switches"][0], secure_ca_file, certificate
+        )
+    assert len(live_https_setup) == 1
+    assert clock.sleeps == []
+
+    context = FakeVerifyingSSLContext([TimeoutError("slow handshake")])
+    monkeypatch.setattr(checker, "create_client_tls_context", lambda *, cafile: context)
+    with pytest.raises(ValueError, match="did not become ready"):
+        checker.verify_live_https_certificate(
+            make_config()["switches"][0],
+            secure_ca_file,
+            certificate,
+            verification_window=1,
+            retry_delay=2,
+        )
+    assert clock.sleeps == [1]
+
+
+def test_verify_live_https_resolution_uses_deadline_and_kills_slow_worker(monkeypatch):
+    clock = FakeMonotonicClock()
+    monkeypatch.setattr(checker.time, "monotonic", clock.monotonic)
+
+    class FakeConnection:
+        def close(self):
+            pass
+
+        def poll(self, timeout):
+            assert 0 < timeout <= 0.9
+            clock.now += timeout
+            return False
+
+    class FakeProcess:
+        pid = 123
+        daemon = False
+        killed = False
+
+        def start(self):
+            pass
+
+        def is_alive(self):
+            return not self.killed
+
+        def kill(self):
+            self.killed = True
+
+        def join(self, timeout):
+            assert timeout == checker.HTTPS_RESOLVER_CLEANUP_SECONDS
+
+        def close(self):
+            pass
+
+    process = FakeProcess()
+
+    class FakeContext:
+        def Pipe(self, *, duplex):
+            assert duplex is False
+            return FakeConnection(), FakeConnection()
+
+        def Process(self, *, target, args):
+            assert target is checker._resolve_hostname_worker
+            return process
+
+    monkeypatch.setattr(
+        checker.multiprocessing, "get_context", lambda name: FakeContext()
+    )
+    with pytest.raises(ValueError, match="resolution exceeded"):
+        checker._resolve_live_https_addresses("switch.example.com", 1)
+    assert process.killed
+    assert process.daemon
+    assert clock.now <= 1
+
+
+def test_verify_live_https_resolution_skips_worker_after_deadline(monkeypatch):
+    monkeypatch.setattr(checker.time, "monotonic", lambda: 1)
+    monkeypatch.setattr(
+        checker.multiprocessing,
+        "get_context",
+        lambda name: pytest.fail("No DNS process after the deadline"),
+    )
+    with pytest.raises(ValueError, match="resolution exceeded"):
+        checker._resolve_live_https_addresses("switch.example.com", 1)
 
 
 def test_verify_live_https_revalidates_ca_before_ssl_path_reopen(monkeypatch, tmp_path):
