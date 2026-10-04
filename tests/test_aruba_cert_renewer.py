@@ -27,6 +27,7 @@ from paramiko.hostkeys import HostKeys
 
 import aruba_cert_renewer as checker
 import lifecycle_lock
+import opnsense_client
 from secure_file import SecureFileError
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
@@ -3380,6 +3381,152 @@ def test_sign_pending_csr_retrieves_existing_csr_and_never_generates(monkeypatch
     )
     assert sign_call[2]["dns_names"] == ["switch.example.com"]
     assert sign_call[2]["ip_addresses"] == ["192.0.2.10"]
+
+
+def test_opnsense_description_preserves_normal_and_boundary_values():
+    certificate_name = "webcert-20260829-01"
+    normal_host = "switch.example.com"
+    normal = checker.build_opnsense_certificate_description(
+        certificate_name, normal_host
+    )
+    assert normal == f"Aruba Web certificate {certificate_name} for {normal_host}"
+    assert len(normal) < opnsense_client.MAX_DESCRIPTION_CHARS
+
+    boundary_host = ".".join(("a" * 63, "b" * 63, "c" * 63, "d" * 17))
+    assert checker.parse_identity(boundary_host)["kind"] == "dns"
+    boundary = checker.build_opnsense_certificate_description(
+        certificate_name, boundary_host
+    )
+    assert len(boundary) == opnsense_client.MAX_DESCRIPTION_CHARS
+    assert boundary.endswith(boundary_host)
+
+
+def test_opnsense_description_bounds_long_certificate_name_and_host():
+    long_name = "webcert-" + "x" * 300
+    long_host = ".".join(("a" * 63, "b" * 63, "c" * 63, "d" * 61))
+    assert checker.validate_cli_identifier(long_name, "certificate name") == long_name
+    assert checker.parse_identity(long_host)["value"] == long_host
+
+    description = checker.build_opnsense_certificate_description(long_name, long_host)
+    assert len(description) == opnsense_client.MAX_DESCRIPTION_CHARS
+    assert description == f"Aruba Web certificate {long_name} for {long_host}"[:255]
+
+
+def setup_long_host_opnsense_signing(monkeypatch):
+    host = ".".join(("a" * 63, "b" * 63, "c" * 63, "d" * 18))
+    assert len(f"Aruba Web certificate webcert-20260829-01 for {host}") == 256
+    config = make_config()
+    switch = config["switches"][0]
+    switch["host"] = host
+    switch["additional_sans"] = []
+    _, switches = checker.validate_config(config)
+    assert switches[0]["host"] == host
+
+    monkeypatch.setenv("OPNSENSE_API_KEY", "synthetic-key")
+    monkeypatch.setenv("OPNSENSE_API_SECRET", "synthetic-secret")
+    monkeypatch.delenv("OPNSENSE_API_KEY_FILE", raising=False)
+    monkeypatch.delenv("OPNSENSE_API_SECRET_FILE", raising=False)
+    client = checker.OPNsenseClient(make_opnsense_settings()["base_url"])
+    calls = []
+
+    def fake_request(method, path, payload=None):
+        calls.append((method, path, payload))
+        if path == opnsense_client.CA_LIST_PATH:
+            return {
+                "rows": [{"descr": "internal-ca", "caref": "0123456789abc"}],
+                "count": 1,
+            }
+        if path == opnsense_client.CERT_ADD_PATH:
+            return {"result": "saved", "uuid": "12345678-1234-4234-9234-123456789abc"}
+        return {"status": "ok", "payload": "CERTIFICATE"}
+
+    monkeypatch.setattr(client, "_request_json", fake_request)
+    monkeypatch.setattr(checker, "OPNsenseClient", lambda base_url: client)
+    monkeypatch.setattr(
+        checker,
+        "retrieve_csr",
+        lambda *args, **kwargs: (
+            "-----BEGIN CERTIFICATE REQUEST-----\nTEST\n"
+            "-----END CERTIFICATE REQUEST-----\n"
+        ),
+    )
+    monkeypatch.setattr(checker, "validate_csr_pem", lambda *args: object())
+    monkeypatch.setattr(
+        checker, "validate_issued_certificate", lambda *args, **kwargs: None
+    )
+    return switch, host, calls
+
+
+def test_staged_signing_bounds_description_without_changing_dns_san(monkeypatch):
+    switch, host, calls = setup_long_host_opnsense_signing(monkeypatch)
+    monkeypatch.setattr(
+        checker,
+        "generate_csr",
+        lambda *args: pytest.fail("Staged signing must not generate a CSR"),
+    )
+
+    result = checker.sign_pending_csr(
+        switch,
+        "username",
+        "password",
+        "webcert-20260829-01",
+        make_csr_settings(),
+        make_opnsense_settings(),
+    )
+
+    assert result == "CERTIFICATE\n"
+    cert = next(
+        payload["cert"]
+        for _, path, payload in calls
+        if path == opnsense_client.CERT_ADD_PATH
+    )
+    assert len(cert["descr"]) == opnsense_client.MAX_DESCRIPTION_CHARS
+    assert cert["altnames_dns"] == host
+    assert cert["altnames_ip"] == ""
+
+
+def test_automatic_renewal_bounds_description_after_csr_creation(monkeypatch):
+    switch, host, calls = setup_long_host_opnsense_signing(monkeypatch)
+    certificate_name = "webcert-20260829-01"
+    monkeypatch.setattr(
+        checker,
+        "renewal_preflight",
+        lambda *args, **kwargs: {
+            "active_certificate_name": "webcert2026",
+            "ta_profile": "webprofile2026",
+            "new_certificate_name": certificate_name,
+        },
+    )
+    generated = []
+    monkeypatch.setattr(
+        checker,
+        "generate_csr",
+        lambda *args: generated.append(args) or "generated CSR",
+    )
+    monkeypatch.setattr(
+        checker, "install_pending_certificate", lambda *args, **kwargs: object()
+    )
+    monkeypatch.setattr(checker, "verify_live_https_certificate", lambda *args: None)
+
+    result = checker.renew_certificate(
+        switch,
+        "username",
+        "password",
+        make_csr_settings(),
+        make_opnsense_settings(),
+        Path("public-ca.pem"),
+    )
+
+    assert result == certificate_name
+    assert generated[0][0] is switch
+    assert generated[0][3] == certificate_name
+    cert = next(
+        payload["cert"]
+        for _, path, payload in calls
+        if path == opnsense_client.CERT_ADD_PATH
+    )
+    assert len(cert["descr"]) == opnsense_client.MAX_DESCRIPTION_CHARS
+    assert cert["altnames_dns"] == host
 
 
 def signing_config_text():

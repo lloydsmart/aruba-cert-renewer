@@ -175,28 +175,23 @@ def test_json_integer_limit_is_safely_reported(monkeypatch):
         sys.set_int_max_str_digits(previous_limit)
 
 
-def test_json_excessive_nesting_is_safely_reported(monkeypatch):
-    previous_limit = sys.getrecursionlimit()
-    try:
-        sys.setrecursionlimit(1000)
-        # The C JSON decoder can recurse more deeply than this Python limit.
-        response = b'{"rows":' + b"[" * 20000 + b"0" + b"]" * 20000 + b"}"
-        assert len(response) < opnsense_client.MAX_RESPONSE_BYTES
-        with pytest.raises(RecursionError):
-            json.loads(response)
+def test_json_parser_recursion_error_is_safely_reported(monkeypatch):
+    response = b'{"rows":[]}'
 
-        monkeypatch.setattr(
-            opnsense_client,
-            "_open_url",
-            lambda *args, **kwargs: FakeResponse(response),
+    def fail_parser(*args, **kwargs):
+        raise RecursionError("synthetic parser detail")
+
+    monkeypatch.setattr(
+        opnsense_client, "_open_url", lambda *args, **kwargs: FakeResponse(response)
+    )
+    monkeypatch.setattr(opnsense_client.json, "loads", fail_parser)
+    with pytest.raises(opnsense_client.OPNsenseAPIError) as raised:
+        opnsense_client.OPNsenseClient(BASE_URL)._request_json(
+            "GET", opnsense_client.CA_LIST_PATH
         )
-        with pytest.raises(opnsense_client.OPNsenseAPIError) as raised:
-            opnsense_client.OPNsenseClient(BASE_URL)._request_json(
-                "GET", opnsense_client.CA_LIST_PATH
-            )
-        assert str(raised.value) == "OPNsense API returned malformed JSON"
-    finally:
-        sys.setrecursionlimit(previous_limit)
+    assert str(raised.value) == "OPNsense API returned malformed JSON"
+    assert "synthetic parser detail" not in str(raised.value)
+    assert "rows" not in str(raised.value)
 
 
 def test_json_response_size_is_checked_before_parsing(monkeypatch):

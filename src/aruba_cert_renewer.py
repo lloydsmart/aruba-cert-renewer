@@ -39,7 +39,7 @@ from netmiko.exceptions import (
 )
 
 from lifecycle_lock import LifecycleLockError, LifecycleLockReleaseError, lifecycle_lock
-from opnsense_client import OPNsenseClient, validate_base_url
+from opnsense_client import MAX_DESCRIPTION_CHARS, OPNsenseClient, validate_base_url
 from output_policy import SanitizingFormatter, sanitize_terminal_text
 from secure_file import open_secure_file
 from tls_policy import create_client_tls_context
@@ -1410,6 +1410,12 @@ def read_certificate_input(certificate_input):
     return certificate_pem
 
 
+def build_opnsense_certificate_description(certificate_name, common_name):
+    """Bound metadata built from the validated ASCII name and switch identity."""
+    description = f"Aruba Web certificate {certificate_name} for {common_name}"
+    return description[:MAX_DESCRIPTION_CHARS]
+
+
 def sign_pending_csr(
     switch,
     username,
@@ -1421,6 +1427,9 @@ def sign_pending_csr(
     minimum_remaining_days=None,
 ):
     identities = validate_switch_signing_identity(switch)
+    description = build_opnsense_certificate_description(
+        certificate_name, identities["common_name"]
+    )
     csr_pem = retrieve_csr(
         switch,
         username,
@@ -1439,9 +1448,7 @@ def sign_pending_csr(
         lifetime_days=opnsense_settings["lifetime_days"],
         dns_names=identities["dns_names"],
         ip_addresses=identities["ip_addresses"],
-        description=(
-            f"Aruba Web certificate {certificate_name} for {identities['common_name']}"
-        ),
+        description=description,
     )
     certificate_pem = client.get_certificate(certificate_uuid)
     validate_issued_certificate(
