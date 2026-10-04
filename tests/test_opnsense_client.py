@@ -1,6 +1,7 @@
 import base64
 import json
 import ssl
+import sys
 import urllib.request as urllib_request
 from email.message import Message
 from io import BytesIO
@@ -16,6 +17,9 @@ from secure_file import SecureFileError
 BASE_URL = "https://opnsense.example.com:8443"
 CA_REF = "0123456789abc"
 CERTIFICATE_UUID = "12345678-1234-4234-9234-123456789abc"
+CSR_PEM = (
+    "-----BEGIN CERTIFICATE REQUEST-----\nTEST\n-----END CERTIFICATE REQUEST-----\n"
+)
 
 
 class FakeResponse:
@@ -136,15 +140,186 @@ def test_resolve_ca_rejects_invalid_caref(monkeypatch):
         opnsense_client.OPNsenseClient(BASE_URL).resolve_ca("internal-ca")
 
 
-def test_malformed_json_is_rejected(monkeypatch):
+@pytest.mark.parametrize("response", [b"not JSON", b"\xff"])
+def test_malformed_json_is_rejected(monkeypatch, response):
     monkeypatch.setattr(
         opnsense_client,
         "_open_url",
-        lambda *args, **kwargs: FakeResponse(b"not JSON"),
+        lambda *args, **kwargs: FakeResponse(response),
     )
 
     with pytest.raises(opnsense_client.OPNsenseAPIError, match="malformed JSON"):
         opnsense_client.OPNsenseClient(BASE_URL).resolve_ca("internal-ca")
+
+
+def test_json_integer_limit_is_safely_reported(monkeypatch):
+    previous_limit = sys.get_int_max_str_digits()
+    try:
+        sys.set_int_max_str_digits(sys.int_info.str_digits_check_threshold)
+        response = b'{"count":' + b"9" * (sys.get_int_max_str_digits() + 1) + b"}"
+        assert len(response) < opnsense_client.MAX_RESPONSE_BYTES
+        with pytest.raises(ValueError):
+            json.loads(response)
+
+        monkeypatch.setattr(
+            opnsense_client,
+            "_open_url",
+            lambda *args, **kwargs: FakeResponse(response),
+        )
+        with pytest.raises(opnsense_client.OPNsenseAPIError) as raised:
+            opnsense_client.OPNsenseClient(BASE_URL)._request_json(
+                "GET", opnsense_client.CA_LIST_PATH
+            )
+        assert str(raised.value) == "OPNsense API returned malformed JSON"
+    finally:
+        sys.set_int_max_str_digits(previous_limit)
+
+
+def test_json_excessive_nesting_is_safely_reported(monkeypatch):
+    previous_limit = sys.getrecursionlimit()
+    try:
+        sys.setrecursionlimit(1000)
+        # The C JSON decoder can recurse more deeply than this Python limit.
+        response = b'{"rows":' + b"[" * 20000 + b"0" + b"]" * 20000 + b"}"
+        assert len(response) < opnsense_client.MAX_RESPONSE_BYTES
+        with pytest.raises(RecursionError):
+            json.loads(response)
+
+        monkeypatch.setattr(
+            opnsense_client,
+            "_open_url",
+            lambda *args, **kwargs: FakeResponse(response),
+        )
+        with pytest.raises(opnsense_client.OPNsenseAPIError) as raised:
+            opnsense_client.OPNsenseClient(BASE_URL)._request_json(
+                "GET", opnsense_client.CA_LIST_PATH
+            )
+        assert str(raised.value) == "OPNsense API returned malformed JSON"
+    finally:
+        sys.setrecursionlimit(previous_limit)
+
+
+def test_json_response_size_is_checked_before_parsing(monkeypatch):
+    response = b"{" * (opnsense_client.MAX_RESPONSE_BYTES + 1)
+    monkeypatch.setattr(
+        opnsense_client, "_open_url", lambda *args, **kwargs: FakeResponse(response)
+    )
+    with pytest.raises(opnsense_client.OPNsenseAPIError, match="too large"):
+        opnsense_client.OPNsenseClient(BASE_URL)._request_json(
+            "GET", opnsense_client.CA_LIST_PATH
+        )
+
+
+def test_non_parser_valueerror_is_not_reclassified(monkeypatch):
+    def fail_before_parsing(*args, **kwargs):
+        raise ValueError("local programming error")
+
+    monkeypatch.setattr(opnsense_client, "_open_url", fail_before_parsing)
+    with pytest.raises(ValueError, match="local programming error") as raised:
+        opnsense_client.OPNsenseClient(BASE_URL)._request_json(
+            "GET", opnsense_client.CA_LIST_PATH
+        )
+    assert type(raised.value) is ValueError
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        b'{"rows":[],"count":0,"count":1}',
+        b'{"rows":[{"descr":"a","descr":"b"}],"count":1}',
+        b'{"outer":[{"key":1,"key":2}]}',
+    ],
+)
+def test_duplicate_json_keys_are_rejected_at_every_depth(monkeypatch, response):
+    monkeypatch.setattr(
+        opnsense_client, "_open_url", lambda *args, **kwargs: FakeResponse(response)
+    )
+
+    with pytest.raises(
+        opnsense_client.OPNsenseAPIError, match="malformed JSON"
+    ) as raised:
+        opnsense_client.OPNsenseClient(BASE_URL)._request_json(
+            "GET", opnsense_client.CA_LIST_PATH
+        )
+    assert "descr" not in str(raised.value)
+
+
+def test_unique_nested_json_and_arrays_are_accepted(monkeypatch):
+    payload = {"rows": [{"descr": "internal-ca", "caref": CA_REF}], "count": 1}
+    monkeypatch.setattr(
+        opnsense_client, "_open_url", lambda *args, **kwargs: json_response(payload)
+    )
+    assert (
+        opnsense_client.OPNsenseClient(BASE_URL)._request_json(
+            "GET", opnsense_client.CA_LIST_PATH
+        )
+        == payload
+    )
+
+
+@pytest.mark.parametrize("response", [b"[]", b"null", b'"text"'])
+def test_non_object_json_root_is_rejected(monkeypatch, response):
+    monkeypatch.setattr(
+        opnsense_client, "_open_url", lambda *args, **kwargs: FakeResponse(response)
+    )
+    with pytest.raises(opnsense_client.OPNsenseAPIError, match="invalid JSON response"):
+        opnsense_client.OPNsenseClient(BASE_URL)._request_json(
+            "GET", opnsense_client.CA_LIST_PATH
+        )
+
+
+@pytest.mark.parametrize("timeout", [1, 0.5])
+def test_positive_finite_timeout_is_accepted(timeout):
+    assert opnsense_client.OPNsenseClient(BASE_URL, timeout=timeout).timeout == timeout
+
+
+@pytest.mark.parametrize(
+    "timeout",
+    [0, -1, True, False, float("nan"), float("inf"), -float("inf"), "1", None, 10**400],
+)
+def test_invalid_timeout_is_rejected_before_credentials(monkeypatch, timeout):
+    monkeypatch.delenv("OPNSENSE_API_KEY")
+    with pytest.raises(ValueError, match="positive finite"):
+        opnsense_client.OPNsenseClient(BASE_URL, timeout=timeout)
+
+
+@pytest.mark.parametrize("description", ["CA with spaces", "Café authority", "x" * 255])
+def test_resolve_ca_accepts_safe_description(monkeypatch, description):
+    monkeypatch.setattr(
+        opnsense_client,
+        "_open_url",
+        lambda *args, **kwargs: json_response(
+            {"rows": [{"descr": description, "caref": CA_REF}], "count": 1}
+        ),
+    )
+    assert opnsense_client.OPNsenseClient(BASE_URL).resolve_ca(description) == CA_REF
+
+
+@pytest.mark.parametrize(
+    "description",
+    [
+        None,
+        7,
+        "",
+        "   ",
+        "x" * 256,
+        "hidden\nvalue",
+        "bad\x7f",
+        "bad\u200e",
+        "bad\ud800",
+        "bad\u2028",
+        "bad\u2029",
+    ],
+)
+def test_resolve_ca_rejects_unsafe_description_before_request(monkeypatch, description):
+    calls = []
+    client = opnsense_client.OPNsenseClient(BASE_URL)
+    monkeypatch.setattr(client, "_request_json", lambda *args: calls.append(args))
+    with pytest.raises(opnsense_client.OPNsenseAPIError) as raised:
+        client.resolve_ca(description)
+    assert calls == []
+    assert "hidden" not in str(raised.value)
+    assert "value" not in str(raised.value)
 
 
 def test_ca_list_redirect_is_rejected_without_following_authorization(monkeypatch):
@@ -166,7 +341,7 @@ def test_post_redirect_is_rejected_without_following_authorization(monkeypatch):
 
     with pytest.raises(opnsense_client.OPNsenseAPIError, match="HTTP 302"):
         opnsense_client.OPNsenseClient(BASE_URL).sign_csr(
-            "CSR",
+            CSR_PEM,
             caref=CA_REF,
             digest="sha256",
             lifetime_days=397,
@@ -612,9 +787,7 @@ def test_sign_csr_sends_nested_model_payload(monkeypatch):
         return json_response({"result": "saved", "uuid": CERTIFICATE_UUID})
 
     monkeypatch.setattr(opnsense_client, "_open_url", fake_open_url)
-    csr_pem = (
-        "-----BEGIN CERTIFICATE REQUEST-----\nTEST\n-----END CERTIFICATE REQUEST-----\n"
-    )
+    csr_pem = CSR_PEM
 
     result = opnsense_client.OPNsenseClient(BASE_URL).sign_csr(
         csr_pem,
@@ -672,7 +845,7 @@ def test_sign_csr_serializes_typed_san_lists(
     monkeypatch.setattr(opnsense_client, "_open_url", fake_open_url)
 
     opnsense_client.OPNsenseClient(BASE_URL).sign_csr(
-        "CSR",
+        CSR_PEM,
         caref=CA_REF,
         digest="sha256",
         lifetime_days=397,
@@ -685,6 +858,165 @@ def test_sign_csr_serializes_typed_san_lists(
     assert set(payload) == {"cert"}
     assert payload["cert"]["altnames_dns"] == expected_dns
     assert payload["cert"]["altnames_ip"] == expected_ip
+
+
+def signing_arguments(**changes):
+    arguments = {
+        "caref": CA_REF,
+        "digest": "sha256",
+        "lifetime_days": 397,
+        "dns_names": ["switch.example.com"],
+        "ip_addresses": ["192.0.2.10"],
+        "description": "Aruba certificate",
+    }
+    arguments.update(changes)
+    return arguments
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"caref": "0123456789ABC"}, "CA reference"),
+        ({"caref": "0123456789ab"}, "CA reference"),
+        ({"caref": None}, "CA reference"),
+        ({"digest": "sha1"}, "digest"),
+        ({"digest": "SHA256"}, "digest"),
+        ({"digest": []}, "digest"),
+        ({"lifetime_days": 0}, "lifetime"),
+        ({"lifetime_days": 3651}, "lifetime"),
+        ({"lifetime_days": True}, "lifetime"),
+        ({"lifetime_days": 1.0}, "lifetime"),
+        ({"description": ""}, "description"),
+        ({"description": "x" * 256}, "description"),
+        ({"description": "bad\u200e"}, "description"),
+        ({"description": "bad\nvalue"}, "description"),
+        ({"dns_names": "switch.example.com"}, "SANs"),
+        ({"ip_addresses": "192.0.2.10"}, "SANs"),
+        ({"dns_names": [], "ip_addresses": []}, "SAN count"),
+        ({"dns_names": ["*.example.com"]}, "DNS SAN"),
+        ({"dns_names": ["999.999.999.999"]}, "DNS SAN"),
+        ({"dns_names": ["bad..example.com"]}, "DNS SAN"),
+        ({"dns_names": ["bad\n.example.com"]}, "DNS SAN"),
+        ({"dns_names": ["tést.example.com"]}, "DNS SAN"),
+        ({"dns_names": [42]}, "DNS SAN"),
+        ({"dns_names": ["Switch.example.com", "switch.example.com"]}, "duplicate"),
+        ({"ip_addresses": ["999.999.999.999"]}, "IP SAN"),
+        ({"ip_addresses": ["fe80::1%eth0"]}, "IP SAN"),
+        ({"ip_addresses": ["bad\nip"]}, "IP SAN"),
+        ({"ip_addresses": [42]}, "IP SAN"),
+        ({"ip_addresses": ["2001:0db8::1", "2001:db8::1"]}, "duplicate"),
+        ({"csr_pem": b"not text"}, "CSR PEM"),
+        (
+            {
+                "csr_pem": "-----BEGIN CERTIFICATE REQUEST-----\nTÉST\n-----END CERTIFICATE REQUEST-----\n"
+            },
+            "ASCII",
+        ),
+        ({"csr_pem": "not a CSR"}, "CSR PEM"),
+    ],
+)
+def test_sign_csr_rejects_invalid_arguments_before_network(
+    monkeypatch, changes, message
+):
+    calls = []
+    client = opnsense_client.OPNsenseClient(BASE_URL)
+    monkeypatch.setattr(client, "_request_json", lambda *args: calls.append(args))
+    arguments = signing_arguments(
+        **{key: value for key, value in changes.items() if key != "csr_pem"}
+    )
+    with pytest.raises(opnsense_client.OPNsenseAPIError, match=message) as raised:
+        client.sign_csr(changes.get("csr_pem", CSR_PEM), **arguments)
+    assert calls == []
+    assert "bad\nvalue" not in str(raised.value)
+
+
+@pytest.mark.parametrize("lifetime_days", [1, 3650])
+def test_sign_csr_accepts_aruba_lifetime_boundaries(monkeypatch, lifetime_days):
+    payloads = []
+    client = opnsense_client.OPNsenseClient(BASE_URL)
+    monkeypatch.setattr(
+        client,
+        "_request_json",
+        lambda method, path, payload: (
+            payloads.append(payload) or {"result": "saved", "uuid": CERTIFICATE_UUID}
+        ),
+    )
+    assert (
+        client.sign_csr(CSR_PEM, **signing_arguments(lifetime_days=lifetime_days))
+        == CERTIFICATE_UUID
+    )
+    assert payloads[0]["cert"]["lifetime"] == lifetime_days
+
+
+def test_sign_csr_accepts_maximum_safe_description_and_crlf_pem(monkeypatch):
+    payloads = []
+    client = opnsense_client.OPNsenseClient(BASE_URL)
+    monkeypatch.setattr(
+        client,
+        "_request_json",
+        lambda method, path, payload: (
+            payloads.append(payload) or {"result": "saved", "uuid": CERTIFICATE_UUID}
+        ),
+    )
+    description = "x" * 255
+    crlf_pem = CSR_PEM.replace("\n", "\r\n")
+    assert (
+        client.sign_csr(crlf_pem, **signing_arguments(description=description))
+        == CERTIFICATE_UUID
+    )
+    assert payloads[0]["cert"]["descr"] == description
+    assert payloads[0]["cert"]["csr_payload"] == crlf_pem
+
+
+def test_sign_csr_preserves_dns_case_and_canonicalizes_ip(monkeypatch):
+    payloads = []
+    client = opnsense_client.OPNsenseClient(BASE_URL)
+    monkeypatch.setattr(
+        client,
+        "_request_json",
+        lambda method, path, payload: (
+            payloads.append(payload) or {"result": "saved", "uuid": CERTIFICATE_UUID}
+        ),
+    )
+    client.sign_csr(
+        CSR_PEM,
+        **signing_arguments(
+            dns_names=["Switch.Example.com", "alias.example.com"],
+            ip_addresses=["192.0.2.10", "2001:0db8::0010"],
+        ),
+    )
+    assert (
+        payloads[0]["cert"]["altnames_dns"] == "Switch.Example.com\nalias.example.com"
+    )
+    assert payloads[0]["cert"]["altnames_ip"] == "192.0.2.10\n2001:db8::10"
+
+
+@pytest.mark.parametrize("count", [101, 102])
+def test_sign_csr_san_count_boundary(monkeypatch, count):
+    calls = []
+    client = opnsense_client.OPNsenseClient(BASE_URL)
+    monkeypatch.setattr(
+        client,
+        "_request_json",
+        lambda method, path, payload: (
+            calls.append(payload) or {"result": "saved", "uuid": CERTIFICATE_UUID}
+        ),
+    )
+    names = [f"switch-{index}.example.com" for index in range(count)]
+    if count == 101:
+        assert (
+            client.sign_csr(
+                CSR_PEM, **signing_arguments(dns_names=names, ip_addresses=[])
+            )
+            == CERTIFICATE_UUID
+        )
+        assert len(calls) == 1
+    else:
+        with pytest.raises(opnsense_client.OPNsenseAPIError, match="SAN count"):
+            client.sign_csr(
+                CSR_PEM, **signing_arguments(dns_names=names, ip_addresses=[])
+            )
+        assert calls == []
 
 
 @pytest.mark.parametrize(
@@ -705,7 +1037,7 @@ def test_sign_csr_rejects_failed_or_invalid_uuid_response(monkeypatch, response)
 
     with pytest.raises(opnsense_client.OPNsenseAPIError):
         opnsense_client.OPNsenseClient(BASE_URL).sign_csr(
-            "CSR",
+            CSR_PEM,
             caref=CA_REF,
             digest="sha256",
             lifetime_days=397,
@@ -753,6 +1085,40 @@ def test_get_certificate_rejects_malformed_response(monkeypatch, response):
 
     with pytest.raises(opnsense_client.OPNsenseAPIError, match="malformed"):
         opnsense_client.OPNsenseClient(BASE_URL).get_certificate(CERTIFICATE_UUID)
+
+
+@pytest.mark.parametrize("payload", ["PÉM", " CERTIFICATE\u2003"])
+def test_get_certificate_rejects_non_ascii_payload(monkeypatch, payload):
+    monkeypatch.setattr(
+        opnsense_client,
+        "_open_url",
+        lambda *args, **kwargs: json_response({"status": "ok", "payload": payload}),
+    )
+    with pytest.raises(opnsense_client.OPNsenseAPIError, match="not ASCII") as raised:
+        opnsense_client.OPNsenseClient(BASE_URL).get_certificate(CERTIFICATE_UUID)
+    assert payload not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    "size",
+    [
+        opnsense_client.MAX_CERTIFICATE_PEM_BYTES,
+        opnsense_client.MAX_CERTIFICATE_PEM_BYTES + 1,
+    ],
+)
+def test_get_certificate_pem_size_boundary(monkeypatch, size):
+    payload = "A" * (size - 1)
+    monkeypatch.setattr(
+        opnsense_client,
+        "_open_url",
+        lambda *args, **kwargs: json_response({"status": "ok", "payload": payload}),
+    )
+    client = opnsense_client.OPNsenseClient(BASE_URL)
+    if size == opnsense_client.MAX_CERTIFICATE_PEM_BYTES:
+        assert len(client.get_certificate(CERTIFICATE_UUID)) == size
+    else:
+        with pytest.raises(opnsense_client.OPNsenseAPIError, match="size limit"):
+            client.get_certificate(CERTIFICATE_UUID)
 
 
 @pytest.mark.parametrize(

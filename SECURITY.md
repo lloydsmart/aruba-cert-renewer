@@ -613,6 +613,8 @@ The automation is limited to CA description lookup, CSR signing, and public-cert
 * Keep TLS certificate and hostname verification enabled for every OPNsense request.
 * Accept only an explicit HTTPS origin in `opnsense.base_url`; ignore ambient environment and system proxies for
   OPNsense API routing.
+* Reject ambiguous duplicate JSON keys, invalid signing inputs, and public certificate PEM over 64 KiB at the
+  OPNsense client boundary. CSR/device-output and total outbound signing request-byte bounds remain separate work.
 
 Aruba certificate private keys are generated and stored on the switch. They must not be exported to or retrieved from
 OPNsense. A pending CSR represents the valuable association with its switch-held private key and must not be cleared,
