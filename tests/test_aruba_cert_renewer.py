@@ -91,6 +91,49 @@ def test_load_config_accepts_secure_regular_file(tmp_path):
     assert checker.load_config(config_file) == {"settings": {"warning_days": 30}}
 
 
+def test_load_config_accepts_empty_toml(tmp_path):
+    config_file = tmp_path / "config.toml"
+    config_file.write_bytes(b"")
+    assert checker.load_config(config_file) == {}
+
+
+def test_load_config_size_boundary_and_parser_order(tmp_path):
+    config_file = tmp_path / "config.toml"
+    config_file.write_bytes(b" " * checker.MAX_CONFIG_FILE_BYTES)
+    assert checker.load_config(config_file) == {}
+
+    config_file.write_bytes(b"invalid = [" + b" " * checker.MAX_CONFIG_FILE_BYTES)
+    with pytest.raises(ValueError, match="exceeds") as raised:
+        checker.load_config(config_file)
+    assert "invalid =" not in str(raised.value)
+
+
+def test_load_config_invalid_utf8_does_not_echo_contents(tmp_path):
+    config_file = tmp_path / "config.toml"
+    config_file.write_bytes(b'secret_marker = "private"\n\xff')
+    with pytest.raises(ValueError, match="Invalid TOML or UTF-8") as raised:
+        checker.load_config(config_file)
+    assert "private" not in str(raised.value)
+
+
+def test_load_config_parses_open_descriptor_after_path_replacement(
+    monkeypatch, tmp_path
+):
+    config_file = tmp_path / "config.toml"
+    config_file.write_bytes(b"answer = 1\n")
+    replacement = tmp_path / "replacement.toml"
+    replacement.write_bytes(b"answer = 2\n")
+    original_open = checker.open_secure_file
+
+    def replace_after_open(path, **kwargs):
+        opened = original_open(path, **kwargs)
+        replacement.replace(config_file)
+        return opened
+
+    monkeypatch.setattr(checker, "open_secure_file", replace_after_open)
+    assert checker.load_config(config_file) == {"answer": 1}
+
+
 @pytest.mark.parametrize(
     ("mode", "message"),
     [(0o620, "group-writable"), (0o602, "world-writable")],
@@ -121,7 +164,7 @@ def test_load_config_still_reports_invalid_toml_after_metadata_validation(tmp_pa
     config_file.write_text("invalid = [", encoding="utf-8")
     config_file.chmod(0o600)
 
-    with pytest.raises(ValueError, match="Invalid TOML in configuration file"):
+    with pytest.raises(ValueError, match="Invalid TOML or UTF-8 in configuration file"):
         checker.load_config(config_file)
 
 
@@ -734,13 +777,15 @@ def test_read_password_file_rejects_symlink(tmp_path):
 def test_device_parameters_require_dedicated_strict_known_hosts():
     switch = make_config()["switches"][0]
 
-    device = checker.get_device_parameters(switch, "username", "password")
+    with checker.snapshot_known_hosts(switch) as snapshot:
+        device = checker.get_device_parameters(switch, "username", "password", snapshot)
 
     assert device["host"] == "switch.example.com"
     assert device["ssh_strict"] is True
     assert device["system_host_keys"] is False
     assert device["alt_host_keys"] is True
-    assert device["alt_key_file"] == str(KNOWN_HOSTS_FILE.resolve())
+    assert device["alt_key_file"] == str(snapshot)
+    assert device["alt_key_file"] != str(KNOWN_HOSTS_FILE.resolve())
 
 
 def test_device_parameters_disable_only_required_legacy_ssh_algorithms():
@@ -754,12 +799,13 @@ def test_device_parameters_disable_only_required_legacy_ssh_algorithms():
         for category, algorithms in checker.SSH_DISABLED_ALGORITHMS.items()
     }
 
-    first_disabled = checker.get_device_parameters(switch, "username", "password")[
-        "disabled_algorithms"
-    ]
-    second_disabled = checker.get_device_parameters(switch, "username", "password")[
-        "disabled_algorithms"
-    ]
+    with checker.snapshot_known_hosts(switch) as snapshot:
+        first_disabled = checker.get_device_parameters(
+            switch, "username", "password", snapshot
+        )["disabled_algorithms"]
+        second_disabled = checker.get_device_parameters(
+            switch, "username", "password", snapshot
+        )["disabled_algorithms"]
 
     assert first_disabled == expected
     assert isinstance(first_disabled, dict)
@@ -810,22 +856,28 @@ def test_device_parameters_disable_only_required_legacy_ssh_algorithms():
     } == canonical_snapshot
 
 
-def test_device_parameters_revalidate_known_hosts_before_path_reopen(tmp_path):
+def test_snapshot_revalidates_known_hosts_before_connection(tmp_path):
     known_hosts_file = tmp_path / "known_hosts"
     known_hosts_file.write_text("switch.example.com ssh-rsa test\n", encoding="ascii")
     known_hosts_file.chmod(0o620)
     switch = make_config()["switches"][0]
     switch["_ssh_known_hosts_file"] = known_hosts_file
 
-    with pytest.raises(ValueError, match="group-writable"):
-        checker.get_device_parameters(switch, "username", "password")
+    with (
+        pytest.raises(ValueError, match="group-writable"),
+        checker.snapshot_known_hosts(switch),
+    ):
+        pass
 
 
 def test_unvalidated_switch_cannot_construct_device_parameters():
     switch = {"name": "EXAMPLE-SWITCH", "host": "switch.example.com"}
 
-    with pytest.raises(ValueError, match="known_hosts configuration was not validated"):
-        checker.get_device_parameters(switch, "username", "password")
+    with (
+        pytest.raises(ValueError, match="known_hosts configuration was not validated"),
+        checker.snapshot_known_hosts(switch),
+    ):
+        pass
 
 
 def test_extra_ssh_settings_cannot_disable_strict_verification():
@@ -837,7 +889,10 @@ def test_extra_ssh_settings_cannot_disable_strict_verification():
     )
     _, switches = checker.validate_config(config)
 
-    device = checker.get_device_parameters(switches[0], "username", "password")
+    with checker.snapshot_known_hosts(switches[0]) as snapshot:
+        device = checker.get_device_parameters(
+            switches[0], "username", "password", snapshot
+        )
 
     assert device["ssh_strict"] is True
     assert device["system_host_keys"] is False
@@ -853,48 +908,225 @@ def test_every_aruba_connection_path_uses_common_device_parameters(
 ):
     calls = []
 
-    def stop_at_device_parameters(switch, username, password):
+    def stop_at_device_parameters(switch, username, password, snapshot):
+        assert Path(snapshot).is_file()
         calls.append((switch, username, password))
         raise RuntimeError("common device parameters reached")
 
     monkeypatch.setattr(checker, "get_device_parameters", stop_at_device_parameters)
     switch = make_config()["switches"][0]
 
-    with pytest.raises(RuntimeError, match="common device parameters reached"):
-        if connection_path == "monitor":
-            checker.check_switch(switch, "username", "password", 30)
-        elif connection_path == "preflight":
-            checker.renewal_preflight(switch, "username", "password")
-        elif connection_path == "generate":
-            checker.generate_csr(
-                switch,
-                "username",
-                "password",
-                "webcert2027",
-                make_csr_settings(),
-            )
-        elif connection_path == "retrieve":
-            checker.retrieve_csr(
-                switch,
-                "username",
-                "password",
-                "webcert2027",
-                make_csr_settings(),
-            )
-        else:
-            checker.install_pending_certificate(
-                switch,
-                "username",
-                "password",
-                "webcert2027",
-                "unused certificate",
-                make_csr_settings(),
-                397,
-                synthetic_ca_snapshot(),
-                digest="sha256",
-            )
+    if connection_path == "monitor":
+        assert checker.check_switch(switch, "username", "password", 30) == "error"
+    else:
+        expected_error = (
+            "SSH operation failed before certificate installation was attempted"
+            if connection_path == "install"
+            else "common device parameters reached"
+        )
+        with pytest.raises((RuntimeError, ValueError), match=expected_error):
+            if connection_path == "preflight":
+                checker.renewal_preflight(switch, "username", "password")
+            elif connection_path == "generate":
+                checker.generate_csr(
+                    switch,
+                    "username",
+                    "password",
+                    "webcert2027",
+                    make_csr_settings(),
+                )
+            elif connection_path == "retrieve":
+                checker.retrieve_csr(
+                    switch,
+                    "username",
+                    "password",
+                    "webcert2027",
+                    make_csr_settings(),
+                )
+            else:
+                checker.install_pending_certificate(
+                    switch,
+                    "username",
+                    "password",
+                    "webcert2027",
+                    "unused certificate",
+                    make_csr_settings(),
+                    397,
+                    synthetic_ca_snapshot(),
+                    digest="sha256",
+                )
 
     assert calls == [(switch, "username", "password")]
+
+
+def test_known_hosts_snapshot_size_boundary(tmp_path):
+    source = tmp_path / "known_hosts"
+    switch = make_config()["switches"][0]
+    switch["_ssh_known_hosts_file"] = source
+    source.write_bytes(b"A" * checker.MAX_KNOWN_HOSTS_FILE_BYTES)
+
+    with checker.snapshot_known_hosts(switch) as snapshot:
+        assert snapshot.read_bytes() == b"A" * checker.MAX_KNOWN_HOSTS_FILE_BYTES
+        assert snapshot.stat().st_mode & 0o777 == 0o600
+        assert snapshot.parent.stat().st_mode & 0o777 == 0o700
+    assert not snapshot.exists()
+    assert not snapshot.parent.exists()
+
+    source.write_bytes(b"A" * (checker.MAX_KNOWN_HOSTS_FILE_BYTES + 1))
+    with (
+        pytest.raises(ValueError, match="exceeds"),
+        checker.snapshot_known_hosts(switch),
+    ):
+        pytest.fail("Oversized source reached connection setup")
+
+
+@pytest.mark.parametrize("case", ["missing", "symlink", "directory", "fifo", "unsafe"])
+def test_known_hosts_snapshot_rejects_unsafe_source(tmp_path, case):
+    source = tmp_path / "known_hosts"
+    switch = make_config()["switches"][0]
+    switch["_ssh_known_hosts_file"] = source
+    if case == "symlink":
+        target = tmp_path / "target"
+        target.write_bytes(b"key")
+        source.symlink_to(target)
+    elif case == "directory":
+        source.mkdir()
+    elif case == "fifo":
+        os.mkfifo(source)
+    elif case == "unsafe":
+        source.write_bytes(b"key")
+        source.chmod(0o620)
+    with pytest.raises(ValueError), checker.snapshot_known_hosts(switch):
+        pytest.fail("Unsafe source reached connection setup")
+
+
+def test_known_hosts_snapshot_rejects_untrusted_owner(monkeypatch, tmp_path):
+    if os.geteuid() == 0:
+        pytest.skip("Root ownership is intentionally trusted")
+    source = tmp_path / "known_hosts"
+    source.write_bytes(b"synthetic key")
+    switch = make_config()["switches"][0]
+    switch["_ssh_known_hosts_file"] = source
+    monkeypatch.setattr(os, "geteuid", lambda: -1)
+    with (
+        pytest.raises(ValueError, match="untrusted owner"),
+        checker.snapshot_known_hosts(switch),
+    ):
+        pytest.fail("Untrusted owner reached connection setup")
+
+
+def test_ssh_connection_uses_captured_key_after_source_replacement(
+    monkeypatch, tmp_path
+):
+    source = tmp_path / "known_hosts"
+    trusted = KNOWN_HOSTS_FILE.read_bytes()
+    source.write_bytes(trusted)
+    switch = make_config()["switches"][0]
+    switch["_ssh_known_hosts_file"] = source
+    captured = []
+
+    class Connection:
+        def __enter__(self):
+            snapshot = captured[0]
+            assert snapshot.is_file()
+            assert snapshot.read_bytes() == trusted
+            assert source.read_bytes() == b"untrusted replacement\n"
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            assert captured[0].is_file()
+
+    def connect_handler(**device):
+        snapshot = Path(device["alt_key_file"])
+        assert snapshot != source
+        assert device["ssh_strict"] is True
+        assert device["system_host_keys"] is False
+        assert device["alt_host_keys"] is True
+        assert snapshot.stat().st_mode & 0o777 == 0o600
+        captured.append(snapshot)
+        replacement = tmp_path / "replacement"
+        replacement.write_bytes(b"untrusted replacement\n")
+        replacement.replace(source)
+        return Connection()
+
+    monkeypatch.setattr(checker, "ConnectHandler", connect_handler)
+    with checker.ssh_connection(switch, "username", "password"):
+        assert captured[0].is_file()
+    assert not captured[0].exists()
+
+
+def test_each_ssh_connection_captures_current_source(tmp_path):
+    source = tmp_path / "known_hosts"
+    switch = make_config()["switches"][0]
+    switch["_ssh_known_hosts_file"] = source
+    source.write_bytes(b"first key\n")
+    with checker.snapshot_known_hosts(switch) as first:
+        assert first.read_bytes() == b"first key\n"
+    source.write_bytes(b"second key\n")
+    with checker.snapshot_known_hosts(switch) as second:
+        assert second.read_bytes() == b"second key\n"
+    assert first != second
+
+
+def test_snapshot_setup_failure_does_not_start_ssh(monkeypatch):
+    switch = make_config()["switches"][0]
+
+    def fail_setup(*args, **kwargs):
+        raise OSError("synthetic temp directory failure")
+
+    monkeypatch.setattr(checker.tempfile, "mkdtemp", fail_setup)
+    monkeypatch.setattr(
+        checker,
+        "ConnectHandler",
+        lambda **kwargs: pytest.fail("SSH started after snapshot setup failure"),
+    )
+    with (
+        pytest.raises(OSError, match="synthetic temp directory failure"),
+        checker.ssh_connection(switch, "username", "password"),
+    ):
+        pass
+
+
+def test_ssh_snapshot_cleanup_preserves_primary_error(monkeypatch):
+    switch = make_config()["switches"][0]
+    original_rmtree = checker.shutil.rmtree
+
+    def cleanup_then_fail(path):
+        original_rmtree(path)
+        raise OSError("synthetic cleanup failure")
+
+    monkeypatch.setattr(checker.shutil, "rmtree", cleanup_then_fail)
+    with (
+        pytest.raises(
+            checker.CertificateInstallationAttemptError, match="installation attempted"
+        ),
+        checker.snapshot_known_hosts(switch),
+    ):
+        raise checker.CertificateInstallationAttemptError("installation attempted")
+
+    with (
+        pytest.raises(ValueError, match="snapshot could not be removed"),
+        checker.snapshot_known_hosts(switch),
+    ):
+        pass
+
+
+def test_ssh_snapshot_removed_after_connection_failure(monkeypatch):
+    switch = make_config()["switches"][0]
+    snapshots = []
+
+    def connection_failure(**device):
+        snapshots.append(Path(device["alt_key_file"]))
+        assert snapshots[0].is_file()
+        raise NetmikoTimeoutException("synthetic SSH timeout")
+
+    monkeypatch.setattr(checker, "ConnectHandler", connection_failure)
+    with (
+        pytest.raises(NetmikoTimeoutException),
+        checker.ssh_connection(switch, "username", "password"),
+    ):
+        pass
+    assert not snapshots[0].exists()
 
 
 class HostKeyFailureConnection:

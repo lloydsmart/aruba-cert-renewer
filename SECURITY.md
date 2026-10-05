@@ -124,11 +124,15 @@ symlink and compares pre-open, post-open, and descriptor identities before
 reading. Parent-directory symlinks remain supported; only the configured final
 component is rejected. The verification CA is read once from the validated
 descriptor, with a 1 MiB bound, and that snapshot supplies both pre-install
-verification and live TLS trust without reopening its pathname. The SSH library
-reopens `known_hosts` by pathname; revalidation cannot eliminate that race.
-Deployment directories must therefore be protected from unrelated writers.
-Configuration-file and `known_hosts` size limits and a `known_hosts` snapshot
-remain separate input-boundary work.
+verification and live TLS trust without reopening its pathname. Configuration is
+securely opened and captured with a 1 MiB application resource ceiling before
+TOML parsing. For each SSH connection, the dedicated `known_hosts` source is
+securely opened and captured with a 256 KiB ceiling. The captured bytes are
+copied unchanged into a private temporary file with mode `0600` in a mode `0700`
+directory. Netmiko/Paramiko consumes that snapshot path during the connection,
+never the configured source pathname after capture. Strict verification uses
+only this trust file; system host keys are disabled. SSH command output and
+CSR/device output bounds remain separate input-boundary work.
 
 ## Container Publication
 
