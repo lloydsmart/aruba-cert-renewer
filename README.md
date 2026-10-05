@@ -568,8 +568,10 @@ paths are resolved relative to `config.toml`; absolute paths such as
 certificates trusted to issue switch HTTPS certificates. It is required by
 `--install-certificate`, `--renew`, and `--renew-due`. Before installation, the
 issued certificate is cryptographically path-validated against this bundle for
-the switch's configured host identity. After installation, the same file is
-loaded by Python's normal SSL trust machinery for live HTTPS verification.
+the switch's configured host identity. The file is securely opened and read
+once, with a 1 MiB limit. Both pre-install verification and Python's normal
+SSL trust machinery for live HTTPS use that captured content, even if the path
+changes during the operation.
 Relative paths are resolved relative to `config.toml`, not the process working
 directory. Do not put a CA private key or real infrastructure certificate in
 the repository.
@@ -607,11 +609,11 @@ world-writable. Read-only bind mounts remain required and complement rather
 than replace these application-level ownership, permission, regular-file, and
 symlink checks.
 
-The standard SSL and SSH libraries accept the CA and `known_hosts` inputs only
-as pathnames. The application validates each immediately before handing the
-path to those libraries, but cannot eliminate the final pathname-reopen race.
-Protect the containing deployment directories from modification by unrelated
-users as an additional operational control.
+The SSH library accepts `known_hosts` only as a pathname. The application
+validates it immediately before handing the path to that library, but cannot
+eliminate its final pathname-reopen race. Protect the containing deployment
+directories from modification by unrelated users as an additional operational
+control. The verification CA is instead passed to SSL from its captured content.
 
 ## SSH Host-Key Enrollment and Rotation
 
@@ -692,6 +694,9 @@ use different source types. A configured file is authoritative: an empty,
 invalid, unreadable, or malformed file fails closed and does not fall back to
 the direct variable. Each secret file must contain exactly one non-empty UTF-8
 line; either no terminator, one final LF, or one final CRLF is accepted.
+Both direct environment values and file-backed credentials have a 16 KiB
+resource ceiling measured in UTF-8 bytes. This limit does not define an
+OPNsense token format. Credential values are never included in errors.
 
 For example, Docker or another container runtime can mount secrets beneath
 `/run/secrets`:
@@ -883,7 +888,8 @@ python src/aruba_cert_renewer.py \
   --certificate-input switch-2027.crt.pem
 ```
 
-The install stage reads one bounded ASCII PEM certificate, retrieves and
+The install stage reads one bounded ASCII PEM certificate from a regular file;
+non-regular inputs are rejected without waiting for FIFO data. It retrieves and
 validates the named pending CSR again, and validates the certificate against
 that CSR and the configured switch identity. It then cryptographically verifies
 the certificate's trust path against the complete `verification.ca_file` CA

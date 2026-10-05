@@ -2,6 +2,8 @@ import base64
 import errno
 import ipaddress
 import logging
+import multiprocessing
+import os
 import re
 import warnings
 from datetime import UTC, date, datetime, timedelta, timezone
@@ -33,6 +35,10 @@ from secure_file import SecureFileError
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 KNOWN_HOSTS_FILE = FIXTURES_DIR / "known_hosts"
 OBSERVED_EKU_OID = x509.ObjectIdentifier("1.3.6.1.5.5.8.2.2")
+
+
+def synthetic_ca_snapshot():
+    return checker.VerificationCASnapshot(Path("public-ca.pem"), b"synthetic CA")
 
 
 def fail_next_lock_close(patch):
@@ -884,7 +890,7 @@ def test_every_aruba_connection_path_uses_common_device_parameters(
                 "unused certificate",
                 make_csr_settings(),
                 397,
-                Path("public-ca.pem"),
+                synthetic_ca_snapshot(),
                 digest="sha256",
             )
 
@@ -951,7 +957,7 @@ def test_ssh_failure_does_not_reach_opnsense(monkeypatch, operation):
                 "password",
                 make_csr_settings(),
                 make_opnsense_settings(),
-                Path("public-ca.pem"),
+                synthetic_ca_snapshot(),
             )
 
 
@@ -2622,7 +2628,9 @@ def test_verify_issued_certificate_trust_accepts_complete_ca_bundle(tmp_path):
         trusted_ca,
     )
 
-    checker.verify_issued_certificate_trust(certificate, switch, ca_file)
+    checker.verify_issued_certificate_trust(
+        certificate, switch, checker.capture_verification_ca(ca_file)
+    )
 
 
 def test_verify_issued_certificate_trust_accepts_ip_host_identity(tmp_path):
@@ -2645,7 +2653,9 @@ def test_verify_issued_certificate_trust_accepts_ip_host_identity(tmp_path):
     )
     ca_file = write_test_ca_bundle(tmp_path / "ca.pem", trusted_ca)
 
-    checker.verify_issued_certificate_trust(certificate, switch, ca_file)
+    checker.verify_issued_certificate_trust(
+        certificate, switch, checker.capture_verification_ca(ca_file)
+    )
 
 
 @pytest.mark.parametrize(
@@ -2668,23 +2678,177 @@ def test_verify_issued_certificate_trust_rejects_empty_or_malformed_bundle(
         checker.verify_issued_certificate_trust(
             certificate,
             make_config()["switches"][0],
-            ca_file,
+            checker.capture_verification_ca(ca_file),
         )
 
 
-def test_verify_issued_certificate_trust_rechecks_secure_file_metadata(tmp_path):
+def test_capture_verification_ca_rechecks_secure_file_metadata(tmp_path):
     _, trusted_ca = make_test_ca("Trusted Test CA")
-    _, _, certificate_pem = make_test_identity_and_certificate()
-    certificate = x509.load_pem_x509_certificate(certificate_pem.encode("ascii"))
     ca_file = write_test_ca_bundle(tmp_path / "ca.pem", trusted_ca)
     ca_file.chmod(0o620)
 
     with pytest.raises(SecureFileError, match="group-writable"):
-        checker.verify_issued_certificate_trust(
-            certificate,
-            make_config()["switches"][0],
-            ca_file,
+        checker.capture_verification_ca(ca_file)
+
+
+def test_verification_ca_snapshot_accepts_exact_mib_and_rejects_one_more(tmp_path):
+    _, trusted_ca = make_test_ca("Boundary Test CA")
+    pem = trusted_ca.public_bytes(serialization.Encoding.PEM)
+    ca_file = tmp_path / "ca.pem"
+    ca_file.write_bytes(
+        pem + b" " * (checker.MAX_VERIFICATION_CA_FILE_BYTES - len(pem))
+    )
+
+    snapshot = checker.get_verification_ca_file(
+        {"verification": {"ca_file": str(ca_file)}}, tmp_path / "config.toml"
+    )
+    assert len(snapshot.pem) == checker.MAX_VERIFICATION_CA_FILE_BYTES
+
+    ca_file.write_bytes(snapshot.pem + b" ")
+    with pytest.raises(ValueError, match="exceeds 1048576 bytes"):
+        checker.get_verification_ca_file(
+            {"verification": {"ca_file": str(ca_file)}}, tmp_path / "config.toml"
         )
+
+
+def test_verification_ca_snapshot_survives_path_replacement_for_both_trust_paths(
+    monkeypatch, tmp_path
+):
+    trusted_key, trusted_ca = make_test_ca("Snapshot CA A")
+    _, other_ca = make_test_ca("Replacement CA B")
+    _, csr, certificate_pem = make_test_identity_and_certificate(
+        not_before=datetime.now(UTC) - timedelta(minutes=1),
+        issuer_certificate=trusted_ca,
+        issuer_signing_key=trusted_key,
+    )
+    switch = make_config()["switches"][0]
+    certificate = checker.validate_issued_certificate(
+        certificate_pem, csr, switch, 397, digest="sha256"
+    )
+    ca_file = write_test_ca_bundle(tmp_path / "ca.pem", trusted_ca)
+    snapshot = checker.get_verification_ca_file(
+        {"verification": {"ca_file": str(ca_file)}}, tmp_path / "config.toml"
+    )
+    assert "BEGIN CERTIFICATE" not in repr(snapshot)
+    replacement = write_test_ca_bundle(tmp_path / "replacement.pem", other_ca)
+    replacement.replace(ca_file)
+
+    checker.verify_issued_certificate_trust(certificate, switch, snapshot)
+    with pytest.raises(ValueError, match="failed pre-install trust verification"):
+        checker.verify_issued_certificate_trust(
+            certificate, switch, checker.capture_verification_ca(ca_file)
+        )
+
+    expected_ca_der = trusted_ca.public_bytes(serialization.Encoding.DER)
+    unexpected_ca_der = other_ca.public_bytes(serialization.Encoding.DER)
+    checked_contexts = []
+
+    def inspect_tls_trust(addresses, host, context, deadline, socket_timeout):
+        trusted = context.get_ca_certs(binary_form=True)
+        assert expected_ca_der in trusted
+        assert unexpected_ca_der not in trusted
+        assert context.check_hostname
+        assert context.verify_mode == checker.ssl.CERT_REQUIRED
+        checked_contexts.append(context)
+        return certificate.public_bytes(serialization.Encoding.DER)
+
+    monkeypatch.setattr(checker, "_read_live_https_leaf", inspect_tls_trust)
+    monkeypatch.setattr(
+        checker,
+        "_resolve_live_https_addresses",
+        lambda host, deadline: [(checker.socket.AF_INET, ("192.0.2.10", 443))],
+    )
+    checker.verify_live_https_certificate(switch, snapshot, certificate)
+    assert len(checked_contexts) == 1
+
+
+@pytest.mark.parametrize(
+    "stage",
+    [
+        "preinstall",
+        "live",
+        "install",
+        "renew",
+        "renew_due",
+        "explicit_install",
+        "explicit_renew",
+    ],
+)
+def test_certificate_orchestration_rejects_ca_path_before_work(monkeypatch, stage):
+    ca_path = Path("public-ca.pem")
+    switch = make_config()["switches"][0]
+    monkeypatch.setattr(
+        checker,
+        "open_secure_file",
+        lambda *args, **kwargs: pytest.fail("Orchestration must not reopen CA path"),
+    )
+    monkeypatch.setattr(
+        checker,
+        "get_device_parameters",
+        lambda *args: pytest.fail("Invalid CA must fail before SSH setup"),
+    )
+    monkeypatch.setattr(
+        checker,
+        "renewal_preflight",
+        lambda *args, **kwargs: pytest.fail("Invalid CA must fail before renewal"),
+    )
+    monkeypatch.setattr(
+        checker,
+        "get_switch_credentials",
+        lambda *args: pytest.fail("Invalid CA must fail before credentials"),
+    )
+
+    def call_stage():
+        if stage == "preinstall":
+            checker.verify_issued_certificate_trust(object(), switch, ca_path)
+        elif stage == "live":
+            checker.verify_live_https_certificate(switch, ca_path, object())
+        elif stage == "install":
+            checker.install_pending_certificate(
+                switch,
+                "user",
+                "password",
+                "webcert2027",
+                "certificate",
+                make_csr_settings(),
+                397,
+                ca_path,
+                digest="sha256",
+            )
+        elif stage == "renew":
+            checker.renew_certificate(
+                switch,
+                "user",
+                "password",
+                make_csr_settings(),
+                make_opnsense_settings(),
+                ca_path,
+            )
+        elif stage == "renew_due":
+            checker.renew_due_certificates(
+                [switch],
+                Path("config.toml"),
+                30,
+                make_csr_settings(),
+                make_opnsense_settings(),
+                ca_path,
+            )
+        else:
+            args = SimpleNamespace(
+                renew=stage == "explicit_renew",
+                install_certificate=stage == "explicit_install",
+            )
+            checker.run_explicit_operation(
+                args,
+                [switch],
+                make_csr_settings(),
+                make_opnsense_settings(),
+                ca_path,
+                "certificate",
+            )
+
+    with pytest.raises(ValueError, match="captured verification CA snapshot"):
+        call_stage()
 
 
 def test_get_opnsense_settings_validates_configuration():
@@ -3113,7 +3277,9 @@ def test_issued_signature_accepts_configured_digest_and_issuer_family(
     )
     ca_file = write_test_ca_bundle(tmp_path / "issuer.pem", issuer_certificate)
     checker.verify_issued_certificate_trust(
-        certificate, make_config()["switches"][0], ca_file
+        certificate,
+        make_config()["switches"][0],
+        checker.capture_verification_ca(ca_file),
     )
 
 
@@ -3514,7 +3680,7 @@ def test_automatic_renewal_bounds_description_after_csr_creation(monkeypatch):
         "password",
         make_csr_settings(),
         make_opnsense_settings(),
-        Path("public-ca.pem"),
+        synthetic_ca_snapshot(),
     )
 
     assert result == certificate_name
@@ -3800,6 +3966,44 @@ def test_read_certificate_input_is_bounded(tmp_path):
         checker.read_certificate_input(certificate_file)
 
 
+def test_read_certificate_input_accepts_symlink_to_regular_file(tmp_path):
+    _, _, certificate_pem = make_test_identity_and_certificate()
+    target = tmp_path / "target.pem"
+    target.write_text(certificate_pem, encoding="ascii")
+    link = tmp_path / "link.pem"
+    link.symlink_to(target)
+
+    assert checker.read_certificate_input(link) == certificate_pem
+
+
+def test_read_certificate_input_rejects_directory(tmp_path):
+    with pytest.raises(ValueError, match="not a regular file"):
+        checker.read_certificate_input(tmp_path)
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="POSIX FIFO required")
+def test_read_certificate_input_rejects_fifo_without_blocking(tmp_path):
+    fifo = tmp_path / "certificate.fifo"
+    os.mkfifo(fifo)
+    result = multiprocessing.get_context("fork").Queue()
+
+    def read_fifo():
+        try:
+            checker.read_certificate_input(fifo)
+        except ValueError as error:
+            result.put(str(error))
+
+    process = multiprocessing.get_context("fork").Process(target=read_fifo)
+    process.start()
+    process.join(2)
+    if process.is_alive():
+        process.terminate()
+        process.join()
+
+    assert process.exitcode == 0, "FIFO input blocked without a writer"
+    assert "not a regular file" in result.get(timeout=1)
+
+
 def test_get_verification_ca_file_resolves_relative_to_config(monkeypatch, tmp_path):
     config_file = tmp_path / "config.toml"
     ca_file = tmp_path / "ca" / "internal-ca.pem"
@@ -3810,7 +4014,7 @@ def test_get_verification_ca_file_resolves_relative_to_config(monkeypatch, tmp_p
     monkeypatch.setattr(
         checker,
         "create_client_tls_context",
-        lambda *, cafile: calls.append(cafile) or object(),
+        lambda *, cadata: calls.append(cadata) or object(),
     )
 
     result = checker.get_verification_ca_file(
@@ -3818,8 +4022,9 @@ def test_get_verification_ca_file_resolves_relative_to_config(monkeypatch, tmp_p
         config_file,
     )
 
-    assert result == ca_file
-    assert calls == [str(ca_file)]
+    assert result.path == ca_file
+    assert result.pem == b"public CA placeholder"
+    assert calls == ["public CA placeholder"]
 
 
 def test_get_verification_ca_file_rejects_missing_file(tmp_path):
@@ -3828,6 +4033,43 @@ def test_get_verification_ca_file_rejects_missing_file(tmp_path):
             {"verification": {"ca_file": "missing.pem"}},
             tmp_path / "config.toml",
         )
+
+
+def test_get_verification_ca_file_rejects_malformed_trust(tmp_path):
+    ca_file = tmp_path / "invalid-ca.pem"
+    ca_file.write_bytes(b"not a certificate")
+
+    with pytest.raises(ValueError, match="cannot be loaded as a CA file"):
+        checker.get_verification_ca_file(
+            {"verification": {"ca_file": str(ca_file)}},
+            tmp_path / "config.toml",
+        )
+
+
+def test_capture_verification_ca_reports_read_failure_without_contents(
+    monkeypatch, tmp_path
+):
+    class UnreadableCA:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self, size):
+            assert size == checker.MAX_VERIFICATION_CA_FILE_BYTES + 1
+            raise OSError("synthetic private detail")
+
+    monkeypatch.setattr(
+        checker, "open_secure_file", lambda *args, **kwargs: UnreadableCA()
+    )
+
+    with pytest.raises(
+        ValueError, match="verification.ca_file cannot be read"
+    ) as raised:
+        checker.capture_verification_ca(tmp_path / "ca.pem")
+
+    assert "synthetic private detail" not in str(raised.value)
 
 
 @pytest.mark.parametrize(
@@ -3919,7 +4161,7 @@ def test_malformed_certificate_input_fails_before_credentials(monkeypatch, tmp_p
     monkeypatch.setattr(
         checker,
         "get_verification_ca_file",
-        lambda *args: tmp_path / "public-ca.pem",
+        lambda *args: synthetic_ca_snapshot(),
     )
     monkeypatch.setattr(
         checker,
@@ -4058,7 +4300,7 @@ def test_wrong_ca_fails_before_any_installation_command(monkeypatch, tmp_path):
             certificate_pem,
             make_csr_settings(),
             397,
-            ca_file,
+            checker.capture_verification_ca(ca_file),
             digest="sha256",
         )
 
@@ -4099,7 +4341,7 @@ def test_invalid_signature_with_trusted_issuer_name_fails_before_installation(
             certificate_pem,
             make_csr_settings(),
             397,
-            ca_file,
+            checker.capture_verification_ca(ca_file),
             digest="sha256",
         )
 
@@ -4140,7 +4382,7 @@ def test_install_pending_certificate_accepts_real_detail_shape_and_uses_guarded_
         certificate_pem,
         make_csr_settings(),
         397,
-        Path("public-ca.pem"),
+        synthetic_ca_snapshot(),
         digest="sha256",
     )
 
@@ -4240,12 +4482,32 @@ def test_explicit_install_trust_success_still_invokes_live_https(monkeypatch, tm
         tmp_path,
         lambda *args: live_calls.append(args),
     )
+    ca_opens = []
+    original_open = checker.open_secure_file
+    original_verify = checker.verify_issued_certificate_trust
+    preinstall_snapshots = []
+
+    def record_open(path, *, source_name, **kwargs):
+        if source_name == "verification.ca_file":
+            ca_opens.append(path)
+        return original_open(path, source_name=source_name, **kwargs)
+
+    def record_preinstall(certificate, switch, snapshot):
+        preinstall_snapshots.append(snapshot)
+        return original_verify(certificate, switch, snapshot)
+
+    monkeypatch.setattr(checker, "open_secure_file", record_open)
+    monkeypatch.setattr(checker, "verify_issued_certificate_trust", record_preinstall)
 
     assert checker.main() == checker.EXIT_OK
     assert connection.entered_config_mode
     assert "crypto pki install-signed-certificate" in connection.commands
     assert len(live_calls) == 1
-    assert live_calls[0][0:2] == (make_config()["switches"][0], ca_file)
+    assert live_calls[0][0] == make_config()["switches"][0]
+    assert isinstance(live_calls[0][1], checker.VerificationCASnapshot)
+    assert live_calls[0][1].path == ca_file
+    assert ca_opens == [ca_file]
+    assert preinstall_snapshots[0] is live_calls[0][1]
 
 
 def test_staged_install_accepts_old_valid_leaf(monkeypatch, tmp_path):
@@ -4382,7 +4644,7 @@ def test_bad_paste_prompt_never_sends_certificate(
             certificate_pem,
             make_csr_settings(),
             397,
-            Path("public-ca.pem"),
+            synthetic_ca_snapshot(),
             digest="sha256",
         )
 
@@ -4424,7 +4686,7 @@ def test_bad_replacement_prompt_never_sends_confirmation(
             certificate_pem,
             make_csr_settings(),
             397,
-            Path("public-ca.pem"),
+            synthetic_ca_snapshot(),
             digest="sha256",
         )
 
@@ -4465,7 +4727,7 @@ def test_certificate_validation_failure_sends_no_configuration_command(
             certificate_pem,
             make_csr_settings(),
             397,
-            Path("public-ca.pem"),
+            synthetic_ca_snapshot(),
             digest="sha256",
         )
 
@@ -4490,7 +4752,7 @@ def test_installed_certificate_name_is_rejected_before_config_mode(monkeypatch):
             certificate_pem,
             make_csr_settings(),
             397,
-            Path("public-ca.pem"),
+            synthetic_ca_snapshot(),
             digest="sha256",
         )
 
@@ -4523,7 +4785,7 @@ def test_post_install_summary_must_show_installed_web_certificate(
             certificate_pem,
             make_csr_settings(),
             397,
-            Path("public-ca.pem"),
+            synthetic_ca_snapshot(),
             digest="sha256",
         )
 
@@ -4556,7 +4818,7 @@ def test_post_install_detail_rejects_cli_errors_or_missing_success_marker(
             certificate_pem,
             make_csr_settings(),
             397,
-            Path("public-ca.pem"),
+            synthetic_ca_snapshot(),
             digest="sha256",
         )
 
@@ -4587,7 +4849,7 @@ def test_context_exit_error_after_install_is_post_install_failure(
             certificate_pem,
             make_csr_settings(),
             397,
-            Path("public-ca.pem"),
+            synthetic_ca_snapshot(),
             digest="sha256",
         )
 
@@ -4617,7 +4879,7 @@ def test_context_exit_oserror_cannot_reach_main_pre_install_path(
     monkeypatch.setattr(
         checker,
         "get_verification_ca_file",
-        lambda *args: tmp_path / "public-ca.pem",
+        lambda *args: synthetic_ca_snapshot(),
     )
     monkeypatch.setattr(
         checker, "get_switch_credentials", lambda *args: ("username", "password")
@@ -4666,7 +4928,7 @@ def test_pre_install_valueerror_and_oserror_remain_safe(monkeypatch, pre_install
             "not reached",
             make_csr_settings(),
             397,
-            Path("public-ca.pem"),
+            synthetic_ca_snapshot(),
             digest="sha256",
         )
 
@@ -4745,7 +5007,7 @@ def secure_ca_file(tmp_path):
     ca_file = tmp_path / "public-ca.pem"
     ca_file.write_text("public CA placeholder", encoding="ascii")
     ca_file.chmod(0o600)
-    return ca_file
+    return checker.capture_verification_ca(ca_file)
 
 
 @pytest.fixture
@@ -4779,7 +5041,7 @@ def test_verify_live_https_uses_verified_hostname_and_exact_der(
     monkeypatch.setattr(
         checker,
         "create_client_tls_context",
-        lambda *, cafile: context_calls.append(cafile) or context,
+        lambda *, cadata: context_calls.append(cadata) or context,
     )
 
     checker.verify_live_https_certificate(
@@ -4788,7 +5050,7 @@ def test_verify_live_https_uses_verified_hostname_and_exact_der(
         certificate,
     )
 
-    assert context_calls == [str(secure_ca_file)]
+    assert context_calls == ["public CA placeholder"]
     assert live_https_setup[0].addresses == [("192.0.2.10", 443)]
     assert 0 < live_https_setup[0].timeouts[0] <= 5
     assert context.wrap_calls == [(live_https_setup[0], "switch.example.com")]
@@ -4808,7 +5070,7 @@ def test_verify_live_https_uses_ip_host_for_connection_and_identity(
     context = FakeVerifyingSSLContext([expected_der])
     connections = []
     monkeypatch.setattr(
-        checker.ssl, "create_default_context", lambda *, cafile: context
+        checker.ssl, "create_default_context", lambda *, cadata: context
     )
 
     def socket_factory(family, socktype):
@@ -4844,7 +5106,7 @@ def test_verify_live_https_retries_until_expected_certificate_appears(
     context = FakeVerifyingSSLContext([b"previous certificate", expected_der])
     sleep_calls = []
     monkeypatch.setattr(
-        checker.ssl, "create_default_context", lambda *, cafile: context
+        checker.ssl, "create_default_context", lambda *, cadata: context
     )
     monkeypatch.setattr(checker.time, "sleep", sleep_calls.append)
 
@@ -4875,7 +5137,7 @@ def test_verify_live_https_rejects_wrong_or_unverified_certificate(
     certificate = x509.load_pem_x509_certificate(certificate_pem.encode("ascii"))
     context = FakeVerifyingSSLContext([tls_result])
     monkeypatch.setattr(
-        checker.ssl, "create_default_context", lambda *, cafile: context
+        checker.ssl, "create_default_context", lambda *, cadata: context
     )
 
     class FakeClock:
@@ -4914,7 +5176,7 @@ def test_verify_live_https_retries_transient_connection_failure(
     expected_der = certificate.public_bytes(serialization.Encoding.DER)
     context = FakeVerifyingSSLContext([expected_der])
     monkeypatch.setattr(
-        checker.ssl, "create_default_context", lambda *, cafile: context
+        checker.ssl, "create_default_context", lambda *, cadata: context
     )
 
     original_socket = checker.socket.socket
@@ -4950,7 +5212,7 @@ def test_verify_live_https_classifies_each_address_before_fallback(
     certificate = x509.load_pem_x509_certificate(certificate_pem.encode("ascii"))
     expected_der = certificate.public_bytes(serialization.Encoding.DER)
     context = FakeVerifyingSSLContext([expected_der])
-    monkeypatch.setattr(checker, "create_client_tls_context", lambda *, cafile: context)
+    monkeypatch.setattr(checker, "create_client_tls_context", lambda *, cadata: context)
     monkeypatch.setattr(
         checker,
         "_resolve_live_https_addresses",
@@ -4994,7 +5256,7 @@ def test_verify_live_https_all_addresses_retry_only_within_deadline(
     monkeypatch.setattr(
         checker,
         "create_client_tls_context",
-        lambda *, cafile: FakeVerifyingSSLContext([]),
+        lambda *, cadata: FakeVerifyingSSLContext([]),
     )
     monkeypatch.setattr(
         checker,
@@ -5064,7 +5326,7 @@ def test_verify_live_https_clips_connect_and_handshake_to_remaining_time(
     monkeypatch.setattr(checker, "_resolve_live_https_addresses", resolve)
     monkeypatch.setattr(checker.time, "monotonic", clock.monotonic)
     context = FakeVerifyingSSLContext([expected])
-    monkeypatch.setattr(checker, "create_client_tls_context", lambda *, cafile: context)
+    monkeypatch.setattr(checker, "create_client_tls_context", lambda *, cadata: context)
     original_connect = FakeTCPSocket.connect
 
     def slow_connect(self, address):
@@ -5092,7 +5354,7 @@ def test_verify_live_https_slow_connect_cannot_start_handshake_after_deadline(
     clock = FakeMonotonicClock()
     monkeypatch.setattr(checker.time, "monotonic", clock.monotonic)
     context = FakeVerifyingSSLContext([])
-    monkeypatch.setattr(checker, "create_client_tls_context", lambda *, cafile: context)
+    monkeypatch.setattr(checker, "create_client_tls_context", lambda *, cadata: context)
 
     def slow_connect(self, address):
         self.addresses.append(address)
@@ -5119,7 +5381,7 @@ def test_verify_live_https_clips_retry_sleep_and_stops_at_boundary(
     monkeypatch.setattr(checker.time, "monotonic", clock.monotonic)
     monkeypatch.setattr(checker.time, "sleep", clock.sleep)
     context = FakeVerifyingSSLContext([b"old valid leaf"])
-    monkeypatch.setattr(checker, "create_client_tls_context", lambda *, cafile: context)
+    monkeypatch.setattr(checker, "create_client_tls_context", lambda *, cadata: context)
 
     with pytest.raises(ValueError, match="different valid certificate"):
         checker.verify_live_https_certificate(
@@ -5143,7 +5405,7 @@ def test_verify_live_https_accepts_expected_leaf_on_final_legal_attempt(
     monkeypatch.setattr(checker.time, "monotonic", clock.monotonic)
     monkeypatch.setattr(checker.time, "sleep", clock.sleep)
     context = FakeVerifyingSSLContext([b"old valid leaf", expected])
-    monkeypatch.setattr(checker, "create_client_tls_context", lambda *, cafile: context)
+    monkeypatch.setattr(checker, "create_client_tls_context", lambda *, cadata: context)
 
     checker.verify_live_https_certificate(
         make_config()["switches"][0],
@@ -5166,7 +5428,7 @@ def test_verify_live_https_rejects_expected_leaf_completed_after_deadline(
     clock = FakeMonotonicClock()
     monkeypatch.setattr(checker.time, "monotonic", clock.monotonic)
     context = FakeVerifyingSSLContext([expected])
-    monkeypatch.setattr(checker, "create_client_tls_context", lambda *, cafile: context)
+    monkeypatch.setattr(checker, "create_client_tls_context", lambda *, cadata: context)
     original_getpeercert = FakeTLSSocket.getpeercert
 
     def slow_getpeercert(self, *, binary_form):
@@ -5202,7 +5464,7 @@ def test_verify_live_https_rejects_exact_leaf_compared_at_deadline(
 
     monkeypatch.setattr(checker.time, "monotonic", clock.monotonic)
     context = FakeVerifyingSSLContext([TimedPeerDER(expected)])
-    monkeypatch.setattr(checker, "create_client_tls_context", lambda *, cafile: context)
+    monkeypatch.setattr(checker, "create_client_tls_context", lambda *, cadata: context)
 
     with pytest.raises(ValueError, match="verification deadline expired"):
         checker.verify_live_https_certificate(
@@ -5226,7 +5488,7 @@ def test_verify_live_https_connection_refusal_until_deadline(
     monkeypatch.setattr(
         checker,
         "create_client_tls_context",
-        lambda *, cafile: FakeVerifyingSSLContext([]),
+        lambda *, cadata: FakeVerifyingSSLContext([]),
     )
 
     def refuse(self, address):
@@ -5255,7 +5517,7 @@ def test_verify_live_https_does_not_connect_after_resolution_uses_deadline(
     monkeypatch.setattr(
         checker,
         "create_client_tls_context",
-        lambda *, cafile: FakeVerifyingSSLContext([]),
+        lambda *, cadata: FakeVerifyingSSLContext([]),
     )
 
     def resolve(host, deadline):
@@ -5282,7 +5544,7 @@ def test_verify_live_https_tls_handshake_failures_are_hard_except_timeout(
     monkeypatch.setattr(checker.time, "monotonic", clock.monotonic)
     monkeypatch.setattr(checker.time, "sleep", clock.sleep)
     context = FakeVerifyingSSLContext([checker.ssl.SSLError("bad handshake")])
-    monkeypatch.setattr(checker, "create_client_tls_context", lambda *, cafile: context)
+    monkeypatch.setattr(checker, "create_client_tls_context", lambda *, cadata: context)
     with pytest.raises(ValueError, match="TLS handshake failed"):
         checker.verify_live_https_certificate(
             make_config()["switches"][0], secure_ca_file, certificate
@@ -5291,7 +5553,7 @@ def test_verify_live_https_tls_handshake_failures_are_hard_except_timeout(
     assert clock.sleeps == []
 
     context = FakeVerifyingSSLContext([TimeoutError("slow handshake")])
-    monkeypatch.setattr(checker, "create_client_tls_context", lambda *, cafile: context)
+    monkeypatch.setattr(checker, "create_client_tls_context", lambda *, cadata: context)
     with pytest.raises(ValueError, match="did not become ready"):
         checker.verify_live_https_certificate(
             make_config()["switches"][0],
@@ -5368,19 +5630,18 @@ def test_verify_live_https_resolution_skips_worker_after_deadline(monkeypatch):
         checker._resolve_live_https_addresses("switch.example.com", 1)
 
 
-def test_verify_live_https_revalidates_ca_before_ssl_path_reopen(monkeypatch, tmp_path):
+def test_verify_live_https_rejects_ca_path_before_ssl(monkeypatch, tmp_path):
     _, _, certificate_pem = make_test_identity_and_certificate()
     certificate = x509.load_pem_x509_certificate(certificate_pem.encode("ascii"))
     ca_file = tmp_path / "public-ca.pem"
     ca_file.write_text("public CA placeholder", encoding="ascii")
-    ca_file.chmod(0o620)
     monkeypatch.setattr(
         checker.ssl,
         "create_default_context",
-        lambda **kwargs: pytest.fail("Unsafe CA path must not reach SSL"),
+        lambda **kwargs: pytest.fail("CA pathname must not reach SSL"),
     )
 
-    with pytest.raises(ValueError, match="group-writable"):
+    with pytest.raises(ValueError, match="snapshot"):
         checker.verify_live_https_certificate(
             make_config()["switches"][0],
             ca_file,
@@ -5624,7 +5885,7 @@ def test_renew_certificate_composes_stages_in_order_without_files(monkeypatch):
     opnsense_settings = make_opnsense_settings()
     certificate_pem = "issued certificate PEM"
     certificate = object()
-    ca_file = Path("public-ca.pem")
+    ca_snapshot = synthetic_ca_snapshot()
 
     monkeypatch.setattr(
         checker,
@@ -5675,7 +5936,7 @@ def test_renew_certificate_composes_stages_in_order_without_files(monkeypatch):
         "password",
         csr_settings,
         opnsense_settings,
-        ca_file,
+        ca_snapshot,
         now=date(2026, 8, 29),
     )
 
@@ -5697,8 +5958,9 @@ def test_renew_certificate_composes_stages_in_order_without_files(monkeypatch):
             "webcert-20260829-01",
         )
     assert calls[3][1][4] == certificate_pem
-    assert calls[3][1][7] == ca_file
-    assert calls[4][1] == (switch, ca_file, certificate)
+    assert calls[3][1][7] is ca_snapshot
+    assert calls[4][1] == (switch, ca_snapshot, certificate)
+    assert calls[4][1][1] is ca_snapshot
 
 
 def test_renew_trust_failure_is_preinstall_and_skips_live_https(monkeypatch):
@@ -5732,7 +5994,7 @@ def test_renew_trust_failure_is_preinstall_and_skips_live_https(monkeypatch):
         lambda *args: calls.append(("https", args)),
     )
 
-    ca_file = Path("public-ca.pem")
+    ca_file = synthetic_ca_snapshot()
     with pytest.raises(
         checker.CertificatePreInstallationError,
         match="pre-install trust verification",
@@ -5813,7 +6075,7 @@ def test_renew_certificate_stops_after_failed_stage(
             "password",
             make_csr_settings(),
             make_opnsense_settings(),
-            Path("public-ca.pem"),
+            synthetic_ca_snapshot(),
         )
 
     assert calls == expected_calls
@@ -5848,7 +6110,7 @@ def test_renew_certificate_preflight_failure_attempts_no_stage(monkeypatch):
             "password",
             make_csr_settings(),
             make_opnsense_settings(),
-            Path("public-ca.pem"),
+            synthetic_ca_snapshot(),
         )
 
 
@@ -5883,7 +6145,7 @@ def test_renew_signing_failure_reports_that_pending_csr_remains(monkeypatch):
             "password",
             make_csr_settings(),
             make_opnsense_settings(),
-            Path("public-ca.pem"),
+            synthetic_ca_snapshot(),
         )
 
 
@@ -5937,7 +6199,7 @@ def test_renew_verification_ca_is_validated_before_credentials(monkeypatch, tmp_
     monkeypatch.setattr(
         checker,
         "get_verification_ca_file",
-        lambda *args: calls.append("verification") or Path("public-ca.pem"),
+        lambda *args: calls.append("verification") or synthetic_ca_snapshot(),
     )
     monkeypatch.setattr(
         checker,
@@ -5974,7 +6236,7 @@ def test_renew_https_failure_returns_error_with_post_install_warning(
     monkeypatch.setattr(
         checker,
         "get_verification_ca_file",
-        lambda *args: Path("public-ca.pem"),
+        lambda *args: synthetic_ca_snapshot(),
     )
     monkeypatch.setattr(
         checker, "get_switch_credentials", lambda *args: ("username", "password")
@@ -6017,7 +6279,7 @@ def test_renew_post_attempt_generation_oserror_never_claims_no_pending_csr(
     monkeypatch.setattr(
         checker,
         "get_verification_ca_file",
-        lambda *args: Path("public-ca.pem"),
+        lambda *args: synthetic_ca_snapshot(),
     )
     monkeypatch.setattr(
         checker, "get_switch_credentials", lambda *args: ("username", "password")
@@ -6129,7 +6391,7 @@ def test_explicit_renew_preserves_safety_messages(
     monkeypatch.setattr(
         checker,
         "get_verification_ca_file",
-        lambda config, config_file: Path("public-ca.pem"),
+        lambda config, config_file: synthetic_ca_snapshot(),
     )
     monkeypatch.setattr(
         checker,
@@ -6204,10 +6466,12 @@ def test_renew_due_orchestrates_and_summarizes_switches(
         renewal_calls.append(switch["name"])
         assert username == f"user-{switch['name']}"
         assert password == f"password-{switch['name']}"
+        assert settings[-1] is ca_snapshot
 
     monkeypatch.setattr(checker, "get_switch_credentials", credentials)
     monkeypatch.setattr(checker, "check_switch", check)
     monkeypatch.setattr(checker, "renew_certificate", renew)
+    ca_snapshot = synthetic_ca_snapshot()
 
     result = checker.renew_due_certificates(
         switches,
@@ -6215,7 +6479,7 @@ def test_renew_due_orchestrates_and_summarizes_switches(
         30,
         make_csr_settings(),
         make_opnsense_settings(),
-        Path("public-ca.pem"),
+        ca_snapshot,
     )
 
     assert result == exit_code
@@ -6267,7 +6531,7 @@ def test_renew_due_prints_start_before_switches_and_completion_in_summary(
         30,
         make_csr_settings(),
         make_opnsense_settings(),
-        Path("public-ca.pem"),
+        synthetic_ca_snapshot(),
     )
 
     assert result == checker.EXIT_OK
@@ -6313,7 +6577,7 @@ def test_renew_due_credential_failure_does_not_stop_later_switch(monkeypatch, ca
         30,
         make_csr_settings(),
         make_opnsense_settings(),
-        Path("public-ca.pem"),
+        synthetic_ca_snapshot(),
     )
 
     assert result == checker.EXIT_ERROR
@@ -6354,7 +6618,7 @@ def test_renew_due_unexpected_credential_failure_is_sanitized_and_isolated(
         30,
         make_csr_settings(),
         make_opnsense_settings(),
-        Path("public-ca.pem"),
+        synthetic_ca_snapshot(),
     )
 
     assert result == checker.EXIT_ERROR
@@ -6388,7 +6652,7 @@ def test_renew_due_credential_keyboard_interrupt_propagates(monkeypatch):
             30,
             make_csr_settings(),
             make_opnsense_settings(),
-            Path("public-ca.pem"),
+            synthetic_ca_snapshot(),
         )
 
 
@@ -6443,7 +6707,7 @@ def test_renew_due_failure_class_continues_without_retry(
         30,
         make_csr_settings(),
         make_opnsense_settings(),
-        Path("public-ca.pem"),
+        synthetic_ca_snapshot(),
     )
 
     assert result == checker.EXIT_ERROR
@@ -6478,7 +6742,7 @@ def test_renew_due_unexpected_renewal_failure_is_sanitized_and_isolated(
         30,
         make_csr_settings(),
         make_opnsense_settings(),
-        Path("public-ca.pem"),
+        synthetic_ca_snapshot(),
     )
 
     assert result == checker.EXIT_ERROR
@@ -6516,7 +6780,7 @@ def test_renew_due_renewal_keyboard_interrupt_propagates(monkeypatch):
             30,
             make_csr_settings(),
             make_opnsense_settings(),
-            Path("public-ca.pem"),
+            synthetic_ca_snapshot(),
         )
 
 
@@ -6547,7 +6811,7 @@ def test_renew_due_monitor_exception_does_not_stop_later_switch(monkeypatch):
             30,
             make_csr_settings(),
             make_opnsense_settings(),
-            Path("public-ca.pem"),
+            synthetic_ca_snapshot(),
         )
         == checker.EXIT_ERROR
     )
@@ -6625,7 +6889,7 @@ def test_renew_due_main_healthy_run_uses_selection_without_opnsense_contact(
     monkeypatch.setattr(
         checker,
         "get_verification_ca_file",
-        lambda config, config_file: Path("public-ca.pem"),
+        lambda config, config_file: synthetic_ca_snapshot(),
     )
     monkeypatch.setattr(
         checker,
@@ -6700,7 +6964,7 @@ def test_forced_renew_does_not_reject_automatic_threshold(monkeypatch):
     monkeypatch.setattr(
         checker,
         "get_verification_ca_file",
-        lambda config, config_file: Path("public-ca.pem"),
+        lambda config, config_file: synthetic_ca_snapshot(),
     )
     monkeypatch.setattr(
         checker,
@@ -6727,7 +6991,7 @@ def test_busy_lifecycle_rejects_before_switch_or_opnsense(monkeypatch, capsys, m
     monkeypatch.setattr(
         checker,
         "get_verification_ca_file",
-        lambda config, config_file: Path("public-ca.pem"),
+        lambda config, config_file: synthetic_ca_snapshot(),
     )
     monkeypatch.setattr(
         checker,
@@ -6794,7 +7058,7 @@ def test_renew_due_holds_lock_through_check_and_renewal(monkeypatch, status):
             30,
             make_csr_settings(),
             make_opnsense_settings(),
-            Path("public-ca.pem"),
+            synthetic_ca_snapshot(),
         )
         == checker.EXIT_OK
     )
@@ -6875,7 +7139,7 @@ def test_automatic_short_lived_certificate_never_reaches_install(monkeypatch):
             "password",
             make_csr_settings(),
             make_opnsense_settings(),
-            Path("public-ca.pem"),
+            synthetic_ca_snapshot(),
             minimum_remaining_days=30,
         )
 
@@ -6911,7 +7175,7 @@ def test_automatic_minimum_reaches_signing_and_preinstallation(monkeypatch):
         "password",
         make_csr_settings(),
         make_opnsense_settings(),
-        Path("public-ca.pem"),
+        synthetic_ca_snapshot(),
         minimum_remaining_days=30,
     )
     assert stages == [
@@ -6948,7 +7212,7 @@ def test_busy_staged_mutation_does_not_start(monkeypatch, mode, options):
     monkeypatch.setattr(
         checker,
         "get_verification_ca_file",
-        lambda config, config_file: Path("public-ca.pem"),
+        lambda config, config_file: synthetic_ca_snapshot(),
     )
     monkeypatch.setattr(
         checker, "read_certificate_input", lambda path: "synthetic certificate"
@@ -6990,7 +7254,7 @@ def test_explicit_operation_oserror_is_not_reported_as_lock_failure(monkeypatch)
     monkeypatch.setattr(
         checker,
         "get_verification_ca_file",
-        lambda config, config_file: Path("public-ca.pem"),
+        lambda config, config_file: synthetic_ca_snapshot(),
     )
 
     def fail_after_change(*args):
@@ -7022,7 +7286,7 @@ def test_post_csr_oserror_keeps_pending_csr_recovery_classification(
     monkeypatch.setattr(
         checker,
         "get_verification_ca_file",
-        lambda config, config_file: Path("public-ca.pem"),
+        lambda config, config_file: synthetic_ca_snapshot(),
     )
     monkeypatch.setattr(
         checker,
@@ -7098,7 +7362,7 @@ def test_busy_first_switch_does_not_block_second_switch(monkeypatch, capsys):
                 30,
                 make_csr_settings(),
                 make_opnsense_settings(),
-                Path("public-ca.pem"),
+                synthetic_ca_snapshot(),
             )
             == checker.EXIT_ERROR
         )
@@ -7149,7 +7413,7 @@ def test_aging_before_installation_rejects_certificate_at_warning_boundary(monke
             certificate_pem,
             make_csr_settings(),
             397,
-            Path("public-ca.pem"),
+            synthetic_ca_snapshot(),
             minimum_remaining_days=30,
             digest="sha256",
         )
@@ -7189,7 +7453,7 @@ def test_aging_during_trust_check_rejects_before_installation(monkeypatch):
             certificate_pem,
             make_csr_settings(),
             397,
-            Path("public-ca.pem"),
+            synthetic_ca_snapshot(),
             digest="sha256",
             minimum_remaining_days=30,
         )
@@ -7226,7 +7490,7 @@ def test_renew_due_release_failure_counts_one_error_and_continues(monkeypatch, c
             30,
             make_csr_settings(),
             make_opnsense_settings(),
-            Path("public-ca.pem"),
+            synthetic_ca_snapshot(),
         )
 
     output = capsys.readouterr().out
@@ -7271,7 +7535,7 @@ def test_renew_due_healthy_check_release_failure_is_not_renewal(monkeypatch, cap
             30,
             make_csr_settings(),
             make_opnsense_settings(),
-            Path("public-ca.pem"),
+            synthetic_ca_snapshot(),
         )
 
     output = capsys.readouterr().out
@@ -7314,7 +7578,7 @@ def test_renew_due_existing_error_and_release_failure_remain_distinct(
             30,
             make_csr_settings(),
             make_opnsense_settings(),
-            Path("public-ca.pem"),
+            synthetic_ca_snapshot(),
         )
 
     output = capsys.readouterr()
@@ -7353,7 +7617,7 @@ def test_explicit_mutation_release_failure_is_post_operation(
     monkeypatch.setattr(
         checker,
         "get_verification_ca_file",
-        lambda config, config_file: Path("public-ca.pem"),
+        lambda config, config_file: synthetic_ca_snapshot(),
     )
     monkeypatch.setattr(
         checker, "read_certificate_input", lambda path: "synthetic certificate"

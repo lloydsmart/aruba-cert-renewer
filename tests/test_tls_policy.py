@@ -1,6 +1,7 @@
 import ssl
 from datetime import UTC, datetime, timedelta
 
+import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -18,7 +19,7 @@ def test_client_tls_context_has_explicit_floor_and_verification():
     assert context.verify_mode == ssl.CERT_REQUIRED
 
 
-def test_client_tls_context_loads_configured_ca_file(tmp_path):
+def test_client_tls_context_loads_configured_ca_data():
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Test CA")])
     now = datetime.now(UTC)
@@ -33,10 +34,19 @@ def test_client_tls_context_loads_configured_ca_file(tmp_path):
         .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
         .sign(key, hashes.SHA256())
     )
-    ca_file = tmp_path / "ca.pem"
-    ca_file.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
+    ca_data = certificate.public_bytes(serialization.Encoding.PEM).decode("ascii")
 
-    context = create_client_tls_context(cafile=str(ca_file))
+    context = create_client_tls_context(cadata=ca_data)
 
     assert context.cert_store_stats()["x509_ca"] == 1
     assert context.minimum_version == ssl.TLSVersion.TLSv1_2
+
+
+def test_client_tls_context_rejects_cafile_authority_without_disclosure():
+    with pytest.raises(TypeError, match="cafile") as raised:
+        create_client_tls_context(cafile="synthetic-ca-path")
+
+    assert "synthetic-ca-path" not in str(raised.value)
+
+    with pytest.raises(TypeError, match="cafile"):
+        create_client_tls_context(cafile="synthetic-ca-path", cadata="synthetic-ca")

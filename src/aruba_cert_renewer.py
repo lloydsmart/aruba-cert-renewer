@@ -16,6 +16,8 @@ import sys
 import time
 import tomllib
 import warnings
+from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from types import MappingProxyType
@@ -58,6 +60,46 @@ HTTPS_VERIFICATION_WINDOW_SECONDS = 30
 HTTPS_RETRY_DELAY_SECONDS = 2
 HTTPS_SOCKET_TIMEOUT_SECONDS = 5
 HTTPS_RESOLVER_CLEANUP_SECONDS = 0.1
+
+
+@dataclass(frozen=True)
+class VerificationCASnapshot:
+    path: Path
+    pem: bytes = dataclass_field(repr=False)
+
+
+def capture_verification_ca(path):
+    try:
+        with open_secure_file(path, source_name="verification.ca_file") as ca_file:
+            ca_bytes = ca_file.read(MAX_VERIFICATION_CA_FILE_BYTES + 1)
+    except OSError:
+        raise ValueError(f"verification.ca_file cannot be read: {path}") from None
+    if len(ca_bytes) > MAX_VERIFICATION_CA_FILE_BYTES:
+        raise ValueError(
+            "verification.ca_file exceeds "
+            f"{MAX_VERIFICATION_CA_FILE_BYTES} bytes: {path}"
+        )
+    if not ca_bytes:
+        raise ValueError(
+            f"verification.ca_file does not contain any trusted certificates: {path}"
+        )
+    return VerificationCASnapshot(Path(path), ca_bytes)
+
+
+def require_verification_ca_snapshot(snapshot):
+    if not isinstance(snapshot, VerificationCASnapshot):
+        raise ValueError("A captured verification CA snapshot is required")
+    return snapshot
+
+
+def _ca_ssl_data(snapshot):
+    try:
+        return snapshot.pem.decode("ascii")
+    except UnicodeDecodeError:
+        raise ValueError(
+            f"verification.ca_file does not contain valid PEM certificates: {snapshot.path}"
+        ) from None
+
 
 CERTIFICATE_PASTE_PROMPT = "Paste the certificate here and enter:"
 CERTIFICATE_REPLACEMENT_PROMPT = (
@@ -835,17 +877,16 @@ def get_verification_ca_file(config, config_file):
         raise ValueError("verification.ca_file contains unsupported characters")
 
     ca_file = resolve_config_relative_path(configured_path, config_file)
-    with open_secure_file(ca_file, source_name="verification.ca_file"):
-        pass
+    snapshot = capture_verification_ca(ca_file)
 
     try:
-        create_client_tls_context(cafile=str(ca_file))
-    except (OSError, ssl.SSLError) as error:
+        create_client_tls_context(cadata=_ca_ssl_data(snapshot))
+    except (OSError, ssl.SSLError, ValueError):
         raise ValueError(
-            f"verification.ca_file cannot be loaded as a CA file: {ca_file}: {error}"
-        ) from error
+            f"verification.ca_file cannot be loaded as a CA file: {ca_file}"
+        ) from None
 
-    return ca_file
+    return snapshot
 
 
 def validate_csr_settings(csr_settings):
@@ -1298,38 +1339,22 @@ def validate_issued_certificate(
     return certificate
 
 
-def verify_issued_certificate_trust(certificate, switch, verification_ca_file):
+def verify_issued_certificate_trust(certificate, switch, verification_ca_snapshot):
     """Verify an issued server certificate against the configured CA bundle."""
-    with open_secure_file(
-        verification_ca_file,
-        source_name="verification.ca_file",
-    ) as ca_file:
-        ca_bytes = ca_file.read(MAX_VERIFICATION_CA_FILE_BYTES + 1)
-
-    if len(ca_bytes) > MAX_VERIFICATION_CA_FILE_BYTES:
-        raise ValueError(
-            "verification.ca_file exceeds "
-            f"{MAX_VERIFICATION_CA_FILE_BYTES} bytes: {verification_ca_file}"
-        )
-
-    if not ca_bytes:
-        raise ValueError(
-            "verification.ca_file does not contain any trusted certificates: "
-            f"{verification_ca_file}"
-        )
+    snapshot = require_verification_ca_snapshot(verification_ca_snapshot)
 
     try:
-        trusted_certificates = x509.load_pem_x509_certificates(ca_bytes)
-    except ValueError as error:
+        trusted_certificates = x509.load_pem_x509_certificates(snapshot.pem)
+    except ValueError:
         raise ValueError(
             "verification.ca_file does not contain valid PEM certificates: "
-            f"{verification_ca_file}"
-        ) from error
+            f"{snapshot.path}"
+        ) from None
 
     if not trusted_certificates:
         raise ValueError(
             "verification.ca_file does not contain any trusted certificates: "
-            f"{verification_ca_file}"
+            f"{snapshot.path}"
         )
 
     host_identity = parse_identity(switch["host"], "switch host")
@@ -1349,13 +1374,21 @@ def verify_issued_certificate_trust(certificate, switch, verification_ca_file):
     except VerificationError as error:
         raise ValueError(
             "Issued certificate failed pre-install trust verification against "
-            f"verification.ca_file ({verification_ca_file}): {error}"
+            f"verification.ca_file ({snapshot.path}): {error}"
         ) from error
 
 
 def read_certificate_input(certificate_input):
     try:
-        with certificate_input.open("rb") as input_file:
+        flags = os.O_RDONLY | os.O_NONBLOCK
+        flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_BINARY", 0)
+        descriptor = os.open(certificate_input, flags)
+        try:
+            input_file = os.fdopen(descriptor, "rb")
+        except BaseException:
+            os.close(descriptor)
+            raise
+        with input_file:
             if not stat.S_ISREG(os.fstat(input_file.fileno()).st_mode):
                 raise ValueError(
                     f"Certificate input is not a regular file: {certificate_input}"
@@ -1572,12 +1605,13 @@ def renew_certificate(
     password,
     csr_settings,
     opnsense_settings,
-    verification_ca_file,
+    verification_ca_snapshot,
     *,
     now=None,
     minimum_remaining_days=None,
 ):
     """Compose the proven staged functions into one explicit renewal."""
+    require_verification_ca_snapshot(verification_ca_snapshot)
     preflight = renewal_preflight(
         switch,
         username,
@@ -1635,7 +1669,7 @@ def renew_certificate(
             certificate_pem,
             csr_settings,
             opnsense_settings["lifetime_days"],
-            verification_ca_file,
+            verification_ca_snapshot,
             digest=opnsense_settings["digest"],
             minimum_remaining_days=minimum_remaining_days,
         )
@@ -1653,7 +1687,7 @@ def renew_certificate(
     try:
         verify_live_https_certificate(
             switch,
-            verification_ca_file,
+            verification_ca_snapshot,
             certificate,
         )
     except (ValueError, OSError, ssl.SSLError) as error:
@@ -2000,11 +2034,12 @@ def install_pending_certificate(
     certificate_pem,
     csr_settings,
     lifetime_days,
-    verification_ca_file,
+    verification_ca_snapshot,
     *,
     digest,
     minimum_remaining_days=None,
 ):
+    require_verification_ca_snapshot(verification_ca_snapshot)
     certificate_name = validate_cli_identifier(
         certificate_name,
         "certificate name",
@@ -2041,7 +2076,7 @@ def install_pending_certificate(
             verify_issued_certificate_trust(
                 certificate,
                 switch,
-                verification_ca_file,
+                verification_ca_snapshot,
             )
             _require_current_certificate_validity(
                 certificate, datetime.now(UTC), minimum_remaining_days
@@ -2092,13 +2127,14 @@ def install_pending_certificate(
 
 def verify_live_https_certificate(
     switch,
-    ca_file,
+    verification_ca_snapshot,
     expected_certificate,
     *,
     verification_window=HTTPS_VERIFICATION_WINDOW_SECONDS,
     retry_delay=HTTPS_RETRY_DELAY_SECONDS,
     socket_timeout=HTTPS_SOCKET_TIMEOUT_SECONDS,
 ):
+    snapshot = require_verification_ca_snapshot(verification_ca_snapshot)
     for value, name, zero_allowed in (
         (verification_window, "verification window", False),
         (retry_delay, "retry delay", True),
@@ -2115,9 +2151,12 @@ def verify_live_https_certificate(
 
     host = validate_switch_signing_identity(switch)["common_name"]
     expected_der = expected_certificate.public_bytes(serialization.Encoding.DER)
-    with open_secure_file(ca_file, source_name="verification.ca_file"):
-        pass
-    context = create_client_tls_context(cafile=str(ca_file))
+    try:
+        context = create_client_tls_context(cadata=_ca_ssl_data(snapshot))
+    except (OSError, ssl.SSLError, ValueError):
+        raise ValueError(
+            f"verification.ca_file cannot be loaded as a CA file: {snapshot.path}"
+        ) from None
 
     if not context.check_hostname or context.verify_mode != ssl.CERT_REQUIRED:
         raise ValueError("TLS verification context is not securely configured")
@@ -2455,8 +2494,9 @@ def renew_due_certificates(
     warning_days,
     csr_settings,
     opnsense_settings,
-    verification_ca_file,
+    verification_ca_snapshot,
 ):
+    require_verification_ca_snapshot(verification_ca_snapshot)
     validate_automatic_renewal_window(warning_days, opnsense_settings)
     print_run_start("Aruba certificate renewal check", get_local_time())
     results = []
@@ -2511,7 +2551,7 @@ def renew_due_certificates(
                         password,
                         csr_settings,
                         opnsense_settings,
-                        verification_ca_file,
+                        verification_ca_snapshot,
                         minimum_remaining_days=warning_days,
                     )
                 except RENEWAL_FAILURE_TYPES as error:
@@ -2606,9 +2646,11 @@ def run_explicit_operation(
     switches,
     csr_settings,
     opnsense_settings,
-    verification_ca_file,
+    verification_ca_snapshot,
     certificate_pem,
 ):
+    if args.renew or args.install_certificate:
+        require_verification_ca_snapshot(verification_ca_snapshot)
     try:
         username, password = get_switch_credentials(switches[0], args.config)
     except ValueError as error:
@@ -2625,7 +2667,7 @@ def run_explicit_operation(
                 password,
                 csr_settings,
                 opnsense_settings,
-                verification_ca_file,
+                verification_ca_snapshot,
             )
             return EXIT_OK
 
@@ -2645,7 +2687,7 @@ def run_explicit_operation(
                 certificate_pem,
                 csr_settings,
                 opnsense_settings["lifetime_days"],
-                verification_ca_file,
+                verification_ca_snapshot,
                 digest=opnsense_settings["digest"],
             )
 
@@ -2673,7 +2715,7 @@ def run_explicit_operation(
         try:
             verify_live_https_certificate(
                 switch,
-                verification_ca_file,
+                verification_ca_snapshot,
                 certificate,
             )
         except (ValueError, OSError, ssl.SSLError) as error:
@@ -2766,7 +2808,7 @@ def run_explicit_operation(
 def main():
     args = parse_args()
     configure_logging(args.debug)
-    csr_settings = opnsense_settings = verification_ca_file = certificate_pem = None
+    csr_settings = opnsense_settings = verification_ca_snapshot = certificate_pem = None
 
     try:
         validate_cli_args(args)
@@ -2793,7 +2835,7 @@ def main():
                 validate_switch_signing_identity(switch)
 
         if args.install_certificate or args.renew or renew_due:
-            verification_ca_file = get_verification_ca_file(config, args.config)
+            verification_ca_snapshot = get_verification_ca_file(config, args.config)
 
         if args.install_certificate:
             certificate_pem = read_certificate_input(args.certificate_input)
@@ -2818,7 +2860,7 @@ def main():
             warning_days,
             csr_settings,
             opnsense_settings,
-            verification_ca_file,
+            verification_ca_snapshot,
         )
 
     if explicit_operation:
@@ -2836,7 +2878,7 @@ def main():
                         switches,
                         csr_settings,
                         opnsense_settings,
-                        verification_ca_file,
+                        verification_ca_snapshot,
                         certificate_pem,
                     )
                 return body_result
@@ -2845,7 +2887,7 @@ def main():
                 switches,
                 csr_settings,
                 opnsense_settings,
-                verification_ca_file,
+                verification_ca_snapshot,
                 certificate_pem,
             )
         except LifecycleLockReleaseError:

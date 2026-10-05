@@ -122,11 +122,13 @@ Where supported, the opener uses `O_NOFOLLOW` and validates metadata from the
 opened descriptor with `fstat`. Its portable fallback rejects a pre-open
 symlink and compares pre-open, post-open, and descriptor identities before
 reading. Parent-directory symlinks remain supported; only the configured final
-component is rejected. The SSL and SSH libraries subsequently reopen CA and
-`known_hosts` files by pathname, so the application revalidates immediately
-before each handoff but cannot eliminate that final library-level pathname
-race. Deployment directories must therefore be protected from unrelated
-writers.
+component is rejected. The verification CA is read once from the validated
+descriptor, with a 1 MiB bound, and that snapshot supplies both pre-install
+verification and live TLS trust without reopening its pathname. The SSH library
+reopens `known_hosts` by pathname; revalidation cannot eliminate that race.
+Deployment directories must therefore be protected from unrelated writers.
+Configuration-file and `known_hosts` size limits and a `known_hosts` snapshot
+remain separate input-boundary work.
 
 ## Container Publication
 
@@ -610,6 +612,8 @@ The automation is limited to CA description lookup, CSR signing, and public-cert
 * Never log OPNsense API keys, secrets, Basic Authorization headers, full CSRs, or full certificates.
 * Supply OPNsense credentials through `OPNSENSE_API_KEY` and `OPNSENSE_API_SECRET`, or reference mounted secret files
   through `OPNSENSE_API_KEY_FILE` and `OPNSENSE_API_SECRET_FILE`; do not put credentials in TOML or CLI arguments.
+* Bound each direct environment credential to 16 KiB encoded as UTF-8, matching the file-source resource ceiling.
+  This is an implementation bound, not an OPNsense token-format rule; credential values are never echoed in errors.
 * Keep TLS certificate and hostname verification enabled for every OPNsense request.
 * Accept only an explicit HTTPS origin in `opnsense.base_url`; ignore ambient environment and system proxies for
   OPNsense API routing.
@@ -689,10 +693,11 @@ these properties before the operation succeeds:
 * Normal hostname or IP verification succeeds for the configured switch host.
 * The served certificate is byte-for-byte the expected certificate in DER form.
 
-The configured CA file contains public certificate material only. It must be
-loaded securely for pre-install path verification and by Python's normal SSL
-trust machinery for live verification. TLS hostname checking and certificate
-verification must never be disabled, including during bounded post-install
+The configured CA file contains public certificate material only. It is
+securely opened once and read with a 1 MiB bound; pre-install path verification
+and Python's normal SSL trust machinery consume the same captured content.
+TLS hostname checking and certificate verification must never be disabled,
+including during bounded post-install
 retries. The live check remains mandatory because it verifies what the switch
 actually serves, including exact certificate equality; pre-install path
 verification does not replace it.
