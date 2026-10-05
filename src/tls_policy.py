@@ -3,9 +3,9 @@
 import ssl
 
 
-def create_client_tls_context(*, cafile=None):
+def create_client_tls_context(*, cadata=None):
     """Create a verified client context with the project's protocol floor."""
-    context = ssl.create_default_context(cafile=cafile)
+    context = ssl.create_default_context(cadata=cadata)
     context.minimum_version = ssl.TLSVersion.TLSv1_2
 
     if not context.check_hostname or context.verify_mode != ssl.CERT_REQUIRED:

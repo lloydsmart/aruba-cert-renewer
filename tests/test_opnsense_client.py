@@ -736,6 +736,105 @@ def test_file_and_direct_credentials_produce_identical_authorization(
     assert file_authorization == direct_authorization
 
 
+@pytest.mark.parametrize("name", ["OPNSENSE_API_KEY", "OPNSENSE_API_SECRET"])
+@pytest.mark.parametrize("value", ["x" * 16384, "é" * 8192])
+def test_direct_credential_accepts_exact_utf8_limit(monkeypatch, name, value):
+    monkeypatch.setenv(name, value)
+
+    client = opnsense_client.OPNsenseClient(BASE_URL)
+
+    decoded = base64.b64decode(client._authorization.removeprefix("Basic "))
+    assert value.encode("utf-8") in decoded
+
+
+@pytest.mark.parametrize("name", ["OPNSENSE_API_KEY", "OPNSENSE_API_SECRET"])
+@pytest.mark.parametrize("value", ["x" * 16385, "é" * 8192 + "x"])
+def test_direct_credential_rejects_overlong_utf8_without_disclosure(
+    monkeypatch, name, value
+):
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(
+        opnsense_client.OPNsenseAPIError, match="exceeds 16384 bytes"
+    ) as raised:
+        opnsense_client.OPNsenseClient(BASE_URL)
+
+    assert name in str(raised.value)
+    assert value not in str(raised.value)
+    assert "Basic " not in str(raised.value)
+
+
+@pytest.mark.parametrize("name", ["OPNSENSE_API_KEY", "OPNSENSE_API_SECRET"])
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [("", "is empty"), ("secret\nvalue", "one line")],
+)
+def test_direct_credential_shares_file_content_rules_without_disclosure(
+    monkeypatch, name, value, message
+):
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(opnsense_client.OPNsenseAPIError, match=message) as raised:
+        opnsense_client.OPNsenseClient(BASE_URL)
+
+    assert value not in str(raised.value) or not value
+
+
+def test_shared_credential_content_validator_rejects_nul_without_disclosure():
+    with pytest.raises(
+        opnsense_client.OPNsenseAPIError, match="contains NUL"
+    ) as raised:
+        opnsense_client._validate_credential_content(
+            "secret\x00value", "OPNSENSE_API_KEY"
+        )
+
+    assert "secret" not in str(raised.value)
+
+
+def test_direct_credential_rejects_invalid_utf8_without_disclosure(monkeypatch):
+    monkeypatch.setenv("OPNSENSE_API_KEY", "secret\udcffvalue")
+
+    with pytest.raises(opnsense_client.OPNsenseAPIError, match="valid UTF-8") as raised:
+        opnsense_client.OPNsenseClient(BASE_URL)
+
+    assert "secret" not in str(raised.value)
+
+
+@pytest.mark.parametrize("name", ["OPNSENSE_API_KEY_FILE", "OPNSENSE_API_SECRET_FILE"])
+def test_secret_file_accepts_exact_size_limit(monkeypatch, tmp_path, name):
+    path = tmp_path / "credential"
+    path.write_bytes(b"x" * opnsense_client.MAX_SECRET_FILE_BYTES)
+    monkeypatch.setenv(name, str(path))
+
+    client = opnsense_client.OPNsenseClient(BASE_URL)
+
+    assert b"x" * opnsense_client.MAX_SECRET_FILE_BYTES in base64.b64decode(
+        client._authorization.removeprefix("Basic ")
+    )
+
+
+@pytest.mark.parametrize(
+    ("file_name", "direct_name"),
+    [
+        ("OPNSENSE_API_KEY_FILE", "OPNSENSE_API_KEY"),
+        ("OPNSENSE_API_SECRET_FILE", "OPNSENSE_API_SECRET"),
+    ],
+)
+def test_secret_file_precedence_skips_oversized_direct_value(
+    monkeypatch, tmp_path, file_name, direct_name
+):
+    path = tmp_path / "credential"
+    path.write_bytes(b"file-value")
+    monkeypatch.setenv(file_name, str(path))
+    monkeypatch.setenv(direct_name, "x" * 16385)
+
+    client = opnsense_client.OPNsenseClient(BASE_URL)
+
+    assert b"file-value" in base64.b64decode(
+        client._authorization.removeprefix("Basic ")
+    )
+
+
 def test_basic_authentication_and_tls_context_are_used(monkeypatch):
     captured = {}
 

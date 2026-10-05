@@ -247,13 +247,23 @@ def _read_secret_file(configured_path, source_name):
     elif secret.endswith("\n"):
         secret = secret[:-1]
 
-    if "\r" in secret or "\n" in secret:
+    return _validate_credential_content(secret, source_name)
+
+
+def _validate_credential_content(credential, source_name):
+    try:
+        encoded_size = len(credential.encode("utf-8"))
+    except UnicodeEncodeError:
+        raise OPNsenseAPIError(f"{source_name} must contain valid UTF-8") from None
+    if encoded_size > MAX_SECRET_FILE_BYTES:
+        raise OPNsenseAPIError(f"{source_name} exceeds {MAX_SECRET_FILE_BYTES} bytes")
+    if "\x00" in credential:
+        raise OPNsenseAPIError(f"{source_name} contains NUL")
+    if "\r" in credential or "\n" in credential:
         raise OPNsenseAPIError(f"{source_name} must contain exactly one line")
-
-    if not secret:
+    if not credential:
         raise OPNsenseAPIError(f"{source_name} is empty")
-
-    return secret
+    return credential
 
 
 def _load_credential(direct_name, file_name):
@@ -261,10 +271,9 @@ def _load_credential(direct_name, file_name):
         return _read_secret_file(os.environ[file_name], file_name)
 
     credential = os.environ.get(direct_name)
-    if not credential:
+    if credential is None:
         raise OPNsenseAPIError(f"{direct_name} or {file_name} must be set")
-
-    return credential
+    return _validate_credential_content(credential, direct_name)
 
 
 class OPNsenseClient:
