@@ -117,10 +117,16 @@ command echo, prompt and a 4 KiB framing allowance; certificate paste also
 allows the public certificate's possible terminal echo. The returned-output
 checks remain in place. Overflow closes the SSH transport and requires a new
 connection. The CLI limits begin after Paramiko creates the shell channel.
-F09e-B bounds pre-auth SSH textual identification and banner input only.
-F09e-C remains open for peer-directed pre-auth binary SSH packet-length
-allocation in Paramiko 4.0.0. These limits do not cap kernel/socket buffering,
-other finite Paramiko transport/window buffers, or total process RSS.
+Inbound SSH transport packets are limited to a `packet_length` field value of
+256 KiB throughout the connection. A larger declared packet closes the
+connection before a body read sized from that declaration. The field excludes
+its own four bytes and MAC; this is a project resource policy, not an Aruba
+maximum. Large CLI output can span multiple permitted packets. The raw and
+processed CLI budgets above and the returned-output checks still limit
+cumulative application output. SSH compression is currently not requested;
+enabling it later requires review of decompressed-output resource policy.
+These limits do not cap kernel/socket buffering, finite Paramiko
+transport/window buffers, or total process RSS.
 
 ## Requirements
 

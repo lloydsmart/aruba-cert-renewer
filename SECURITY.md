@@ -158,10 +158,16 @@ not an RFC or Aruba vendor maximum. Read-only production measurements found
 zero preceding lines and a 24-byte identification line, 24 textual bytes total,
 on each of two switches. No Netmiko session log is configured.
 
-F09e-C remains open: Paramiko 4.0.0's pre-authentication binary packet reader
-can derive a very large recv request from a peer-controlled 32-bit packet
-length. The textual boundary does not address binary packet lengths, and these
-limits do not bound total process RSS.
+For pinned Paramiko 4.0.0, every inbound SSH transport packet declaring a
+`packet_length` field greater than 262,144 is rejected before a body recv or
+allocation proportional to that declaration. The field excludes its own four
+bytes and the MAC; bounded MAC or AEAD tag overhead is permitted. This 256 KiB
+field ceiling is project resource policy, not an Aruba maximum. The textual
+pre-authentication and cumulative CLI limits above remain independent. Allowed
+packets still use finite memory, and many packets can arrive. This ceiling
+does not bound kernel/socket buffering, finite Paramiko structures and channel
+windows, or total process RSS. The project does not request SSH compression;
+future enablement requires review of decompressed-output expansion.
 
 ## Container Publication
 

@@ -1,6 +1,7 @@
 """Synthetic channel tests for the Netmiko 4.8.0 SSH read boundary."""
 
 from threading import Lock
+from types import SimpleNamespace
 
 import netmiko.base_connection as netmiko_base
 import pytest
@@ -16,6 +17,7 @@ from bounded_netmiko import (
     SSHOutputLimitError,
     assert_netmiko_contract,
 )
+from bounded_paramiko import SSHBinaryPacketLimitError
 
 
 class FakeChannel:
@@ -63,6 +65,9 @@ class FakeSSHClient:
 
     def close(self):
         self.closed = True
+
+    def get_transport(self):
+        return getattr(self, "transport", None)
 
 
 def make_connection(chunks=(), **kwargs):
@@ -264,6 +269,60 @@ def test_poisoned_disconnect_skips_procurve_cleanup(monkeypatch):
     with conn.read_budget(2), pytest.raises(SSHOutputLimitError):
         conn.channel.read_channel()
     conn.disconnect()
+
+
+def test_binary_packet_overflow_poison_skips_all_protocol_io(monkeypatch):
+    conn = make_connection([b"unread"])
+    channel = conn.remote_conn
+    client = FakeSSHClient(channel)
+    packetizer = SimpleNamespace(binary_packet_limit_exceeded=True)
+    client.transport = SimpleNamespace(packetizer=packetizer)
+    conn.remote_conn_pre = client
+    monkeypatch.setattr(
+        HPProcurveSSH,
+        "cleanup",
+        lambda *args, **kwargs: pytest.fail("protocol cleanup attempted"),
+    )
+    assert conn.poisoned
+    assert channel.closed and client.closed
+    before = (len(channel.requests), len(channel.writes))
+    for operation in (
+        lambda: conn.channel.read_channel(),
+        lambda: conn.channel.write_channel("x"),
+        lambda: conn.read_channel(),
+        lambda: conn.write_channel("x"),
+        lambda: conn.send_command("x"),
+        lambda: conn.send_command_timing("x"),
+        conn.config_mode,
+        conn.exit_config_mode,
+    ):
+        with pytest.raises(SSHOutputLimitError):
+            operation()
+    conn.disconnect()
+    assert (len(channel.requests), len(channel.writes)) == before
+
+
+def test_binary_packet_overflow_during_channel_read_recovers_typed_error():
+    conn = make_connection([b"unread"])
+    channel = conn.remote_conn
+    client = FakeSSHClient(channel)
+    packetizer = SimpleNamespace(binary_packet_limit_exceeded=False)
+    client.transport = SimpleNamespace(packetizer=packetizer)
+    conn.remote_conn_pre = client
+
+    def fail_recv(size):
+        channel.requests.append(size)
+        packetizer.binary_packet_limit_exceeded = True
+        raise OSError("synthetic closed socket")
+
+    channel.recv = fail_recv
+    with pytest.raises(
+        SSHBinaryPacketLimitError, match="SSH binary packet resource limit"
+    ):
+        conn.channel.read_channel()
+    assert conn.poisoned
+    assert channel.closed and client.closed
+    assert channel.writes == []
 
 
 def test_default_budget_and_scopes_restore_on_success_and_error():
