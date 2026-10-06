@@ -131,8 +131,13 @@ securely opened and captured with a 256 KiB ceiling. The captured bytes are
 copied unchanged into a private temporary file with mode `0600` in a mode `0700`
 directory. Netmiko/Paramiko consumes that snapshot path during the connection,
 never the configured source pathname after capture. Strict verification uses
-only this trust file; system host keys are disabled. SSH command output and
-CSR/device output bounds remain separate input-boundary work.
+only this trust file; system host keys are disabled. Returned SSH text has
+UTF-8 byte ceilings before application parsing: 16 KiB for `show version`,
+64 KiB for certificate summaries, 80 KiB for CSR creation and CSR detail,
+80 KiB for installation prompts, 16 KiB for confirmation, and 256 KiB for
+installed-certificate detail. Raw CSR PEM is limited to 64 KiB. These are
+application resource ceilings, not Aruba protocol maxima. They apply after
+Netmiko returns; F09e will address Netmiko read-time accumulation.
 
 ## Container Publication
 
@@ -621,8 +626,8 @@ The automation is limited to CA description lookup, CSR signing, and public-cert
 * Keep TLS certificate and hostname verification enabled for every OPNsense request.
 * Accept only an explicit HTTPS origin in `opnsense.base_url`; ignore ambient environment and system proxies for
   OPNsense API routing.
-* Reject ambiguous duplicate JSON keys, invalid signing inputs, and public certificate PEM over 64 KiB at the
-  OPNsense client boundary. CSR/device-output and total outbound signing request-byte bounds remain separate work.
+* Reject ambiguous duplicate JSON keys, invalid signing inputs, CSR PEM over 64 KiB, serialized signing requests over
+  144 KiB, and public certificate PEM over 64 KiB at the OPNsense client boundary, before network activity.
 
 Aruba certificate private keys are generated and stored on the switch. They must not be exported to or retrieved from
 OPNsense. A pending CSR represents the valuable association with its switch-held private key and must not be cleared,
@@ -648,12 +653,23 @@ self-signature. SHA-1 is accepted only in the narrowly scoped CSR
 proof-of-possession verification path. Issued HTTPS certificates must use
 SHA-256 or stronger, and SSH SHA-1 algorithms are independently prohibited.
 This exception should be removed when supported switches no longer require it.
+CSR subjects must have exactly the configured CN, O, OU, L, ST, and C once each
+and no extra attributes. The Aruba CN limit is 90 ASCII characters; O, OU, L,
+and ST are at most 100 characters, and C is two uppercase ASCII letters.
+CSR attributes are otherwise absent; the only permitted extension request is
+one non-critical SAN with up to 101 unique configured DNS/IP identities that
+includes the primary host. Other requested extensions and attributes fail
+closed. Signing reserializes a fully validated CSR as canonical PEM without
+changing its DER; staged CSR output keeps the original validated PEM.
 
 Operator-facing dynamic text visibly escapes all C0 and C1 control characters
 before reaching stdout or stderr. Debug log messages receive the same treatment
 after formatting, so endpoint-controlled ANSI sequences and embedded line breaks
 cannot alter terminal state or forge log lines. Validated PEM CSR output that is
 deliberately written to stdout is not passed through this display transformation.
+Netmiko DEBUG logging is suppressed only while reading CSR-bearing creation and
+named-detail responses, and while pasting a certificate. The prior logging
+state is restored after each read, including on exceptions.
 
 ## Aruba SSH Host-Key Trust
 

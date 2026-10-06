@@ -2673,6 +2673,566 @@ def test_validate_csr_pem_rejects_invalid_signature():
         )
 
 
+def make_policy_csr(*, attributes=(), extensions=(), subject=None):
+    if subject is None:
+        subject = [
+            (NameOID.COMMON_NAME, "switch.example.com"),
+            (NameOID.ORGANIZATION_NAME, "Example Organization"),
+            (NameOID.ORGANIZATIONAL_UNIT_NAME, "Infrastructure"),
+            (NameOID.LOCALITY_NAME, "Example City"),
+            (NameOID.STATE_OR_PROVINCE_NAME, "Example State"),
+            (NameOID.COUNTRY_NAME, "GB"),
+        ]
+    builder = x509.CertificateSigningRequestBuilder().subject_name(
+        x509.Name(
+            [x509.NameAttribute(oid, value, _validate=False) for oid, value in subject]
+        )
+    )
+    for oid, value in attributes:
+        builder = builder.add_attribute(oid, value)
+    for extension, critical in extensions:
+        builder = builder.add_extension(extension, critical)
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    return (
+        builder.sign(key, hashes.SHA256())
+        .public_bytes(serialization.Encoding.PEM)
+        .decode("ascii")
+    )
+
+
+@pytest.mark.parametrize(
+    ("parser", "limit"),
+    [
+        (checker.parse_aos_version, checker.MAX_SHOW_VERSION_OUTPUT_BYTES),
+        (checker.parse_web_certificates, checker.MAX_CERTIFICATE_SUMMARY_OUTPUT_BYTES),
+    ],
+)
+def test_f09d_monitoring_parser_byte_boundaries(parser, limit):
+    parser("x" * limit)
+    with pytest.raises(ValueError, match="exceeds") as raised:
+        parser("x" * (limit - 1) + "é")
+    assert "x" * 100 not in str(raised.value)
+
+
+@pytest.mark.parametrize("oversized_field", ["version", "summary"])
+def test_f09d_monitoring_rejects_oversize_before_parsers(
+    monkeypatch, capsys, oversized_field
+):
+    version = "Software revision : WC.16.11.0015"
+    summary = make_certificate_summary(date.today() + timedelta(days=365))
+    if oversized_field == "version":
+        version = "MARKER" * 3000
+        monkeypatch.setattr(
+            checker, "parse_aos_version", lambda *_: pytest.fail("parsed version")
+        )
+    else:
+        summary = "MARKER" * 12000
+        monkeypatch.setattr(
+            checker, "parse_web_certificates", lambda *_: pytest.fail("parsed summary")
+        )
+    connection = FakeConnection(version, summary)
+    monkeypatch.setattr(checker, "ConnectHandler", lambda **kwargs: connection)
+    assert checker.check_switch(make_config()["switches"][0], "u", "p", 30) == "error"
+    output = capsys.readouterr().out
+    assert "Status:           ERROR" in output
+    assert "MARKER" not in output
+
+
+@pytest.mark.parametrize(
+    "scanner",
+    [
+        lambda text: checker.certificate_name_exists(text, "newcert"),
+        lambda text: checker.get_certificate_summary_entry(text, "newcert"),
+    ],
+)
+def test_f09d_summary_rejected_before_name_regex(scanner):
+    with pytest.raises(ValueError, match="certificate summary output exceeds"):
+        scanner("SECRET" * 12000)
+
+
+def test_f09d_csr_pem_bound_precedes_crypto_parse(monkeypatch):
+    parsed = []
+
+    def parse(*args):
+        parsed.append(args)
+        raise ValueError("synthetic malformed CSR")
+
+    monkeypatch.setattr(checker.x509, "load_pem_x509_csr", parse)
+    with pytest.raises(ValueError, match="Returned CSR is not valid PEM"):
+        checker.validate_csr_pem(
+            "A" * checker.MAX_CSR_PEM_BYTES,
+            make_config()["switches"][0],
+            make_csr_settings(),
+        )
+    assert len(parsed) == 1
+    with pytest.raises(ValueError, match="CSR PEM output exceeds"):
+        checker.validate_csr_pem(
+            "A" * (checker.MAX_CSR_PEM_BYTES + 1),
+            make_config()["switches"][0],
+            make_csr_settings(),
+        )
+    assert len(parsed) == 1
+
+
+def test_f09d_csr_detail_bound_precedes_extraction_and_preserves_read_only(monkeypatch):
+    class Connection:
+        def send_command(self, *args, **kwargs):
+            return "MARKER" * 14000
+
+    monkeypatch.setattr(checker, "extract_csr_pem", lambda *_: pytest.fail("extracted"))
+    with pytest.raises(ValueError, match="CSR detail output exceeds") as raised:
+        checker.retrieve_and_validate_csr(
+            Connection(), make_config()["switches"][0], "newcert", make_csr_settings()
+        )
+    assert "MARKER" not in str(raised.value)
+
+
+def test_f09d_create_output_rejection_is_post_attempt(monkeypatch):
+    connection = FakeCSRConnection(make_test_csr())
+    connection.send_command_timing = lambda *args, **kwargs: "MARKER" * 14000
+    monkeypatch.setattr(checker, "ConnectHandler", lambda **kwargs: connection)
+    with pytest.raises(
+        checker.CSRGenerationError, match="pending CSR may remain"
+    ) as raised:
+        checker.generate_csr(
+            make_config()["switches"][0], "u", "p", "newcert", make_csr_settings()
+        )
+    assert connection.exited_config_mode
+    assert "MARKER" not in str(raised.value)
+
+
+def test_f09d_create_and_detail_exact_boundaries_are_accepted(monkeypatch):
+    connection = FakeCSRConnection(make_test_csr())
+    connection.send_command_timing = lambda *a, **k: (
+        "X" * checker.MAX_CSR_CREATE_OUTPUT_BYTES
+    )
+    monkeypatch.setattr(checker, "ConnectHandler", lambda **kwargs: connection)
+    assert (
+        checker.generate_csr(
+            make_config()["switches"][0], "u", "p", "newcert", make_csr_settings()
+        )
+        == connection.csr_pem
+    )
+
+    class DetailConnection:
+        def send_command(self, *args, **kwargs):
+            tail = connection.csr_pem
+            return "X" * (checker.MAX_CSR_DETAIL_OUTPUT_BYTES - len(tail)) + tail
+
+    assert (
+        checker.retrieve_and_validate_csr(
+            DetailConnection(),
+            make_config()["switches"][0],
+            "newcert",
+            make_csr_settings(),
+        )
+        == connection.csr_pem
+    )
+
+
+def test_f09d_csr_debug_suppression_restores_on_success_and_exception(
+    monkeypatch, caplog
+):
+    logger = logging.getLogger("netmiko")
+    previous_level = logger.level
+    logger.setLevel(logging.DEBUG)
+    caplog.set_level(logging.DEBUG, logger="netmiko")
+    original_disable = logging.root.manager.disable
+
+    class Connection:
+        def send_command(self, *args, **kwargs):
+            logger.debug("PRIVATE_CSR_MARKER")
+            raise RuntimeError("synthetic read failure")
+
+    try:
+        with pytest.raises(RuntimeError):
+            checker.retrieve_and_validate_csr(
+                Connection(),
+                make_config()["switches"][0],
+                "newcert",
+                make_csr_settings(),
+            )
+        assert logging.root.manager.disable == original_disable
+        logger.debug("ordinary diagnostics")
+        assert "PRIVATE_CSR_MARKER" not in caplog.text
+        assert "ordinary diagnostics" in caplog.text
+    finally:
+        logger.setLevel(previous_level)
+
+
+def test_f09d_retrieve_debug_marker_is_suppressed_on_success(caplog):
+    logger = logging.getLogger("netmiko")
+    previous_level = logger.level
+    previous_disable = logging.root.manager.disable
+    logger.setLevel(logging.DEBUG)
+    caplog.set_level(logging.DEBUG, logger="netmiko")
+
+    class Connection:
+        def send_command(self, *args, **kwargs):
+            logger.debug("PRIVATE_DETAIL_CSR_MARKER")
+            return make_test_csr()
+
+    try:
+        checker.retrieve_and_validate_csr(
+            Connection(), make_config()["switches"][0], "newcert", make_csr_settings()
+        )
+        assert logging.root.manager.disable == previous_disable
+        assert "PRIVATE_DETAIL_CSR_MARKER" not in caplog.text
+    finally:
+        logger.setLevel(previous_level)
+
+
+def test_f09d_canonical_csr_der_round_trip_and_original_staged_output():
+    original_pem = make_policy_csr().replace("\n", "\r\n")
+    csr = checker.validate_csr_pem(
+        original_pem, make_config()["switches"][0], make_csr_settings()
+    )
+    canonical = csr.public_bytes(serialization.Encoding.PEM)
+    assert x509.load_pem_x509_csr(canonical).public_bytes(
+        serialization.Encoding.DER
+    ) == csr.public_bytes(serialization.Encoding.DER)
+    assert original_pem != canonical.decode("ascii")
+    assert original_pem.endswith("\r\n")
+
+
+def test_f09d_signing_sends_canonical_csr_only_after_validation(monkeypatch):
+    original_pem = make_test_csr().replace("\n", "\r\n")
+    signed = []
+
+    class Client:
+        def __init__(self, *_):
+            pass
+
+        def resolve_ca(self, *_):
+            return "0123456789abc"
+
+        def sign_csr(self, pem, **kwargs):
+            signed.append(pem)
+            return "12345678-1234-4234-9234-123456789abc"
+
+        def get_certificate(self, *_):
+            return "CERT"
+
+    monkeypatch.setattr(checker, "retrieve_csr", lambda *a, **k: original_pem)
+    monkeypatch.setattr(checker, "OPNsenseClient", Client)
+    monkeypatch.setattr(checker, "validate_issued_certificate", lambda *a, **k: None)
+    checker.sign_pending_csr(
+        make_config()["switches"][0],
+        "u",
+        "p",
+        "newcert",
+        make_csr_settings(),
+        make_opnsense_settings(),
+    )
+    assert signed[0] != original_pem
+    assert x509.load_pem_x509_csr(signed[0].encode()).public_bytes(
+        serialization.Encoding.DER
+    ) == x509.load_pem_x509_csr(original_pem.encode()).public_bytes(
+        serialization.Encoding.DER
+    )
+
+    signed.clear()
+    monkeypatch.setattr(
+        checker, "retrieve_csr", lambda *a, **k: "A" * (checker.MAX_CSR_PEM_BYTES + 1)
+    )
+    with pytest.raises(ValueError, match="CSR PEM output exceeds"):
+        checker.sign_pending_csr(
+            make_config()["switches"][0],
+            "u",
+            "p",
+            "newcert",
+            make_csr_settings(),
+            make_opnsense_settings(),
+        )
+    assert not signed
+
+
+def test_f09d_preflight_summary_oversize_is_read_only_error(monkeypatch):
+    connection = FakeCSRConnection(make_test_csr(), summary_output="SECRET" * 12000)
+    monkeypatch.setattr(checker, "ConnectHandler", lambda **kwargs: connection)
+    with pytest.raises(
+        checker.RenewalPreflightError, match="certificate summary output exceeds"
+    ) as raised:
+        checker.renewal_preflight(make_config()["switches"][0], "u", "p")
+    assert connection.commands == ["show crypto pki local-certificate summary"]
+    assert "SECRET" not in str(raised.value)
+
+
+def test_f09d_generation_summary_oversize_is_pre_attempt(monkeypatch):
+    connection = FakeCSRConnection(make_test_csr(), summary_output="SECRET" * 12000)
+    monkeypatch.setattr(checker, "ConnectHandler", lambda **kwargs: connection)
+    with pytest.raises(
+        ValueError, match="certificate summary output exceeds"
+    ) as raised:
+        checker.generate_csr(
+            make_config()["switches"][0], "u", "p", "newcert", make_csr_settings()
+        )
+    assert not isinstance(raised.value, checker.CSRGenerationError)
+    assert not connection.entered_config_mode
+
+
+def test_f09d_automatic_retrieval_oversize_maps_to_signing_error(monkeypatch):
+    switch = make_config()["switches"][0]
+    monkeypatch.setattr(
+        checker,
+        "renewal_preflight",
+        lambda *a, **k: {
+            "active_certificate_name": "oldcert",
+            "ta_profile": "profile",
+            "new_certificate_name": "newcert",
+        },
+    )
+    monkeypatch.setattr(checker, "generate_csr", lambda *a, **k: make_test_csr())
+    monkeypatch.setattr(
+        checker, "retrieve_csr", lambda *a, **k: "X" * (checker.MAX_CSR_PEM_BYTES + 1)
+    )
+    with pytest.raises(checker.CSRSigningError, match="pending CSR remains") as raised:
+        checker.renew_certificate(
+            switch,
+            "u",
+            "p",
+            make_csr_settings(),
+            make_opnsense_settings(),
+            synthetic_ca_snapshot(),
+        )
+    assert "X" * 100 not in str(raised.value)
+
+
+def test_f09d_create_response_debug_is_suppressed(monkeypatch, caplog):
+    connection = FakeCSRConnection(make_test_csr())
+    logger = logging.getLogger("netmiko")
+    original = connection.send_command_timing
+    previous_level = logger.level
+    previous_disable = logging.root.manager.disable
+    logger.setLevel(logging.DEBUG)
+    caplog.set_level(logging.DEBUG, logger="netmiko")
+
+    def timing(*args, **kwargs):
+        logger.debug("PRIVATE_CREATE_CSR_MARKER")
+        return original(*args, **kwargs)
+
+    connection.send_command_timing = timing
+    monkeypatch.setattr(checker, "ConnectHandler", lambda **kwargs: connection)
+    try:
+        checker.generate_csr(
+            make_config()["switches"][0], "u", "p", "newcert", make_csr_settings()
+        )
+        assert logging.root.manager.disable == previous_disable
+        logger.debug("ordinary create diagnostics")
+        assert "PRIVATE_CREATE_CSR_MARKER" not in caplog.text
+        assert "ordinary create diagnostics" in caplog.text
+    finally:
+        logger.setLevel(previous_level)
+
+
+def test_f09d_subject_order_and_no_extensions_are_accepted():
+    original = x509.load_pem_x509_csr(make_policy_csr().encode("ascii"))
+    subject = [
+        (attribute.oid, attribute.value)
+        for attribute in reversed(list(original.subject))
+    ]
+    csr = checker.validate_csr_pem(
+        make_policy_csr(subject=subject),
+        make_config()["switches"][0],
+        make_csr_settings(),
+    )
+    assert len(csr.attributes) == 0
+    assert len(csr.extensions) == 0
+
+
+@pytest.mark.parametrize(
+    "subject_change",
+    [
+        lambda fields: fields[1:],
+        lambda fields: [*fields, fields[1]],
+        lambda fields: [*fields, (NameOID.SERIAL_NUMBER, "extra")],
+        lambda fields: [
+            (oid, "x" * 91 if oid == NameOID.COMMON_NAME else value)
+            for oid, value in fields
+        ],
+        lambda fields: [
+            (oid, "x" * 101 if oid == NameOID.ORGANIZATION_NAME else value)
+            for oid, value in fields
+        ],
+        lambda fields: [
+            (oid, "x" * 101 if oid == NameOID.ORGANIZATIONAL_UNIT_NAME else value)
+            for oid, value in fields
+        ],
+        lambda fields: [
+            (oid, "x" * 101 if oid == NameOID.LOCALITY_NAME else value)
+            for oid, value in fields
+        ],
+        lambda fields: [
+            (oid, "x" * 101 if oid == NameOID.STATE_OR_PROVINCE_NAME else value)
+            for oid, value in fields
+        ],
+        lambda fields: [
+            (oid, "gb" if oid == NameOID.COUNTRY_NAME else value)
+            for oid, value in fields
+        ],
+    ],
+)
+def test_f09d_subject_rejects_missing_duplicate_extra_and_invalid_lengths(
+    subject_change,
+):
+    fields = [
+        (attribute.oid, attribute.value)
+        for attribute in x509.load_pem_x509_csr(
+            make_policy_csr().encode("ascii")
+        ).subject
+    ]
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore", message="Attribute's length must be >= 1 and <= 64"
+        )
+        with pytest.raises(ValueError):
+            checker.validate_csr_pem(
+                make_policy_csr(subject=subject_change(fields)),
+                make_config()["switches"][0],
+                make_csr_settings(),
+            )
+
+
+@pytest.mark.parametrize(
+    "field", ["organization", "organizational_unit", "locality", "state"]
+)
+def test_f09d_csr_settings_reject_long_fields(field):
+    settings = make_csr_settings()
+    settings[field] = "A" * 101
+    with pytest.raises(ValueError, match="100 characters"):
+        checker.validate_csr_settings(settings)
+
+
+def test_f09d_create_command_rejects_long_cn_before_mutation():
+    switch = make_config()["switches"][0]
+    switch["host"] = ".".join(("a" * 63, "b" * 27))
+    with pytest.raises(ValueError, match="90-character"):
+        checker.build_csr_command(switch, "newcert", "profile", make_csr_settings())
+
+
+@pytest.mark.parametrize(
+    "attribute_oid",
+    [x509.ObjectIdentifier("1.2.840.113549.1.9.7"), x509.ObjectIdentifier("1.2.3.4.5")],
+)
+def test_f09d_csr_rejects_non_extension_attributes(attribute_oid):
+    with pytest.raises(ValueError, match="unsupported or duplicate attributes"):
+        checker.validate_csr_pem(
+            make_policy_csr(attributes=[(attribute_oid, b"marker")]),
+            make_config()["switches"][0],
+            make_csr_settings(),
+        )
+
+
+def test_f09d_duplicate_extension_request_fails_closed_in_pinned_parser():
+    pem = make_policy_csr(
+        attributes=[(x509.ObjectIdentifier("1.2.840.113549.1.9.14"), b"invalid")],
+        extensions=[
+            (x509.SubjectAlternativeName([x509.DNSName("switch.example.com")]), False)
+        ],
+    )
+    with pytest.raises(ValueError, match="malformed attributes"):
+        checker.validate_csr_pem(pem, make_config()["switches"][0], make_csr_settings())
+
+
+def test_f09d_duplicate_extension_parser_exception_maps_to_value_error(monkeypatch):
+    pem = make_policy_csr()
+    original_loader = checker.x509.load_pem_x509_csr
+    parsed = original_loader(pem.encode("ascii"))
+
+    class DuplicateExtensions:
+        def __getattr__(self, name):
+            return getattr(parsed, name)
+
+        @property
+        def extensions(self):
+            raise x509.DuplicateExtension(
+                "duplicate SAN", ExtensionOID.SUBJECT_ALTERNATIVE_NAME
+            )
+
+    monkeypatch.setattr(
+        checker.x509, "load_pem_x509_csr", lambda *_: DuplicateExtensions()
+    )
+    with pytest.raises(ValueError, match="malformed attributes or extensions"):
+        checker.validate_csr_pem(pem, make_config()["switches"][0], make_csr_settings())
+
+
+@pytest.mark.parametrize(
+    ("names", "critical", "allowed"),
+    [
+        ([x509.DNSName("switch.example.com")], False, True),
+        ([x509.DNSName("switch.example.com")], True, False),
+        ([x509.DNSName("alias.example.com")], False, False),
+        (
+            [x509.DNSName("switch.example.com"), x509.DNSName("other.example.com")],
+            False,
+            False,
+        ),
+        (
+            [x509.DNSName("switch.example.com"), x509.DNSName("SWITCH.EXAMPLE.COM")],
+            False,
+            False,
+        ),
+        (
+            [x509.DNSName("switch.example.com"), x509.RFC822Name("user@example.com")],
+            False,
+            False,
+        ),
+        ([x509.DNSName("switch.example.com")] * 102, False, False),
+    ],
+)
+def test_f09d_san_policy(names, critical, allowed):
+    pem = make_policy_csr(extensions=[(x509.SubjectAlternativeName(names), critical)])
+    if allowed:
+        checker.validate_csr_pem(pem, make_config()["switches"][0], make_csr_settings())
+    else:
+        with pytest.raises(ValueError):
+            checker.validate_csr_pem(
+                pem, make_config()["switches"][0], make_csr_settings()
+            )
+
+
+def test_f09d_san_accepts_configured_dns_ip_subset_and_101_identities():
+    switch = make_config()["switches"][0]
+    switch["additional_sans"] = [
+        f"alias-{index}.example.com" for index in range(99)
+    ] + ["192.0.2.10"]
+    names = [x509.DNSName("switch.example.com")]
+    names.extend(x509.DNSName(value) for value in switch["additional_sans"][:-1])
+    names.append(x509.IPAddress(ipaddress.ip_address("192.0.2.10")))
+    assert len(names) == 101
+    csr = checker.validate_csr_pem(
+        make_policy_csr(extensions=[(x509.SubjectAlternativeName(names), False)]),
+        switch,
+        make_csr_settings(),
+    )
+    assert len(csr.extensions[0].value) == 101
+
+    subset = [names[0], names[-1]]
+    checker.validate_csr_pem(
+        make_policy_csr(extensions=[(x509.SubjectAlternativeName(subset), False)]),
+        switch,
+        make_csr_settings(),
+    )
+
+
+@pytest.mark.parametrize(
+    "extension",
+    [
+        x509.BasicConstraints(ca=False, path_length=None),
+        x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]),
+        x509.KeyUsage(False, False, False, False, False, False, False, False, False),
+        x509.UnrecognizedExtension(x509.ObjectIdentifier("1.2.3.4.5"), b"x" * 8192),
+    ],
+)
+def test_f09d_rejects_all_other_requested_extensions(extension):
+    with pytest.raises(ValueError, match="unsupported requested extensions"):
+        checker.validate_csr_pem(
+            make_policy_csr(extensions=[(extension, False)]),
+            make_config()["switches"][0],
+            make_csr_settings(),
+        )
+
+
 def make_opnsense_settings():
     return {
         "base_url": "https://opnsense.example.com:8443",
@@ -3854,8 +4414,7 @@ def test_opnsense_description_bounds_long_certificate_name_and_host():
 
 
 def setup_long_host_opnsense_signing(monkeypatch):
-    host = ".".join(("a" * 63, "b" * 63, "c" * 63, "d" * 18))
-    assert len(f"Aruba Web certificate webcert-20260829-01 for {host}") == 256
+    host = ".".join(("a" * 50, "b" * 13))
     config = make_config()
     switch = config["switches"][0]
     switch["host"] = host
@@ -3884,14 +4443,8 @@ def setup_long_host_opnsense_signing(monkeypatch):
     monkeypatch.setattr(client, "_request_json", fake_request)
     monkeypatch.setattr(checker, "OPNsenseClient", lambda base_url: client)
     monkeypatch.setattr(
-        checker,
-        "retrieve_csr",
-        lambda *args, **kwargs: (
-            "-----BEGIN CERTIFICATE REQUEST-----\nTEST\n"
-            "-----END CERTIFICATE REQUEST-----\n"
-        ),
+        checker, "retrieve_csr", lambda *args, **kwargs: make_test_csr(common_name=host)
     )
-    monkeypatch.setattr(checker, "validate_csr_pem", lambda *args: object())
     monkeypatch.setattr(
         checker, "validate_issued_certificate", lambda *args, **kwargs: None
     )
@@ -3900,6 +4453,7 @@ def setup_long_host_opnsense_signing(monkeypatch):
 
 def test_staged_signing_bounds_description_without_changing_dns_san(monkeypatch):
     switch, host, calls = setup_long_host_opnsense_signing(monkeypatch)
+    certificate_name = "webcert-" + "x" * 200
     monkeypatch.setattr(
         checker,
         "generate_csr",
@@ -3910,7 +4464,7 @@ def test_staged_signing_bounds_description_without_changing_dns_san(monkeypatch)
         switch,
         "username",
         "password",
-        "webcert-20260829-01",
+        certificate_name,
         make_csr_settings(),
         make_opnsense_settings(),
     )
@@ -3928,7 +4482,7 @@ def test_staged_signing_bounds_description_without_changing_dns_san(monkeypatch)
 
 def test_automatic_renewal_bounds_description_after_csr_creation(monkeypatch):
     switch, host, calls = setup_long_host_opnsense_signing(monkeypatch)
-    certificate_name = "webcert-20260829-01"
+    certificate_name = "webcert-" + "x" * 200
     monkeypatch.setattr(
         checker,
         "renewal_preflight",
@@ -4530,6 +5084,94 @@ class FakeInstallConnection:
         self.interactions.append(("read_channel_timing", output))
         self.channel_output = ""
         return output
+
+
+@pytest.mark.parametrize(
+    ("stage", "limit"),
+    [
+        ("paste", checker.MAX_INSTALL_PROMPT_OUTPUT_BYTES),
+        ("replacement", checker.MAX_INSTALL_PROMPT_OUTPUT_BYTES),
+        ("confirmation", checker.MAX_INSTALL_CONFIRM_OUTPUT_BYTES),
+        ("post_summary", checker.MAX_CERTIFICATE_SUMMARY_OUTPUT_BYTES),
+        ("details", checker.MAX_CERTIFICATE_DETAIL_OUTPUT_BYTES),
+    ],
+)
+def test_f09d_install_output_bounds_preserve_ambiguous_state(stage, limit):
+    connection = FakeInstallConnection(make_test_csr())
+    connection.summary_calls = 1
+    if stage == "paste":
+        connection.paste_prompt = "X" * (limit + 1)
+    elif stage == "replacement":
+        connection.replacement_prompt = "X" * (limit + 1)
+    elif stage == "confirmation":
+        original = connection.send_command_timing
+
+        def command(command, **kwargs):
+            return "X" * (limit + 1) if command == "y" else original(command, **kwargs)
+
+        connection.send_command_timing = command
+    elif stage == "post_summary":
+        connection.post_summary = "X" * (limit + 1)
+    else:
+        connection.details_output = "X" * (limit + 1)
+
+    with pytest.raises(checker.CertificateInstallationAttemptError) as raised:
+        checker.install_signed_certificate(
+            connection, "webcert2027", "PUBLIC CERT", "webprofile2026"
+        )
+    assert "may already have changed" in str(raised.value)
+    assert "X" * 100 not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    ("stage", "limit"),
+    [
+        ("paste", checker.MAX_INSTALL_PROMPT_OUTPUT_BYTES),
+        ("replacement", checker.MAX_INSTALL_PROMPT_OUTPUT_BYTES),
+        ("confirmation", checker.MAX_INSTALL_CONFIRM_OUTPUT_BYTES),
+        ("post_summary", checker.MAX_CERTIFICATE_SUMMARY_OUTPUT_BYTES),
+        ("details", checker.MAX_CERTIFICATE_DETAIL_OUTPUT_BYTES),
+    ],
+)
+def test_f09d_install_output_exact_limit_is_accepted(stage, limit):
+    connection = FakeInstallConnection(make_test_csr())
+    connection.summary_calls = 1
+    if stage == "paste":
+        tail = checker.CERTIFICATE_PASTE_PROMPT
+        connection.paste_prompt = "X" * (limit - len(tail)) + tail
+    elif stage == "replacement":
+        tail = checker.CERTIFICATE_REPLACEMENT_PROMPT
+        connection.replacement_prompt = "X" * (limit - len(tail)) + tail
+    elif stage == "confirmation":
+        original = connection.send_command_timing
+
+        def command(command, **kwargs):
+            return "X" * limit if command == "y" else original(command, **kwargs)
+
+        connection.send_command_timing = command
+    elif stage == "post_summary":
+        tail = connection.post_summary
+        connection.post_summary = "X" * (limit - len(tail) - 1) + "\n" + tail
+    else:
+        tail = connection.details_output
+        connection.details_output = "X" * (limit - len(tail) - 1) + "\n" + tail
+    checker.install_signed_certificate(
+        connection, "webcert2027", "PUBLIC CERT", "webprofile2026"
+    )
+
+
+def test_f09d_install_precheck_summary_rejects_before_mutation():
+    connection = FakeInstallConnection(make_test_csr())
+    connection.send_command = lambda *args, **kwargs: "MARKER" * 12000
+    with pytest.raises(
+        ValueError, match="certificate summary output exceeds"
+    ) as raised:
+        checker.install_signed_certificate(
+            connection, "webcert2027", "PUBLIC CERT", "webprofile2026"
+        )
+    assert not isinstance(raised.value, checker.CertificateInstallationAttemptError)
+    assert not connection.entered_config_mode
+    assert "MARKER" not in str(raised.value)
 
 
 @pytest.fixture
