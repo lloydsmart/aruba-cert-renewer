@@ -136,8 +136,21 @@ UTF-8 byte ceilings before application parsing: 16 KiB for `show version`,
 64 KiB for certificate summaries, 80 KiB for CSR creation and CSR detail,
 80 KiB for installation prompts, 16 KiB for confirmation, and 256 KiB for
 installed-certificate detail. Raw CSR PEM is limited to 64 KiB. These are
-application resource ceilings, not Aruba protocol maxima. They apply after
-Netmiko returns; F09e will address Netmiko read-time accumulation.
+application resource ceilings, not Aruba protocol maxima. They still apply
+after Netmiko returns. After Paramiko creates the shell channel, Netmiko CLI
+reads also have cumulative raw-byte budgets enforced before UTF-8 decoding.
+Known Netmiko ANSI insert-line expansion is preflighted before allocation, and
+normalized CLI text has a separate cumulative character budget. Session setup
+has 32 KiB for raw bytes and 32 KiB for processed characters; application
+operations use their returned-output ceiling plus command echo, prompt and
+4 KiB framing allowance for each. The certificate paste also allows a full
+public-certificate echo. Overflow poisons the connection, closes the Paramiko
+channel/client, and forbids further CLI traffic; no truncated output is
+accepted. The returned-output semantic guards remain in place. These limits
+do not bound total process memory, Paramiko's pre-auth SSH identification/banner
+line, Paramiko's internal channel/window buffers, or kernel/socket buffering.
+No Netmiko session log is configured.
+F09e-B will address the pre-auth SSH banner separately.
 
 ## Container Publication
 
@@ -334,7 +347,7 @@ CVSS score of 3.4. The issue concerns Paramiko allowing RSA/SHA-1 signing and
 verification. This is a genuine finding, not a false positive, and the
 repository does not claim that it is currently mitigated.
 
-Paramiko 5 removes the affected SHA-1 behaviour, but Netmiko 4.7.0 currently
+Paramiko 5 removes the affected SHA-1 behaviour, but Netmiko 4.8.0 currently
 requires Paramiko `>=3.5.0,<5.0` because Paramiko 5 caused significant upstream
 compatibility breakage. Forcing an unsupported major version solely to make the
 scanner green is not acceptable. `PYSEC-2026-2858` is therefore an explicit,

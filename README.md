@@ -104,11 +104,21 @@ and C1 terminal controls. The same boundary is applied after debug log records
 are formatted, preventing ANSI/control-sequence injection and forged log lines.
 Deliberately emitted validated PEM CSR output remains unchanged.
 
+Aruba CLI reads use cumulative raw-byte limits at the Netmiko SSH channel.
+Known Netmiko ANSI expansion is checked before it runs, and normalized CLI
+text has a separate cumulative limit. Session setup has 32 KiB for each limit.
+Each application operation uses its existing returned-output ceiling plus its
+command echo, prompt and a 4 KiB framing allowance; certificate paste also
+allows the public certificate's possible terminal echo. The returned-output
+checks remain in place. Overflow closes the SSH transport and requires a new
+connection. These limits begin after Paramiko creates the shell channel;
+pre-auth SSH identification and banner handling is outside this boundary.
+
 ## Requirements
 
 - Python 3.12 or later
 - cryptography 50.0.1
-- Netmiko 4.7.0
+- Netmiko 4.8.0
 
 Install the development dependencies in a virtual environment:
 

@@ -38,12 +38,17 @@ from cryptography.x509.oid import (
     SignatureAlgorithmOID,
 )
 from cryptography.x509.verification import PolicyBuilder, Store, VerificationError
-from netmiko import ConnectHandler
+from netmiko.base_connection import BaseConnection
 from netmiko.exceptions import (
     NetmikoAuthenticationException,
     NetmikoTimeoutException,
 )
 
+from bounded_netmiko import (
+    CONFIG_READ_BYTES,
+    FRAMING_BYTES,
+    BoundedArubaConnection,
+)
 from lifecycle_lock import LifecycleLockError, LifecycleLockReleaseError, lifecycle_lock
 from opnsense_client import MAX_DESCRIPTION_CHARS, OPNsenseClient, validate_base_url
 from output_policy import SanitizingFormatter, sanitize_terminal_text
@@ -70,6 +75,8 @@ MAX_CSR_PEM_BYTES = 64 * 1024
 MAX_INSTALL_PROMPT_OUTPUT_BYTES = 80 * 1024
 MAX_INSTALL_CONFIRM_OUTPUT_BYTES = 16 * 1024
 MAX_CERTIFICATE_DETAIL_OUTPUT_BYTES = 256 * 1024
+# Retain the name as a local seam for synthetic connections in existing tests.
+ConnectHandler = BoundedArubaConnection
 CSR_EXTENSION_REQUEST_OID = ObjectIdentifier("1.2.840.113549.1.9.14")
 HTTPS_VERIFICATION_WINDOW_SECONDS = 30
 HTTPS_RETRY_DELAY_SECONDS = 2
@@ -1670,6 +1677,57 @@ def ssh_connection(switch, username, password):
             yield connection
 
 
+@contextmanager
+def _ssh_read_budget(connection, semantic_limit, command="", extra_echo_bytes=0):
+    """Bound raw CLI reads, including echo and prompt handling inside Netmiko."""
+    prompt = getattr(connection, "base_prompt", "")
+    if not isinstance(prompt, str):
+        prompt = ""
+    limit = (
+        semantic_limit
+        + len(command.encode("utf-8"))
+        + len(prompt.encode("utf-8"))
+        + FRAMING_BYTES
+        + extra_echo_bytes
+    )
+    if isinstance(connection, BoundedArubaConnection):
+        with connection.read_budget(limit):
+            yield
+    elif isinstance(connection, BaseConnection):
+        raise RuntimeError("Bounded SSH channel is required")
+    elif hasattr(type(connection), "read_budget"):
+        # Synthetic test connections can record the requested budget.
+        with connection.read_budget(limit):
+            yield
+    else:
+        # Existing synthetic test connections do not implement the transport.
+        yield
+
+
+def _send_command(connection, command, semantic_limit, **kwargs):
+    with _ssh_read_budget(connection, semantic_limit, command):
+        return connection.send_command(command, **kwargs)
+
+
+def _send_command_timing(connection, command, semantic_limit, **kwargs):
+    with _ssh_read_budget(connection, semantic_limit, command):
+        return connection.send_command_timing(command, **kwargs)
+
+
+def _config_mode(connection):
+    with _ssh_read_budget(connection, CONFIG_READ_BYTES, "configure terminal"):
+        return connection.config_mode()
+
+
+def _exit_config_mode(connection):
+    with _ssh_read_budget(connection, CONFIG_READ_BYTES, "end"):
+        return connection.exit_config_mode()
+
+
+def _connection_poisoned(connection):
+    return getattr(connection, "poisoned", False) is True
+
+
 class CSRGenerationError(ValueError):
     """An error after CSR creation was attempted on the switch."""
 
@@ -1702,8 +1760,10 @@ def renewal_preflight(switch, username, password, *, now=None):
     """Read switch certificate state and select a safe renewal name."""
     try:
         with ssh_connection(switch, username, password) as connection:
-            summary_output = connection.send_command(
-                "show crypto pki local-certificate summary"
+            summary_output = _send_command(
+                connection,
+                "show crypto pki local-certificate summary",
+                MAX_CERTIFICATE_SUMMARY_OUTPUT_BYTES,
             )
 
         certificates = parse_web_certificates(summary_output)
@@ -1842,8 +1902,10 @@ def renew_certificate(
 
 def retrieve_and_validate_csr(connection, switch, certificate_name, csr_settings):
     with _suppress_csr_debug_logging():
-        csr_output = connection.send_command(
+        csr_output = _send_command(
+            connection,
             f"show crypto pki local-certificate {certificate_name}",
+            MAX_CSR_DETAIL_OUTPUT_BYTES,
             read_timeout=30,
         )
     _check_output_size(csr_output, MAX_CSR_DETAIL_OUTPUT_BYTES, "CSR detail")
@@ -1868,8 +1930,10 @@ def generate_csr(
 
     try:
         with ssh_connection(switch, username, password) as connection:
-            summary_output = connection.send_command(
-                "show crypto pki local-certificate summary"
+            summary_output = _send_command(
+                connection,
+                "show crypto pki local-certificate summary",
+                MAX_CERTIFICATE_SUMMARY_OUTPUT_BYTES,
             )
             certificates = parse_web_certificates(summary_output)
             active_certificate = get_active_web_certificate(certificates)
@@ -1899,20 +1963,23 @@ def generate_csr(
             print_terminal(f"Requested new certificate name: {certificate_name}")
             print_terminal("Generating CSR...")
 
-            connection.config_mode()
+            _config_mode(connection)
 
             try:
                 csr_creation_attempted = True
                 with _suppress_csr_debug_logging():
-                    create_output = connection.send_command_timing(
+                    create_output = _send_command_timing(
+                        connection,
                         csr_command,
+                        MAX_CSR_CREATE_OUTPUT_BYTES,
                         read_timeout=120,
                     )
                 _check_output_size(
                     create_output, MAX_CSR_CREATE_OUTPUT_BYTES, "CSR creation"
                 )
             finally:
-                connection.exit_config_mode()
+                if not _connection_poisoned(connection):
+                    _exit_config_mode(connection)
 
             try:
                 return retrieve_and_validate_csr(
@@ -1974,8 +2041,10 @@ def retrieve_csr(
 
     try:
         with ssh_connection(switch, username, password) as connection:
-            summary_output = connection.send_command(
-                "show crypto pki local-certificate summary"
+            summary_output = _send_command(
+                connection,
+                "show crypto pki local-certificate summary",
+                MAX_CERTIFICATE_SUMMARY_OUTPUT_BYTES,
             )
             entry = get_certificate_summary_entry(
                 summary_output,
@@ -2042,7 +2111,14 @@ def _ends_with_expected_prompt(output, expected_prompt):
 
 
 def _send_certificate_pem(connection, certificate_pem):
-    with _suppress_csr_debug_logging():
+    with (
+        _ssh_read_budget(
+            connection,
+            MAX_INSTALL_PROMPT_OUTPUT_BYTES,
+            extra_echo_bytes=len(certificate_pem.encode("utf-8")) + 1,
+        ),
+        _suppress_csr_debug_logging(),
+    ):
         connection.write_channel(certificate_pem)
         connection.write_channel("\n")
         return connection.read_channel_timing(read_timeout=60)
@@ -2070,8 +2146,10 @@ def install_signed_certificate(
     entered_config_mode = False
 
     try:
-        summary_output = connection.send_command(
-            "show crypto pki local-certificate summary"
+        summary_output = _send_command(
+            connection,
+            "show crypto pki local-certificate summary",
+            MAX_CERTIFICATE_SUMMARY_OUTPUT_BYTES,
         )
         _check_summary_size(summary_output)
         pending_entry = require_pending_web_certificate(
@@ -2083,12 +2161,14 @@ def install_signed_certificate(
                 f"Certificate {certificate_name} TA profile changed before installation"
             )
 
-        connection.config_mode()
+        _config_mode(connection)
         entered_config_mode = True
 
         installation_attempted = True
-        paste_prompt = connection.send_command_timing(
+        paste_prompt = _send_command_timing(
+            connection,
             "crypto pki install-signed-certificate",
+            MAX_INSTALL_PROMPT_OUTPUT_BYTES,
             read_timeout=30,
         )
         _check_output_size(
@@ -2112,8 +2192,10 @@ def install_signed_certificate(
                 "confirmation was not sent"
             )
 
-        confirmation_output = connection.send_command_timing(
+        confirmation_output = _send_command_timing(
+            connection,
             "y",
+            MAX_INSTALL_CONFIRM_OUTPUT_BYTES,
             read_timeout=60,
         )
         _check_output_size(
@@ -2135,9 +2217,9 @@ def install_signed_certificate(
         raise
 
     finally:
-        if entered_config_mode:
+        if entered_config_mode and not _connection_poisoned(connection):
             try:
-                connection.exit_config_mode()
+                _exit_config_mode(connection)
             except Exception as exit_error:
                 if installation_dialogue_completed:
                     raise CertificateInstallationAttemptError(
@@ -2146,8 +2228,10 @@ def install_signed_certificate(
                     ) from exit_error
 
     try:
-        summary_output = connection.send_command(
-            "show crypto pki local-certificate summary"
+        summary_output = _send_command(
+            connection,
+            "show crypto pki local-certificate summary",
+            MAX_CERTIFICATE_SUMMARY_OUTPUT_BYTES,
         )
         _check_summary_size(summary_output)
         installed_entry = get_certificate_summary_entry(
@@ -2164,8 +2248,10 @@ def install_signed_certificate(
         if installed_entry["profile"].casefold() != expected_profile.casefold():
             raise ValueError("Installed certificate TA profile changed")
 
-        details_output = connection.send_command(
+        details_output = _send_command(
+            connection,
             f"show crypto pki local-certificate {certificate_name}",
+            MAX_CERTIFICATE_DETAIL_OUTPUT_BYTES,
             read_timeout=30,
         )
         _check_output_size(
@@ -2216,8 +2302,10 @@ def install_pending_certificate(
 
     try:
         with ssh_connection(switch, username, password) as connection:
-            summary_output = connection.send_command(
-                "show crypto pki local-certificate summary"
+            summary_output = _send_command(
+                connection,
+                "show crypto pki local-certificate summary",
+                MAX_CERTIFICATE_SUMMARY_OUTPUT_BYTES,
             )
             _check_summary_size(summary_output)
             pending_entry = require_pending_web_certificate(
@@ -2500,12 +2588,16 @@ def check_switch(switch, username, password, warning_days):
 
     try:
         with ssh_connection(switch, username, password) as connection:
-            version_output = connection.send_command("show version")
+            version_output = _send_command(
+                connection, "show version", MAX_SHOW_VERSION_OUTPUT_BYTES
+            )
             _check_output_size(
                 version_output, MAX_SHOW_VERSION_OUTPUT_BYTES, "show version"
             )
-            cert_output = connection.send_command(
-                "show crypto pki local-certificate summary"
+            cert_output = _send_command(
+                connection,
+                "show crypto pki local-certificate summary",
+                MAX_CERTIFICATE_SUMMARY_OUTPUT_BYTES,
             )
             _check_summary_size(cert_output)
 
