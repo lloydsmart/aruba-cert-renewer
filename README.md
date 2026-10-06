@@ -104,15 +104,23 @@ and C1 terminal controls. The same boundary is applied after debug log records
 are formatted, preventing ANSI/control-sequence injection and forged log lines.
 Deliberately emitted validated PEM CSR output remains unchanged.
 
-Aruba CLI reads use cumulative raw-byte limits at the Netmiko SSH channel.
+Pre-authentication SSH textual input is bounded on the same TCP connection
+used for normal Paramiko host-key checking and authentication: at most 255 raw
+bytes per line (including its terminator), 99 preceding informational lines,
+and 25,500 raw textual bytes in total. These are project resource ceilings,
+not Aruba vendor maxima. Aruba CLI reads use cumulative raw-byte limits at the
+Netmiko SSH channel.
 Known Netmiko ANSI expansion is checked before it runs, and normalized CLI
 text has a separate cumulative limit. Session setup has 32 KiB for each limit.
 Each application operation uses its existing returned-output ceiling plus its
 command echo, prompt and a 4 KiB framing allowance; certificate paste also
 allows the public certificate's possible terminal echo. The returned-output
 checks remain in place. Overflow closes the SSH transport and requires a new
-connection. These limits begin after Paramiko creates the shell channel;
-pre-auth SSH identification and banner handling is outside this boundary.
+connection. The CLI limits begin after Paramiko creates the shell channel.
+F09e-B bounds pre-auth SSH textual identification and banner input only.
+F09e-C remains open for peer-directed pre-auth binary SSH packet-length
+allocation in Paramiko 4.0.0. These limits do not cap kernel/socket buffering,
+other finite Paramiko transport/window buffers, or total process RSS.
 
 ## Requirements
 

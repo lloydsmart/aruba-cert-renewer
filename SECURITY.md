@@ -147,10 +147,21 @@ operations use their returned-output ceiling plus command echo, prompt and
 public-certificate echo. Overflow poisons the connection, closes the Paramiko
 channel/client, and forbids further CLI traffic; no truncated output is
 accepted. The returned-output semantic guards remain in place. These limits
-do not bound total process memory, Paramiko's pre-auth SSH identification/banner
-line, Paramiko's internal channel/window buffers, or kernel/socket buffering.
-No Netmiko session log is configured.
-F09e-B will address the pre-auth SSH banner separately.
+do not bound total process memory, Paramiko's internal channel/window buffers,
+or kernel/socket buffering. Before binary SSH packets begin, project-owned
+Paramiko handling accepts at most 255 raw bytes per textual line (including
+LF), 99 preceding informational lines, and 25,500 raw textual bytes total.
+Overflow closes the connection before an over-budget Python line is built.
+The RFC identification-string maximum is interpreted conservatively as raw
+bytes; the 255-byte cap on preceding informational lines is project policy,
+not an RFC or Aruba vendor maximum. Read-only production measurements found
+zero preceding lines and a 24-byte identification line, 24 textual bytes total,
+on each of two switches. No Netmiko session log is configured.
+
+F09e-C remains open: Paramiko 4.0.0's pre-authentication binary packet reader
+can derive a very large recv request from a peer-controlled 32-bit packet
+length. The textual boundary does not address binary packet lengths, and these
+limits do not bound total process RSS.
 
 ## Container Publication
 
