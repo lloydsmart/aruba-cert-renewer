@@ -578,6 +578,8 @@ the repository.
 
 `config.toml` is excluded from Git and should contain the real inventory. It
 must never contain OPNsense API credentials.
+It is securely opened and captured with a 1 MiB ceiling before TOML parsing.
+This is an application resource limit, not an inventory or protocol limit.
 
 ### Security-Sensitive Local Files
 
@@ -609,11 +611,12 @@ world-writable. Read-only bind mounts remain required and complement rather
 than replace these application-level ownership, permission, regular-file, and
 symlink checks.
 
-The SSH library accepts `known_hosts` only as a pathname. The application
-validates it immediately before handing the path to that library, but cannot
-eliminate its final pathname-reopen race. Protect the containing deployment
-directories from modification by unrelated users as an additional operational
-control. The verification CA is instead passed to SSL from its captured content.
+The SSH library accepts `known_hosts` only as a pathname. For each SSH
+connection, the application securely opens the configured source, captures at
+most 256 KiB, and passes an unchanged copy in a private temporary file to
+Netmiko/Paramiko. The library never receives the source pathname after capture.
+Strict host-key verification remains mandatory, without system host-key
+fallback. The verification CA is passed to SSL from its captured content.
 
 ## SSH Host-Key Enrollment and Rotation
 

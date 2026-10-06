@@ -9,13 +9,16 @@ import math
 import multiprocessing
 import os
 import re
+import shutil
 import socket
 import ssl
 import stat
 import sys
+import tempfile
 import time
 import tomllib
 import warnings
+from contextlib import contextmanager
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from datetime import UTC, date, datetime, timedelta
@@ -53,6 +56,8 @@ EXIT_WARNING = 1
 EXIT_ERROR = 2
 
 MAX_CERTIFICATE_INPUT_BYTES = 64 * 1024
+MAX_CONFIG_FILE_BYTES = 1024 * 1024
+MAX_KNOWN_HOSTS_FILE_BYTES = 256 * 1024
 MAX_VERIFICATION_CA_FILE_BYTES = 1024 * 1024
 MAX_PASSWORD_FILE_BYTES = 16 * 1024
 MAX_ADDITIONAL_SANS = 100
@@ -374,17 +379,21 @@ def print_switch_heading(switch):
 
 def load_config(config_file):
     config_file = Path(config_file)
-    with open_secure_file(config_file, source_name="Configuration file") as file:
-        try:
-            return tomllib.load(file)
-        except tomllib.TOMLDecodeError as error:
-            raise ValueError(
-                f"Invalid TOML in configuration file {config_file}: {error}"
-            ) from error
-        except OSError:
-            raise ValueError(
-                f"Configuration file cannot be read: {config_file}"
-            ) from None
+    try:
+        with open_secure_file(config_file, source_name="Configuration file") as file:
+            contents = file.read(MAX_CONFIG_FILE_BYTES + 1)
+    except OSError:
+        raise ValueError(f"Configuration file cannot be read: {config_file}") from None
+    if len(contents) > MAX_CONFIG_FILE_BYTES:
+        raise ValueError(
+            f"Configuration file exceeds {MAX_CONFIG_FILE_BYTES} bytes: {config_file}"
+        )
+    try:
+        return tomllib.loads(contents.decode("utf-8"))
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError):
+        raise ValueError(
+            f"Invalid TOML or UTF-8 in configuration file {config_file}"
+        ) from None
 
 
 def resolve_config_relative_path(configured_path, config_file):
@@ -1496,7 +1505,8 @@ def sign_pending_csr(
     return certificate_pem
 
 
-def get_device_parameters(switch, username, password):
+@contextmanager
+def snapshot_known_hosts(switch):
     try:
         known_hosts_file = switch["_ssh_known_hosts_file"]
     except KeyError:
@@ -1504,12 +1514,46 @@ def get_device_parameters(switch, username, password):
             "SSH known_hosts configuration was not validated for this switch"
         ) from None
 
-    with open_secure_file(
-        known_hosts_file,
-        source_name="ssh.known_hosts_file",
-    ):
-        pass
+    try:
+        with open_secure_file(
+            known_hosts_file, source_name="ssh.known_hosts_file"
+        ) as source:
+            contents = source.read(MAX_KNOWN_HOSTS_FILE_BYTES + 1)
+    except OSError:
+        raise ValueError(
+            f"ssh.known_hosts_file cannot be read: {known_hosts_file}"
+        ) from None
+    if len(contents) > MAX_KNOWN_HOSTS_FILE_BYTES:
+        raise ValueError(
+            f"ssh.known_hosts_file exceeds {MAX_KNOWN_HOSTS_FILE_BYTES} bytes: {known_hosts_file}"
+        )
 
+    directory = tempfile.mkdtemp(prefix="aruba-known-hosts-")
+    primary_error = False
+    try:
+        if stat.S_IMODE(os.stat(directory).st_mode) != 0o700:
+            raise OSError("temporary directory permissions are unsafe")
+        snapshot = Path(directory) / "known_hosts"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+        with os.fdopen(os.open(snapshot, flags, 0o600), "wb") as output:
+            os.fchmod(output.fileno(), 0o600)
+            output.write(contents)
+        yield snapshot
+    except BaseException:
+        primary_error = True
+        raise
+    finally:
+        try:
+            shutil.rmtree(directory)
+        except OSError:
+            if not primary_error:
+                raise ValueError(
+                    "SSH known_hosts snapshot could not be removed"
+                ) from None
+            logging.warning("SSH known_hosts snapshot could not be removed")
+
+
+def get_device_parameters(switch, username, password, snapshot):
     return {
         "device_type": "aruba_osswitch",
         "host": switch["host"],
@@ -1521,12 +1565,20 @@ def get_device_parameters(switch, username, password):
         "ssh_strict": True,
         "system_host_keys": False,
         "alt_host_keys": True,
-        "alt_key_file": str(known_hosts_file),
+        "alt_key_file": str(snapshot),
         "disabled_algorithms": {
             category: list(algorithms)
             for category, algorithms in SSH_DISABLED_ALGORITHMS.items()
         },
     }
+
+
+@contextmanager
+def ssh_connection(switch, username, password):
+    with snapshot_known_hosts(switch) as snapshot:
+        device = get_device_parameters(switch, username, password, snapshot)
+        with ConnectHandler(**device) as connection:
+            yield connection
 
 
 class CSRGenerationError(ValueError):
@@ -1560,8 +1612,7 @@ class LiveHTTPSVerificationError(ValueError):
 def renewal_preflight(switch, username, password, *, now=None):
     """Read switch certificate state and select a safe renewal name."""
     try:
-        device = get_device_parameters(switch, username, password)
-        with ConnectHandler(**device) as connection:
+        with ssh_connection(switch, username, password) as connection:
             summary_output = connection.send_command(
                 "show crypto pki local-certificate summary"
             )
@@ -1722,11 +1773,10 @@ def generate_csr(
         "certificate name",
     )
     csr_settings = validate_csr_settings(csr_settings)
-    device = get_device_parameters(switch, username, password)
     csr_creation_attempted = False
 
     try:
-        with ConnectHandler(**device) as connection:
+        with ssh_connection(switch, username, password) as connection:
             summary_output = connection.send_command(
                 "show crypto pki local-certificate summary"
             )
@@ -1826,10 +1876,9 @@ def retrieve_csr(
         "certificate name",
     )
     csr_settings = validate_csr_settings(csr_settings)
-    device = get_device_parameters(switch, username, password)
 
     try:
-        with ConnectHandler(**device) as connection:
+        with ssh_connection(switch, username, password) as connection:
             summary_output = connection.send_command(
                 "show crypto pki local-certificate summary"
             )
@@ -2046,11 +2095,10 @@ def install_pending_certificate(
     )
     csr_settings = validate_csr_settings(csr_settings)
     validate_switch_signing_identity(switch)
-    device = get_device_parameters(switch, username, password)
     installation_completed = False
 
     try:
-        with ConnectHandler(**device) as connection:
+        with ssh_connection(switch, username, password) as connection:
             summary_output = connection.send_command(
                 "show crypto pki local-certificate summary"
             )
@@ -2330,12 +2378,10 @@ def _live_https_timeout(deadline, socket_timeout):
 
 
 def check_switch(switch, username, password, warning_days):
-    device = get_device_parameters(switch, username, password)
-
     print_switch_heading(switch)
 
     try:
-        with ConnectHandler(**device) as connection:
+        with ssh_connection(switch, username, password) as connection:
             version_output = connection.send_command("show version")
             cert_output = connection.send_command(
                 "show crypto pki local-certificate summary"
@@ -2800,7 +2846,7 @@ def run_explicit_operation(
 
             return EXIT_OK
 
-        except ValueError as error:
+        except (ValueError, OSError) as error:
             print_terminal(f"Error: {error}", file=sys.stderr)
             return EXIT_ERROR
 
