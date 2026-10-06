@@ -821,6 +821,15 @@ python src/aruba_cert_renewer.py \
 The command discovers the active certificate's TA profile, creates a private key
 and pending CSR on the switch, retrieves the CSR, and validates its signature,
 subject, key type, and key size. Omit `--csr-output` to print the validated CSR.
+The CSR subject must contain exactly one each of CN, O, OU, L, ST, and C, with
+no other subject fields. CN is the configured host and is limited to 90 ASCII
+characters; O, OU, L, and ST are limited to 100 characters each, and C is two
+uppercase ASCII letters. Existing subject character restrictions still apply.
+Only RSA-2048 and RSA/SHA-256 or the documented Aruba RSA/SHA-1 proof-of-possession
+signatures are accepted. Arbitrary CSR attributes and requested extensions are
+rejected. A single non-critical SAN request is accepted when it contains only
+configured DNS/IP identities, includes the primary host, has no duplicates, and
+has at most 101 identities. Other requested extensions are rejected.
 
 The switch retains the private key associated with a pending CSR. Do not reboot
 the switch while a CSR that you intend to sign and install is pending.
@@ -861,6 +870,8 @@ This operation:
 
 1. Confirms that the named Aruba certificate is an existing pending Web CSR.
 2. Retrieves and validates it without generating or replacing anything.
+   The original validated PEM remains the staged output; signing sends a
+   canonical PEM serialization of the same DER CSR to OPNsense.
 3. Resolves the configured OPNsense CA description.
 4. Requests a server certificate with exactly the configured DNS and IP SANs.
 5. Retrieves only the public certificate.

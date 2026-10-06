@@ -34,6 +34,7 @@ from cryptography.x509.oid import (
     ExtendedKeyUsageOID,
     ExtensionOID,
     NameOID,
+    ObjectIdentifier,
     SignatureAlgorithmOID,
 )
 from cryptography.x509.verification import PolicyBuilder, Store, VerificationError
@@ -61,6 +62,15 @@ MAX_KNOWN_HOSTS_FILE_BYTES = 256 * 1024
 MAX_VERIFICATION_CA_FILE_BYTES = 1024 * 1024
 MAX_PASSWORD_FILE_BYTES = 16 * 1024
 MAX_ADDITIONAL_SANS = 100
+MAX_SHOW_VERSION_OUTPUT_BYTES = 16 * 1024
+MAX_CERTIFICATE_SUMMARY_OUTPUT_BYTES = 64 * 1024
+MAX_CSR_CREATE_OUTPUT_BYTES = 80 * 1024
+MAX_CSR_DETAIL_OUTPUT_BYTES = 80 * 1024
+MAX_CSR_PEM_BYTES = 64 * 1024
+MAX_INSTALL_PROMPT_OUTPUT_BYTES = 80 * 1024
+MAX_INSTALL_CONFIRM_OUTPUT_BYTES = 16 * 1024
+MAX_CERTIFICATE_DETAIL_OUTPUT_BYTES = 256 * 1024
+CSR_EXTENSION_REQUEST_OID = ObjectIdentifier("1.2.840.113549.1.9.14")
 HTTPS_VERIFICATION_WINDOW_SECONDS = 30
 HTTPS_RETRY_DELAY_SECONDS = 2
 HTTPS_SOCKET_TIMEOUT_SECONDS = 5
@@ -670,6 +680,7 @@ def get_switch_credentials(switch, config_file):
 
 
 def parse_aos_version(output):
+    _check_output_size(output, MAX_SHOW_VERSION_OUTPUT_BYTES, "show version")
     match = re.search(r"\b[A-Z]{2}\.\d{2}\.\d{2}\.\d{4}\b", output)
 
     if match:
@@ -679,6 +690,7 @@ def parse_aos_version(output):
 
 
 def parse_web_certificates(output):
+    _check_summary_size(output)
     pattern = re.compile(
         r"^\s*"
         r"(?P<name>\S+)"
@@ -740,6 +752,7 @@ def get_active_web_certificate(certificates):
 
 
 def certificate_name_exists(summary_output, certificate_name):
+    _check_summary_size(summary_output)
     certificate_name = validate_cli_identifier(
         certificate_name,
         "certificate name",
@@ -782,6 +795,7 @@ def choose_renewal_certificate_name(summary_output, *, now=None):
 
 
 def get_certificate_summary_entry(summary_output, certificate_name):
+    _check_summary_size(summary_output)
     certificate_name = validate_cli_identifier(
         certificate_name,
         "certificate name",
@@ -931,6 +945,8 @@ def validate_csr_settings(csr_settings):
 
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 .,'()&/-]*", value):
             raise ValueError(f"csr.{field} contains unsupported characters")
+        if len(value) > 100:
+            raise ValueError(f"csr.{field} exceeds 100 characters")
 
     country = csr_settings["country"]
 
@@ -977,6 +993,7 @@ def build_csr_command(switch, certificate_name, ta_profile, csr_settings):
         "TA profile",
     )
     common_name = get_certificate_identities(switch)["common_name"]
+    _validate_csr_common_name(common_name)
 
     organization = quote_cli_subject_value(csr_settings["organization"])
     organizational_unit = quote_cli_subject_value(csr_settings["organizational_unit"])
@@ -1016,6 +1033,23 @@ def extract_csr_pem(output):
         raise ValueError("Could not find a PEM certificate signing request")
 
     return match.group(0).strip() + "\n"
+
+
+def _check_output_size(output, limit, label):
+    if len(output.encode("utf-8")) > limit:
+        raise ValueError(f"{label} output exceeds {limit} bytes")
+    return output
+
+
+def _check_summary_size(output):
+    return _check_output_size(
+        output, MAX_CERTIFICATE_SUMMARY_OUTPUT_BYTES, "certificate summary"
+    )
+
+
+def _validate_csr_common_name(common_name):
+    if not common_name.isascii() or len(common_name) > 90:
+        raise ValueError("CSR common name exceeds Aruba's 90-character ASCII limit")
 
 
 def get_subject_value(subject, oid, field_name):
@@ -1062,6 +1096,7 @@ def verify_csr_signature(csr, public_key):
 
 def validate_csr_pem(csr_pem, switch, csr_settings):
     csr_settings = validate_csr_settings(csr_settings)
+    _check_output_size(csr_pem, MAX_CSR_PEM_BYTES, "CSR PEM")
 
     try:
         csr = x509.load_pem_x509_csr(csr_pem.encode("ascii"))
@@ -1082,10 +1117,12 @@ def validate_csr_pem(csr_pem, switch, csr_settings):
 
     verify_csr_signature(csr, public_key)
 
+    identities = get_certificate_identities(switch)
+    _validate_csr_common_name(identities["common_name"])
     expected_subject = {
         NameOID.COMMON_NAME: (
             "common name",
-            get_certificate_identities(switch)["common_name"],
+            identities["common_name"],
         ),
         NameOID.ORGANIZATION_NAME: (
             "organization",
@@ -1115,11 +1152,62 @@ def validate_csr_pem(csr_pem, switch, csr_settings):
             oid,
             field_name,
         )
+        if oid == NameOID.COMMON_NAME:
+            _validate_csr_common_name(actual_value)
+        elif oid == NameOID.COUNTRY_NAME:
+            if re.fullmatch(r"[A-Z]{2}", actual_value) is None:
+                raise ValueError("CSR country must be two uppercase ASCII letters")
+        elif len(actual_value) > 100:
+            raise ValueError(f"CSR {field_name} exceeds 100 characters")
 
         if actual_value != expected_value:
             raise ValueError(
                 f"CSR {field_name} is {actual_value!r}; expected {expected_value!r}"
             )
+
+    if sum(len(rdn) for rdn in csr.subject.rdns) != len(expected_subject):
+        raise ValueError("CSR subject must contain exactly six expected attributes")
+
+    try:
+        attributes = csr.attributes
+        extensions = csr.extensions
+    except (ValueError, x509.DuplicateExtension):
+        raise ValueError("CSR contains malformed attributes or extensions") from None
+    if len(attributes) > 1 or any(
+        attribute.oid != CSR_EXTENSION_REQUEST_OID for attribute in attributes
+    ):
+        raise ValueError("CSR contains unsupported or duplicate attributes")
+    if len(extensions) > 1 or (extensions and len(attributes) != 1):
+        raise ValueError("CSR contains unsupported requested extensions")
+    if attributes and not extensions:
+        raise ValueError("CSR extension request contains no permitted SAN")
+    if extensions:
+        extension = extensions[0]
+        if extension.oid != ExtensionOID.SUBJECT_ALTERNATIVE_NAME or extension.critical:
+            raise ValueError("CSR contains unsupported requested extensions")
+        names = extension.value
+        if not 1 <= len(names) <= 101:
+            raise ValueError("CSR SAN count must be between 1 and 101")
+        allowed = {
+            parse_identity(value)["key"]
+            for value in [switch["host"], *switch.get("additional_sans", [])]
+        }
+        seen = set()
+        for name in names:
+            if isinstance(name, x509.DNSName):
+                identity = parse_identity(name.value, "CSR SAN")
+                if identity["kind"] != "dns":
+                    raise ValueError("CSR contains unsupported SAN identity")
+            elif isinstance(name, x509.IPAddress):
+                identity = parse_identity(str(name.value), "CSR SAN")
+            else:
+                raise ValueError("CSR contains unsupported SAN identity")
+            key = identity["key"]
+            if key in seen or key not in allowed:
+                raise ValueError("CSR SAN is duplicated or unconfigured")
+            seen.add(key)
+        if parse_identity(switch["host"])["key"] not in seen:
+            raise ValueError("CSR SAN omits the switch host")
 
     return csr
 
@@ -1480,11 +1568,12 @@ def sign_pending_csr(
         csr_settings,
     )
     csr = validate_csr_pem(csr_pem, switch, csr_settings)
+    canonical_csr_pem = csr.public_bytes(serialization.Encoding.PEM).decode("ascii")
 
     client = OPNsenseClient(opnsense_settings["base_url"])
     caref = client.resolve_ca(opnsense_settings["ca"])
     certificate_uuid = client.sign_csr(
-        csr_pem,
+        canonical_csr_pem,
         caref=caref,
         digest=opnsense_settings["digest"],
         lifetime_days=opnsense_settings["lifetime_days"],
@@ -1752,10 +1841,12 @@ def renew_certificate(
 
 
 def retrieve_and_validate_csr(connection, switch, certificate_name, csr_settings):
-    csr_output = connection.send_command(
-        f"show crypto pki local-certificate {certificate_name}",
-        read_timeout=30,
-    )
+    with _suppress_csr_debug_logging():
+        csr_output = connection.send_command(
+            f"show crypto pki local-certificate {certificate_name}",
+            read_timeout=30,
+        )
+    _check_output_size(csr_output, MAX_CSR_DETAIL_OUTPUT_BYTES, "CSR detail")
     csr_pem = extract_csr_pem(csr_output)
     validate_csr_pem(csr_pem, switch, csr_settings)
     return csr_pem
@@ -1812,9 +1903,13 @@ def generate_csr(
 
             try:
                 csr_creation_attempted = True
-                connection.send_command_timing(
-                    csr_command,
-                    read_timeout=120,
+                with _suppress_csr_debug_logging():
+                    create_output = connection.send_command_timing(
+                        csr_command,
+                        read_timeout=120,
+                    )
+                _check_output_size(
+                    create_output, MAX_CSR_CREATE_OUTPUT_BYTES, "CSR creation"
                 )
             finally:
                 connection.exit_config_mode()
@@ -1947,12 +2042,18 @@ def _ends_with_expected_prompt(output, expected_prompt):
 
 
 def _send_certificate_pem(connection, certificate_pem):
-    previous_logging_disable = logging.root.manager.disable
-    logging.disable(logging.DEBUG)
-    try:
+    with _suppress_csr_debug_logging():
         connection.write_channel(certificate_pem)
         connection.write_channel("\n")
         return connection.read_channel_timing(read_timeout=60)
+
+
+@contextmanager
+def _suppress_csr_debug_logging():
+    previous_logging_disable = logging.root.manager.disable
+    logging.disable(logging.DEBUG)
+    try:
+        yield
     finally:
         logging.disable(previous_logging_disable)
 
@@ -1972,6 +2073,7 @@ def install_signed_certificate(
         summary_output = connection.send_command(
             "show crypto pki local-certificate summary"
         )
+        _check_summary_size(summary_output)
         pending_entry = require_pending_web_certificate(
             summary_output,
             certificate_name,
@@ -1989,12 +2091,18 @@ def install_signed_certificate(
             "crypto pki install-signed-certificate",
             read_timeout=30,
         )
+        _check_output_size(
+            paste_prompt, MAX_INSTALL_PROMPT_OUTPUT_BYTES, "installation prompt"
+        )
         if not _ends_with_expected_prompt(paste_prompt, CERTIFICATE_PASTE_PROMPT):
             raise ValueError(
                 "Switch did not return the expected certificate-paste prompt"
             )
 
         replacement_prompt = _send_certificate_pem(connection, certificate_pem)
+        _check_output_size(
+            replacement_prompt, MAX_INSTALL_PROMPT_OUTPUT_BYTES, "installation prompt"
+        )
         if not _ends_with_expected_prompt(
             replacement_prompt,
             CERTIFICATE_REPLACEMENT_PROMPT,
@@ -2007,6 +2115,11 @@ def install_signed_certificate(
         confirmation_output = connection.send_command_timing(
             "y",
             read_timeout=60,
+        )
+        _check_output_size(
+            confirmation_output,
+            MAX_INSTALL_CONFIRM_OUTPUT_BYTES,
+            "installation confirmation",
         )
         if _contains_obvious_cli_error(confirmation_output):
             raise ValueError(
@@ -2036,6 +2149,7 @@ def install_signed_certificate(
         summary_output = connection.send_command(
             "show crypto pki local-certificate summary"
         )
+        _check_summary_size(summary_output)
         installed_entry = get_certificate_summary_entry(
             summary_output,
             certificate_name,
@@ -2053,6 +2167,9 @@ def install_signed_certificate(
         details_output = connection.send_command(
             f"show crypto pki local-certificate {certificate_name}",
             read_timeout=30,
+        )
+        _check_output_size(
+            details_output, MAX_CERTIFICATE_DETAIL_OUTPUT_BYTES, "certificate detail"
         )
         if (
             _contains_obvious_cli_error(details_output)
@@ -2102,6 +2219,7 @@ def install_pending_certificate(
             summary_output = connection.send_command(
                 "show crypto pki local-certificate summary"
             )
+            _check_summary_size(summary_output)
             pending_entry = require_pending_web_certificate(
                 summary_output,
                 certificate_name,
@@ -2383,9 +2501,13 @@ def check_switch(switch, username, password, warning_days):
     try:
         with ssh_connection(switch, username, password) as connection:
             version_output = connection.send_command("show version")
+            _check_output_size(
+                version_output, MAX_SHOW_VERSION_OUTPUT_BYTES, "show version"
+            )
             cert_output = connection.send_command(
                 "show crypto pki local-certificate summary"
             )
+            _check_summary_size(cert_output)
 
     except NetmikoAuthenticationException:
         print_terminal("Status:           ERROR")

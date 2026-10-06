@@ -87,6 +87,84 @@ def test_resolve_ca(monkeypatch):
     assert client.resolve_ca("internal-ca") == CA_REF
 
 
+def f09d_sign(client, csr_pem=CSR_PEM, **overrides):
+    arguments = {
+        "caref": CA_REF,
+        "digest": "sha256",
+        "lifetime_days": 397,
+        "dns_names": ["switch.example.com"],
+        "ip_addresses": [],
+        "description": "Synthetic certificate",
+    }
+    arguments.update(overrides)
+    return client.sign_csr(csr_pem, **arguments)
+
+
+def test_f09d_direct_csr_size_rejected_before_regex_or_network(monkeypatch):
+    monkeypatch.setattr(
+        opnsense_client, "_open_url", lambda *a, **k: pytest.fail("network")
+    )
+    oversized = "-----BEGIN CERTIFICATE REQUEST-----\n" + "A" * 65536
+    with pytest.raises(opnsense_client.OPNsenseAPIError, match="size limit"):
+        f09d_sign(opnsense_client.OPNsenseClient(BASE_URL), oversized)
+
+
+def test_f09d_signing_request_serialized_byte_boundary_precedes_network(monkeypatch):
+    client = opnsense_client.OPNsenseClient(BASE_URL)
+    payload = {"cert": {"action": "sign_csr", "csr_payload": "é" * 100}}
+    size = len(json.dumps(payload).encode("utf-8"))
+    monkeypatch.setattr(opnsense_client, "MAX_OPNSENSE_SIGN_REQUEST_BYTES", size)
+    monkeypatch.setattr(
+        opnsense_client,
+        "_open_url",
+        lambda request, **kwargs: json_response(
+            {"result": "saved", "uuid": CERTIFICATE_UUID}
+        ),
+    )
+    assert (
+        client._request_json("POST", opnsense_client.CERT_ADD_PATH, payload)["result"]
+        == "saved"
+    )
+    monkeypatch.setattr(opnsense_client, "MAX_OPNSENSE_SIGN_REQUEST_BYTES", size - 1)
+    monkeypatch.setattr(
+        opnsense_client, "_open_url", lambda *a, **k: pytest.fail("network")
+    )
+    with pytest.raises(opnsense_client.OPNsenseAPIError, match="size limit"):
+        client._request_json("POST", opnsense_client.CERT_ADD_PATH, payload)
+
+
+def test_f09d_worst_case_direct_signing_payload_fits(monkeypatch):
+    captured = []
+
+    def fake_open(request, **kwargs):
+        captured.append(request.data)
+        return json_response({"result": "saved", "uuid": CERTIFICATE_UUID})
+
+    monkeypatch.setattr(opnsense_client, "_open_url", fake_open)
+    client = opnsense_client.OPNsenseClient(BASE_URL)
+    first_label = "a" * 60
+    names = [
+        f"{index:03d}{first_label}.{('b' * 63)}.{('c' * 63)}.{('d' * 61)}"
+        for index in range(101)
+    ]
+    header = "-----BEGIN CERTIFICATE REQUEST-----\n"
+    footer = "-----END CERTIFICATE REQUEST-----\n"
+    available = opnsense_client.MAX_CSR_PEM_BYTES - len(header) - len(footer)
+    csr = header + "A\n" * (available // 2) + "A" * (available % 2) + footer
+    assert len(csr.encode("utf-8")) == opnsense_client.MAX_CSR_PEM_BYTES
+    f09d_sign(
+        client,
+        csr,
+        dns_names=names,
+        description="😀" * 255,
+        caref="a" * 13,
+        digest="sha512",
+        lifetime_days=3650,
+    )
+    assert len(captured[0]) <= 138210
+    assert len(captured[0]) <= opnsense_client.MAX_OPNSENSE_SIGN_REQUEST_BYTES
+
+
 def test_resolve_ca_rejects_missing_ca(monkeypatch):
     monkeypatch.setattr(
         opnsense_client,

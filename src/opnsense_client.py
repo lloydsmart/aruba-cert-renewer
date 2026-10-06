@@ -26,6 +26,8 @@ CERT_ADD_PATH = "/api/trust/cert/add"
 CERTIFICATE_PATH = "/api/trust/cert/generate_file/{uuid}/crt"
 MAX_RESPONSE_BYTES = 1024 * 1024
 MAX_CERTIFICATE_PEM_BYTES = 64 * 1024
+MAX_CSR_PEM_BYTES = 64 * 1024
+MAX_OPNSENSE_SIGN_REQUEST_BYTES = 144 * 1024
 MAX_SECRET_FILE_BYTES = 16 * 1024
 MAX_DESCRIPTION_CHARS = 255
 MAX_SAN_ENTRIES = 101
@@ -309,6 +311,10 @@ class OPNsenseClient:
         if payload is not None:
             headers["Content-Type"] = "application/json"
             data = json.dumps(payload).encode("utf-8")
+            if path == CERT_ADD_PATH and len(data) > MAX_OPNSENSE_SIGN_REQUEST_BYTES:
+                raise OPNsenseAPIError(
+                    "OPNsense signing request exceeds the size limit"
+                )
 
         request = Request(
             f"{self.base_url}{path}",
@@ -399,6 +405,8 @@ class OPNsenseClient:
     ):
         if not isinstance(csr_pem, str):
             raise OPNsenseAPIError("CSR PEM must be text")
+        if len(csr_pem.encode("utf-8")) > MAX_CSR_PEM_BYTES:
+            raise OPNsenseAPIError("CSR PEM exceeds the size limit")
         if not csr_pem.isascii():
             raise OPNsenseAPIError("CSR PEM must be ASCII")
         if (
