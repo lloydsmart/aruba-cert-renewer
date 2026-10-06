@@ -33,11 +33,97 @@ import aruba_cert_renewer as checker
 import lifecycle_lock
 import opnsense_client
 from bounded_netmiko import SSHOutputLimitError
+from bounded_paramiko import SSHBannerLimitError
 from secure_file import SecureFileError
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 KNOWN_HOSTS_FILE = FIXTURES_DIR / "known_hosts"
 OBSERVED_EKU_OID = x509.ObjectIdentifier("1.3.6.1.5.5.8.2.2")
+
+
+def test_banner_overflow_is_pre_mutation_in_application_paths(monkeypatch, capsys):
+    switch = make_config()["switches"][0]
+    calls = []
+
+    def overflow(**kwargs):
+        calls.append("connect")
+        raise SSHBannerLimitError("SSH banner resource limit exceeded")
+
+    monkeypatch.setattr(checker, "ConnectHandler", overflow)
+    monkeypatch.setattr(
+        checker,
+        "OPNsenseClient",
+        lambda *args, **kwargs: pytest.fail("No OPNsense request is permitted"),
+    )
+    assert checker.check_switch(switch, "synthetic", "synthetic", 30) == "error"
+    assert "SSH banner resource limit exceeded" in capsys.readouterr().out
+
+    with pytest.raises(
+        checker.RenewalPreflightError, match="SSH banner resource limit"
+    ):
+        checker.renewal_preflight(switch, "synthetic", "synthetic")
+
+    with pytest.raises(SSHBannerLimitError):
+        checker.generate_csr(
+            switch, "synthetic", "synthetic", "webcert2027", make_csr_settings()
+        )
+
+    with pytest.raises(SSHBannerLimitError):
+        checker.retrieve_csr(
+            switch, "synthetic", "synthetic", "webcert2027", make_csr_settings()
+        )
+
+    with pytest.raises(SSHBannerLimitError):
+        checker.sign_pending_csr(
+            switch,
+            "synthetic",
+            "synthetic",
+            "webcert2027",
+            make_csr_settings(),
+            {},
+        )
+
+    with pytest.raises(SSHBannerLimitError):
+        checker.install_pending_certificate(
+            switch,
+            "synthetic",
+            "synthetic",
+            "webcert2027",
+            "synthetic",
+            make_csr_settings(),
+            365,
+            synthetic_ca_snapshot(),
+            digest="sha256",
+        )
+
+    with pytest.raises(checker.RenewalPreflightError):
+        checker.renew_certificate(
+            switch,
+            "synthetic",
+            "synthetic",
+            make_csr_settings(),
+            {},
+            synthetic_ca_snapshot(),
+        )
+
+    monkeypatch.setattr(
+        checker,
+        "renewal_preflight",
+        lambda *args, **kwargs: {
+            "active_certificate_name": "webcert2026",
+            "new_certificate_name": "webcert2027",
+        },
+    )
+    with pytest.raises(checker.CSRGenerationPreAttemptError):
+        checker.renew_certificate(
+            switch,
+            "synthetic",
+            "synthetic",
+            make_csr_settings(),
+            {},
+            synthetic_ca_snapshot(),
+        )
+    assert calls == ["connect"] * 8
 
 
 def synthetic_ca_snapshot():

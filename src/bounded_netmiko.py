@@ -15,6 +15,12 @@ from netmiko.exceptions import ReadException
 from netmiko.hp.hp_procurve import HPProcurveSSH
 from netmiko.netmiko_globals import MAX_BUFFER
 
+from bounded_paramiko import (
+    BoundedSSHClient,
+    BoundedSSHClientNoAuth,
+    assert_paramiko_contract,
+)
+
 SETUP_READ_BYTES = 32 * 1024
 FRAMING_BYTES = 4 * 1024
 CONFIG_READ_BYTES = 4 * 1024
@@ -107,8 +113,14 @@ class BoundedArubaConnection(HPProcurveSSH):
 
     def __init__(self, **kwargs):
         assert_netmiko_contract()
+        assert_paramiko_contract()
         self._bounded_channel_poisoned = False
         super().__init__(**kwargs)
+
+    def _get_ssh_client_instance(self):
+        if not self.use_keys and not self.allow_agent and not self.password:
+            return BoundedSSHClientNoAuth()
+        return BoundedSSHClient()
 
     def special_login_handler(self, delay_factor=1.0):
         if type(self.channel) is not SSHChannel:
