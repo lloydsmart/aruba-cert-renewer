@@ -6,6 +6,7 @@ import multiprocessing
 import os
 import re
 import warnings
+from contextlib import contextmanager
 from datetime import UTC, date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,6 +22,7 @@ from cryptography.x509.oid import (
     NameOID,
     SignatureAlgorithmOID,
 )
+from netmiko.base_connection import BaseConnection
 from netmiko.exceptions import (
     NetmikoAuthenticationException,
     NetmikoTimeoutException,
@@ -30,6 +32,7 @@ from paramiko.hostkeys import HostKeys
 import aruba_cert_renewer as checker
 import lifecycle_lock
 import opnsense_client
+from bounded_netmiko import SSHOutputLimitError
 from secure_file import SecureFileError
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
@@ -2828,6 +2831,189 @@ def test_f09d_create_and_detail_exact_boundaries_are_accepted(monkeypatch):
         )
         == connection.csr_pem
     )
+
+
+def test_f09e_budget_includes_echo_prompt_and_framing():
+    class Connection:
+        base_prompt = "switch#"
+
+        @contextmanager
+        def read_budget(self, limit):
+            self.limit = limit
+            yield
+
+        def send_command(self, command):
+            return "ok"
+
+    connection = Connection()
+    assert checker._send_command(connection, "show version", 100) == "ok"
+    assert connection.limit == 100 + len("show version") + len("switch#") + 4096
+
+
+def test_f09e_plain_netmiko_connection_fails_closed():
+    connection = BaseConnection.__new__(BaseConnection)
+    with pytest.raises(RuntimeError, match="Bounded SSH channel is required"):
+        checker._send_command(connection, "show version", 100)
+
+
+def test_f09e_monitoring_overflow_reports_error(monkeypatch, capsys):
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def send_command(self, *args, **kwargs):
+            raise SSHOutputLimitError("SSH read budget exceeded")
+
+    monkeypatch.setattr(checker, "ConnectHandler", lambda **kwargs: Connection())
+    assert checker.check_switch(make_config()["switches"][0], "u", "p", 30) == "error"
+    assert "SSH read budget exceeded" in capsys.readouterr().out
+
+
+def test_f09e_explicit_retrieve_overflow_is_value_error(monkeypatch):
+    connection = FakeCSRConnection(
+        make_test_csr(), summary_output="newcert Web CSR webprofile2026\n"
+    )
+
+    def overflow(*args, **kwargs):
+        raise SSHOutputLimitError("SSH read budget exceeded")
+
+    connection.send_command = overflow
+    monkeypatch.setattr(checker, "ConnectHandler", lambda **kwargs: connection)
+    with pytest.raises(ValueError, match="SSH read budget exceeded"):
+        checker.retrieve_csr(
+            make_config()["switches"][0], "u", "p", "newcert", make_csr_settings()
+        )
+
+
+def test_f09e_preinstall_summary_overflow_is_pre_attempt():
+    connection = FakeInstallConnection(make_test_csr())
+
+    def overflow(*args, **kwargs):
+        raise SSHOutputLimitError("SSH read budget exceeded")
+
+    connection.send_command = overflow
+    with pytest.raises(SSHOutputLimitError):
+        checker.install_signed_certificate(
+            connection, "webcert2027", "PUBLIC CERT", "webprofile2026"
+        )
+    assert not connection.entered_config_mode
+
+
+@pytest.mark.parametrize("stage", ["summary", "config", "create", "detail"])
+def test_f09e_csr_overflow_keeps_attempt_classification(monkeypatch, stage):
+    connection = FakeCSRConnection(make_test_csr())
+    connection.poisoned = False
+
+    def overflow(*args, **kwargs):
+        connection.poisoned = True
+        raise SSHOutputLimitError("SSH read budget exceeded")
+
+    if stage == "summary":
+        connection.send_command = overflow
+    elif stage == "config":
+        connection.config_mode = overflow
+    elif stage == "create":
+        connection.send_command_timing = overflow
+    else:
+        original = connection.send_command
+
+        def detail(command, **kwargs):
+            if command != "show crypto pki local-certificate summary":
+                return overflow()
+            return original(command, **kwargs)
+
+        connection.send_command = detail
+    monkeypatch.setattr(checker, "ConnectHandler", lambda **kwargs: connection)
+    expected = (
+        SSHOutputLimitError
+        if stage in ("summary", "config")
+        else checker.CSRGenerationError
+    )
+    with pytest.raises(expected):
+        checker.generate_csr(
+            make_config()["switches"][0], "u", "p", "newcert", make_csr_settings()
+        )
+    assert connection.exited_config_mode == (stage == "detail")
+
+
+@pytest.mark.parametrize(
+    "stage", ["paste", "replacement", "confirmation", "post_summary", "detail"]
+)
+def test_f09e_install_overflow_keeps_ambiguous_state(stage):
+    connection = FakeInstallConnection(make_test_csr())
+    connection.summary_calls = 1
+    connection.poisoned = False
+
+    def overflow(*args, **kwargs):
+        connection.poisoned = True
+        raise SSHOutputLimitError("SSH read budget exceeded")
+
+    if stage in ("paste", "confirmation"):
+        original = connection.send_command_timing
+
+        def timing(command, **kwargs):
+            if (stage == "paste" and command.startswith("crypto pki install")) or (
+                stage == "confirmation" and command == "y"
+            ):
+                return overflow()
+            return original(command, **kwargs)
+
+        connection.send_command_timing = timing
+    elif stage == "replacement":
+        connection.read_channel_timing = overflow
+    else:
+        original = connection.send_command
+
+        def command(command, **kwargs):
+            post_summary = (
+                stage == "post_summary"
+                and command == "show crypto pki local-certificate summary"
+                and connection.summary_calls >= 2
+            )
+            named_detail = (
+                stage == "detail"
+                and command == "show crypto pki local-certificate webcert2027"
+                and connection.summary_calls >= 3
+            )
+            if post_summary or named_detail:
+                connection.commands.append(command)
+                return overflow()
+            return original(command, **kwargs)
+
+        connection.send_command = command
+    with pytest.raises(
+        checker.CertificateInstallationAttemptError, match="may already have changed"
+    ):
+        checker.install_signed_certificate(
+            connection, "webcert2027", "PUBLIC CERT", "webprofile2026"
+        )
+    assert connection.exited_config_mode == (stage in ("post_summary", "detail"))
+    if stage == "detail":
+        assert connection.summary_calls == 3
+        assert (
+            connection.commands[-1] == "show crypto pki local-certificate webcert2027"
+        )
+
+
+def test_f09e_install_exit_overflow_keeps_ambiguous_state():
+    connection = FakeInstallConnection(make_test_csr())
+    connection.summary_calls = 1
+
+    def overflow():
+        connection.poisoned = True
+        raise SSHOutputLimitError("SSH read budget exceeded")
+
+    connection.exit_config_mode = overflow
+    with pytest.raises(
+        checker.CertificateInstallationAttemptError,
+        match="config mode could not be exited",
+    ):
+        checker.install_signed_certificate(
+            connection, "webcert2027", "PUBLIC CERT", "webprofile2026"
+        )
 
 
 def test_f09d_csr_debug_suppression_restores_on_success_and_exception(
@@ -7031,7 +7217,16 @@ def test_renew_certificate_preflight_failure_attempts_no_stage(monkeypatch):
         )
 
 
-def test_renew_signing_failure_reports_that_pending_csr_remains(monkeypatch):
+@pytest.mark.parametrize(
+    "sign_error",
+    [
+        ValueError("OPNsense unavailable"),
+        SSHOutputLimitError("SSH read budget exceeded"),
+    ],
+)
+def test_renew_signing_failure_reports_that_pending_csr_remains(
+    monkeypatch, sign_error
+):
     monkeypatch.setattr(
         checker,
         "renewal_preflight",
@@ -7045,9 +7240,7 @@ def test_renew_signing_failure_reports_that_pending_csr_remains(monkeypatch):
     monkeypatch.setattr(
         checker,
         "sign_pending_csr",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            ValueError("OPNsense unavailable")
-        ),
+        lambda *args, **kwargs: (_ for _ in ()).throw(sign_error),
     )
     monkeypatch.setattr(
         checker,
