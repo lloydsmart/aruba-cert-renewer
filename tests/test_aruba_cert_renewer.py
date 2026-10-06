@@ -33,7 +33,7 @@ import aruba_cert_renewer as checker
 import lifecycle_lock
 import opnsense_client
 from bounded_netmiko import SSHOutputLimitError
-from bounded_paramiko import SSHBannerLimitError
+from bounded_paramiko import SSHBannerLimitError, SSHBinaryPacketLimitError
 from secure_file import SecureFileError
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
@@ -41,13 +41,22 @@ KNOWN_HOSTS_FILE = FIXTURES_DIR / "known_hosts"
 OBSERVED_EKU_OID = x509.ObjectIdentifier("1.3.6.1.5.5.8.2.2")
 
 
-def test_banner_overflow_is_pre_mutation_in_application_paths(monkeypatch, capsys):
+@pytest.mark.parametrize(
+    ("error_type", "message"),
+    [
+        (SSHBannerLimitError, "SSH banner resource limit exceeded"),
+        (SSHBinaryPacketLimitError, "SSH binary packet resource limit exceeded"),
+    ],
+)
+def test_ssh_transport_overflow_is_pre_mutation_in_application_paths(
+    monkeypatch, capsys, error_type, message
+):
     switch = make_config()["switches"][0]
     calls = []
 
     def overflow(**kwargs):
         calls.append("connect")
-        raise SSHBannerLimitError("SSH banner resource limit exceeded")
+        raise error_type(message)
 
     monkeypatch.setattr(checker, "ConnectHandler", overflow)
     monkeypatch.setattr(
@@ -56,24 +65,22 @@ def test_banner_overflow_is_pre_mutation_in_application_paths(monkeypatch, capsy
         lambda *args, **kwargs: pytest.fail("No OPNsense request is permitted"),
     )
     assert checker.check_switch(switch, "synthetic", "synthetic", 30) == "error"
-    assert "SSH banner resource limit exceeded" in capsys.readouterr().out
+    assert message in capsys.readouterr().out
 
-    with pytest.raises(
-        checker.RenewalPreflightError, match="SSH banner resource limit"
-    ):
+    with pytest.raises(checker.RenewalPreflightError, match="SSH .* resource limit"):
         checker.renewal_preflight(switch, "synthetic", "synthetic")
 
-    with pytest.raises(SSHBannerLimitError):
+    with pytest.raises(error_type):
         checker.generate_csr(
             switch, "synthetic", "synthetic", "webcert2027", make_csr_settings()
         )
 
-    with pytest.raises(SSHBannerLimitError):
+    with pytest.raises(error_type):
         checker.retrieve_csr(
             switch, "synthetic", "synthetic", "webcert2027", make_csr_settings()
         )
 
-    with pytest.raises(SSHBannerLimitError):
+    with pytest.raises(error_type):
         checker.sign_pending_csr(
             switch,
             "synthetic",
@@ -83,7 +90,7 @@ def test_banner_overflow_is_pre_mutation_in_application_paths(monkeypatch, capsy
             {},
         )
 
-    with pytest.raises(SSHBannerLimitError):
+    with pytest.raises(error_type):
         checker.install_pending_certificate(
             switch,
             "synthetic",
@@ -2989,13 +2996,14 @@ def test_f09e_preinstall_summary_overflow_is_pre_attempt():
 
 
 @pytest.mark.parametrize("stage", ["summary", "config", "create", "detail"])
-def test_f09e_csr_overflow_keeps_attempt_classification(monkeypatch, stage):
+@pytest.mark.parametrize("error_type", [SSHOutputLimitError, SSHBinaryPacketLimitError])
+def test_f09e_csr_overflow_keeps_attempt_classification(monkeypatch, stage, error_type):
     connection = FakeCSRConnection(make_test_csr())
     connection.poisoned = False
 
     def overflow(*args, **kwargs):
         connection.poisoned = True
-        raise SSHOutputLimitError("SSH read budget exceeded")
+        raise error_type("SSH transport resource limit exceeded")
 
     if stage == "summary":
         connection.send_command = overflow
@@ -3014,9 +3022,7 @@ def test_f09e_csr_overflow_keeps_attempt_classification(monkeypatch, stage):
         connection.send_command = detail
     monkeypatch.setattr(checker, "ConnectHandler", lambda **kwargs: connection)
     expected = (
-        SSHOutputLimitError
-        if stage in ("summary", "config")
-        else checker.CSRGenerationError
+        error_type if stage in ("summary", "config") else checker.CSRGenerationError
     )
     with pytest.raises(expected):
         checker.generate_csr(
@@ -3028,14 +3034,15 @@ def test_f09e_csr_overflow_keeps_attempt_classification(monkeypatch, stage):
 @pytest.mark.parametrize(
     "stage", ["paste", "replacement", "confirmation", "post_summary", "detail"]
 )
-def test_f09e_install_overflow_keeps_ambiguous_state(stage):
+@pytest.mark.parametrize("error_type", [SSHOutputLimitError, SSHBinaryPacketLimitError])
+def test_f09e_install_overflow_keeps_ambiguous_state(stage, error_type):
     connection = FakeInstallConnection(make_test_csr())
     connection.summary_calls = 1
     connection.poisoned = False
 
     def overflow(*args, **kwargs):
         connection.poisoned = True
-        raise SSHOutputLimitError("SSH read budget exceeded")
+        raise error_type("SSH transport resource limit exceeded")
 
     if stage in ("paste", "confirmation"):
         original = connection.send_command_timing
@@ -3084,13 +3091,14 @@ def test_f09e_install_overflow_keeps_ambiguous_state(stage):
         )
 
 
-def test_f09e_install_exit_overflow_keeps_ambiguous_state():
+@pytest.mark.parametrize("error_type", [SSHOutputLimitError, SSHBinaryPacketLimitError])
+def test_f09e_install_exit_overflow_keeps_ambiguous_state(error_type):
     connection = FakeInstallConnection(make_test_csr())
     connection.summary_calls = 1
 
     def overflow():
         connection.poisoned = True
-        raise SSHOutputLimitError("SSH read budget exceeded")
+        raise error_type("SSH transport resource limit exceeded")
 
     connection.exit_config_mode = overflow
     with pytest.raises(
@@ -7308,6 +7316,7 @@ def test_renew_certificate_preflight_failure_attempts_no_stage(monkeypatch):
     [
         ValueError("OPNsense unavailable"),
         SSHOutputLimitError("SSH read budget exceeded"),
+        SSHBinaryPacketLimitError("SSH binary packet resource limit exceeded"),
     ],
 )
 def test_renew_signing_failure_reports_that_pending_csr_remains(

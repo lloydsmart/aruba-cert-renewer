@@ -18,6 +18,7 @@ from netmiko.netmiko_globals import MAX_BUFFER
 from bounded_paramiko import (
     BoundedSSHClient,
     BoundedSSHClientNoAuth,
+    SSHBinaryPacketLimitError,
     assert_paramiko_contract,
 )
 
@@ -77,6 +78,7 @@ class BoundedSSHChannel(SSHChannel):
         self.poisoned = False
 
     def _require_healthy(self):
+        self.owner._require_healthy()
         if self.poisoned:
             raise SSHOutputLimitError("SSH read budget exceeded")
 
@@ -90,7 +92,10 @@ class BoundedSSHChannel(SSHChannel):
             raise ReadException("Attempt to read, but there is no active channel.")
         if not self.remote_conn.recv_ready():
             return ""
-        raw = self.remote_conn.recv(min(MAX_BUFFER, self.limit - self.used + 1))
+        try:
+            raw = self.remote_conn.recv(min(MAX_BUFFER, self.limit - self.used + 1))
+        finally:
+            self._require_healthy()
         if not raw:
             raise ReadException("Channel stream closed by remote device.")
         self.used += len(raw)
@@ -101,11 +106,27 @@ class BoundedSSHChannel(SSHChannel):
 
     def read_channel(self):
         self._require_healthy()
-        return super().read_channel()
+        try:
+            result = super().read_channel()
+        except SSHBinaryPacketLimitError:
+            raise
+        except Exception:
+            self._require_healthy()
+            raise
+        self._require_healthy()
+        return result
 
     def write_channel(self, out_data):
         self._require_healthy()
-        return super().write_channel(out_data)
+        try:
+            result = super().write_channel(out_data)
+        except SSHBinaryPacketLimitError:
+            raise
+        except Exception:
+            self._require_healthy()
+            raise
+        self._require_healthy()
+        return result
 
 
 class BoundedArubaConnection(HPProcurveSSH):
@@ -131,7 +152,16 @@ class BoundedArubaConnection(HPProcurveSSH):
             raise RuntimeError("Netmiko newline handling changed")
         self.channel = BoundedSSHChannel(self.remote_conn, self.encoding, self)
 
+    def _binary_overflow(self):
+        client = getattr(self, "remote_conn_pre", None)
+        transport = client.get_transport() if hasattr(client, "get_transport") else None
+        packetizer = getattr(transport, "packetizer", None)
+        return getattr(packetizer, "binary_packet_limit_exceeded", False)
+
     def _require_healthy(self):
+        if self._binary_overflow():
+            self._dispose_poisoned()
+            raise SSHBinaryPacketLimitError("SSH binary packet resource limit exceeded")
         if self._bounded_channel_poisoned:
             raise SSHOutputLimitError("SSH read budget exceeded")
 
@@ -219,6 +249,8 @@ class BoundedArubaConnection(HPProcurveSSH):
 
     @property
     def poisoned(self):
+        if self._binary_overflow():
+            self._dispose_poisoned()
         return self._bounded_channel_poisoned
 
     @contextmanager

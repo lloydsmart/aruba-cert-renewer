@@ -1,5 +1,6 @@
 """Paramiko 4.0.0 pre-authentication text boundary tests."""
 
+import hashlib
 import inspect
 import socket
 import struct
@@ -8,6 +9,9 @@ import threading
 import netmiko
 import paramiko
 import pytest
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from netmiko.base_connection import BaseConnection
 from netmiko.exceptions import NetmikoTimeoutException
 from paramiko.packet import Packetizer
@@ -17,11 +21,13 @@ import bounded_paramiko
 from bounded_netmiko import BoundedArubaConnection
 from bounded_paramiko import (
     MAX_SSH_BANNER_LINE_BYTES,
+    MAX_SSH_PACKET_LENGTH,
     MAX_SSH_PREAUTH_TEXT_BYTES,
     BoundedPacketizer,
     BoundedSSHClient,
     BoundedSSHClientNoAuth,
     SSHBannerLimitError,
+    SSHBinaryPacketLimitError,
     assert_paramiko_contract,
 )
 
@@ -36,16 +42,18 @@ class FakeSocket:
         self.acquired = 0
         self.sends = 0
         self.closed = False
+        self.sent_data = b""
 
     def recv(self, size):
         self.requests.append(size)
+        assert size <= 300_000, "unsafe SSH recv request in test"
         if self.error:
             raise self.error
         if self.data:
             take = min(size, self.chunk or size)
             result, self.data = self.data[:take], self.data[take:]
         elif self.endless:
-            result = b"x" * min(size, self.chunk or size)
+            result = b"x" * min(size, self.chunk or 128)
         else:
             result = b""
         self.acquired += len(result)
@@ -53,6 +61,7 @@ class FakeSocket:
 
     def send(self, data):
         self.sends += 1
+        self.sent_data += data
         return len(data)
 
     def settimeout(self, timeout):
@@ -86,8 +95,258 @@ def test_dependency_contract_and_chain():
 
 def test_dependency_drift_fails_before_network(monkeypatch):
     monkeypatch.setattr(bounded_paramiko, "version", lambda name: "4.9.0")
-    with pytest.raises(RuntimeError, match="review the bounded Paramiko banner"):
+    with pytest.raises(RuntimeError, match="review the bounded Paramiko transport"):
         assert_paramiko_contract()
+
+
+def test_packet_parser_source_drift_fails_before_network(monkeypatch):
+    monkeypatch.setattr(bounded_paramiko, "_READ_MESSAGE_SHA256", "0" * 64)
+    with pytest.raises(RuntimeError, match="review the bounded Paramiko transport"):
+        assert_paramiko_contract()
+
+
+def _make_wire_packet(mode, payload):
+    """Use Paramiko's real writer and genuine cipher/MAC implementations."""
+    sock = FakeSocket()
+    writer = Packetizer(sock)
+    key, iv, mac_key = b"k" * 16, b"i" * 16, b"m" * 32
+    if mode == "classic" or mode == "etm":
+        cipher = Cipher(algorithms.AES(key), modes.CTR(iv))
+        writer.set_outbound_cipher(
+            cipher.encryptor(),
+            16,
+            hashlib.sha256,
+            32,
+            mac_key,
+            sdctr=True,
+            etm=mode == "etm",
+        )
+    elif mode == "aead":
+        writer.set_outbound_cipher(
+            AESGCM(key), 16, None, 16, None, aead=True, iv_out=b"i" * 12
+        )
+    writer.send_message(paramiko.Message(payload))
+    return sock.sent_data
+
+
+def _reader_for_mode(reader, mode):
+    key, iv, mac_key = b"k" * 16, b"i" * 16, b"m" * 32
+    if mode == "classic" or mode == "etm":
+        cipher = Cipher(algorithms.AES(key), modes.CTR(iv))
+        reader.set_inbound_cipher(
+            cipher.decryptor(),
+            16,
+            hashlib.sha256,
+            32,
+            mac_key,
+            etm=mode == "etm",
+        )
+    elif mode == "aead":
+        reader.set_inbound_cipher(
+            AESGCM(key), 16, None, 16, None, aead=True, iv_in=b"i" * 12
+        )
+
+
+def _packet_payload(size=24):
+    return b"\x02" + b"x" * (size - 1)
+
+
+@pytest.mark.parametrize("mode", ["plain", "classic", "etm", "aead"])
+def test_real_packet_parser_matches_upstream_for_valid_packet(mode):
+    wire = _make_wire_packet(mode, _packet_payload())
+    results = []
+    for cls in (Packetizer, BoundedPacketizer):
+        sock = FakeSocket(wire, chunk=3)
+        reader = cls(sock)
+        _reader_for_mode(reader, mode)
+        command, message = reader.read_message()
+        results.append((command, message.get_remainder(), message.seqno))
+        assert max(sock.requests) <= len(wire)
+    assert results[0] == results[1] == (2, b"x" * 23, 0)
+
+
+@pytest.mark.parametrize("mode", ["classic", "etm", "aead"])
+def test_upstream_authentication_still_rejects_tampered_packet(mode):
+    wire = bytearray(_make_wire_packet(mode, _packet_payload()))
+    wire[-1] ^= 1  # MAC or GCM tag
+    for cls in (Packetizer, BoundedPacketizer):
+        reader = cls(FakeSocket(bytes(wire)))
+        _reader_for_mode(reader, mode)
+        with pytest.raises((paramiko.SSHException, InvalidTag)):
+            reader.read_message()
+        if isinstance(reader, BoundedPacketizer):
+            assert not reader.binary_packet_limit_exceeded
+
+
+@pytest.mark.parametrize("length", [0xFFFFFFFC, 0xFFFFFFFF])
+def test_malicious_plain_header_never_reaches_large_recv(length):
+    header = struct.pack(">I", length) + b"\x04\x00\x00\x00"
+    reader, sock = packetizer(header)
+    with pytest.raises((SSHBinaryPacketLimitError, paramiko.SSHException)):
+        reader.read_message()
+    assert sock.requests == [8]
+    if length == 0xFFFFFFFC:
+        assert reader.binary_packet_limit_exceeded
+        assert sock.closed
+
+
+@pytest.mark.parametrize(
+    ("mode", "excess"),
+    [("classic", 12), ("etm", 1), ("etm", 16), ("aead", 1)],
+)
+def test_encrypted_over_limit_rejected_before_body_recv(mode, excess):
+    # A real encrypted first block is enough: the body is never supplied.
+    wire = _make_wire_packet(mode, _packet_payload())
+    reader, sock = packetizer(wire[:16])
+    _reader_for_mode(reader, mode)
+    if mode == "classic":
+        # Encrypt a valid aligned over-limit field with the genuine CTR cipher.
+        field = MAX_SSH_PACKET_LENGTH + excess
+        plain = struct.pack(">I", field) + b"\x04" + b"\x00" * 11
+        sock.data = (
+            Cipher(algorithms.AES(b"k" * 16), modes.CTR(b"i" * 16))
+            .encryptor()
+            .update(plain)
+        )
+    else:
+        field = MAX_SSH_PACKET_LENGTH + excess
+        sock.data = struct.pack(">I", field) + wire[4:16]
+    with pytest.raises(SSHBinaryPacketLimitError):
+        reader.read_message()
+    assert sock.requests == [16]
+    assert reader.binary_packet_limit_exceeded
+
+
+def test_exact_etm_field_limit_and_one_block_over():
+    # EtM excludes the clear four-byte field from block alignment.
+    payload = _packet_payload(MAX_SSH_PACKET_LENGTH - 5)
+    wire = _make_wire_packet("etm", payload)
+    field = int.from_bytes(wire[:4], "big")
+    assert field == MAX_SSH_PACKET_LENGTH
+    reader, sock = packetizer(wire, chunk=4096)
+    _reader_for_mode(reader, "etm")
+    command, message = reader.read_message()
+    assert command == 2
+    assert message.get_remainder() == payload[1:]
+    assert reader._packet_phase is None
+    assert not reader.binary_packet_limit_exceeded
+    assert max(sock.requests) <= MAX_SSH_PACKET_LENGTH
+
+
+@pytest.mark.parametrize(
+    ("mode", "field"),
+    [
+        ("plain", MAX_SSH_PACKET_LENGTH - 4),
+        ("classic", MAX_SSH_PACKET_LENGTH - 4),
+        ("aead", MAX_SSH_PACKET_LENGTH),
+    ],
+)
+def test_largest_aligned_classic_and_exact_aead_packets(mode, field):
+    wire = _make_wire_packet(mode, _packet_payload(field - 5))
+    if mode in ("plain", "aead"):
+        assert int.from_bytes(wire[:4], "big") == field
+    reader, sock = packetizer(wire, chunk=4096)
+    _reader_for_mode(reader, mode)
+    command, message = reader.read_message()
+    assert command == 2
+    assert len(message.get_remainder()) == field - 6
+    assert not reader.binary_packet_limit_exceeded
+    if mode == "aead":
+        # Tag bytes are bounded overhead outside packet_length.
+        assert sock.requests[1] == field - 16 + 4 + 16
+        assert sock.requests[1] > MAX_SSH_PACKET_LENGTH
+    if mode == "classic":
+        # Classic's combined body/MAC request includes 32 MAC bytes.
+        assert sock.requests[1] == field - 16 + 4 + 32
+
+
+def test_two_plain_packets_reset_guard_and_sequence():
+    wire = _make_wire_packet("plain", _packet_payload()) * 2
+    reader, _ = packetizer(wire)
+    first, first_message = reader.read_message()
+    second, second_message = reader.read_message()
+    assert (first, second) == (2, 2)
+    assert (first_message.seqno, second_message.seqno) == (0, 1)
+    assert reader._packet_phase is None
+
+
+def test_truncated_body_and_socket_error_do_not_leave_guard_armed():
+    wire = _make_wire_packet("plain", _packet_payload())
+    reader, _ = packetizer(wire[:8])
+    with pytest.raises(EOFError):
+        reader.read_message()
+    assert reader._packet_phase is None
+    assert not reader.binary_packet_limit_exceeded
+
+    reader, _ = packetizer(wire[:8], error=OSError("synthetic socket error"))
+    with pytest.raises(OSError, match="synthetic socket error"):
+        reader.read_message()
+    assert reader._packet_phase is None
+
+
+@pytest.mark.parametrize(
+    "wire",
+    [
+        b"\x00\x00\x00\x04\x04\x02\x00\x00",  # too small for a payload
+        b"\x00\x00\x00\x05\x04\x02\x00\x00",  # classic misalignment
+        b"\x00\x00\x00\x0c\xff\x02\x00\x00" + b"\x00" * 8,
+    ],
+)
+def test_malformed_packets_remain_rejected(wire):
+    reader, sock = packetizer(wire)
+    with pytest.raises((SSHBinaryPacketLimitError, paramiko.SSHException, IndexError)):
+        reader.read_message()
+    assert max(sock.requests) <= len(wire)
+
+
+def test_packet_limit_exceeds_rfc_interoperability_floor():
+    # RFC 4253 requires support for 35,000 total bytes including the length
+    # field and MAC; the no-MAC field component can therefore be 34,996.
+    assert MAX_SSH_PACKET_LENGTH >= 35_000 - 4
+
+
+def test_binary_remainder_and_fragmented_header_are_bounded():
+    identification = b"SSH-2.0-test\r\n"
+    header = bytes.fromhex("ff ff ff fc 04 00 00 00")
+    for prefix in (8, 3):
+        reader, sock = packetizer(identification + header[:prefix])
+        assert reader.readline(1) == "SSH-2.0-test"
+        sock.data = header[prefix:]
+        with pytest.raises(SSHBinaryPacketLimitError):
+            reader.read_message()
+        assert max(sock.requests) <= 128
+
+
+def test_valid_packet_body_spans_banner_remainder_and_socket():
+    identification = b"SSH-2.0-test\r\n"
+    wire = _make_wire_packet("plain", _packet_payload())
+    reader, sock = packetizer(identification + wire[:10])
+    assert reader.readline(1) == "SSH-2.0-test"
+    sock.data = wire[10:]
+    command, message = reader.read_message()
+    assert command == 2
+    assert message.get_remainder() == b"x" * 23
+    assert not reader.binary_packet_limit_exceeded
+
+
+def test_unexpected_packet_read_pattern_fails_closed(monkeypatch):
+    reader, sock = packetizer(b"\x00" * 8)
+    monkeypatch.setattr(reader, "_packet_phase", "body")
+    reader._packet_block = 8
+    reader._packet_mac = 0
+    reader._packet_mode = "classic"
+    with pytest.raises(SSHBinaryPacketLimitError):
+        reader.read_all(MAX_SSH_PACKET_LENGTH + 100)
+    assert sock.requests == []
+    assert reader.binary_packet_limit_exceeded
+
+    reader, sock = packetizer(b"\x00" * 16)
+    reader._packet_phase = "body"
+    reader._packet_block = 8
+    reader._packet_mac = 0
+    with pytest.raises(SSHBinaryPacketLimitError):
+        reader.read_all(16)
+    assert sock.requests == []
 
 
 @pytest.mark.parametrize(
@@ -269,6 +528,17 @@ def test_competing_factory_rejected_before_socket_use():
     assert not sock.closed
 
 
+def test_compression_cannot_be_enabled_without_review():
+    client = BoundedSSHClient()
+    sock = FakeSocket()
+    with pytest.raises(
+        ValueError, match="compression requires a resource-policy review"
+    ):
+        client.connect("switch.example", sock=sock, compress=True)
+    assert not sock.requests
+    assert not sock.closed
+
+
 def test_wrapped_overflow_becomes_content_free_project_error_and_closes():
     sock = FakeSocket(b"x" * 1000, chunk=128)
     client = BoundedSSHClient()
@@ -307,6 +577,36 @@ def test_netmiko_chain_overflow_never_opens_shell_or_reconnects(tmp_path, monkey
     assert sock.closed
     assert sock.acquired == 255
     assert sock.sends == 1
+
+
+def test_binary_overflow_through_client_and_netmiko_before_shell(tmp_path, monkeypatch):
+    known_hosts = tmp_path / "known_hosts"
+    known_hosts.write_text("")
+    header = bytes.fromhex("ff ff ff fc 04 00 00 00")
+    sock = FakeSocket(b"SSH-2.0-synthetic\r\n" + header)
+    monkeypatch.setattr(
+        BoundedSSHClient,
+        "invoke_shell",
+        lambda *args, **kwargs: pytest.fail("A shell must not open"),
+    )
+    with pytest.raises(
+        SSHBinaryPacketLimitError, match="SSH binary packet resource limit"
+    ):
+        BoundedArubaConnection(
+            device_type="aruba_osswitch",
+            host="switch.example",
+            username="synthetic",
+            password="synthetic",
+            sock=sock,
+            alt_host_keys=True,
+            alt_key_file=str(known_hosts),
+            system_host_keys=False,
+            ssh_strict=True,
+        )
+    assert sock.closed
+    assert max(sock.requests) <= 128
+    # Identification and KEXINIT may both be sent before the peer packet.
+    assert sock.sends == 2
 
 
 class SyntheticServer(paramiko.ServerInterface):
