@@ -1087,6 +1087,49 @@ def test_snapshot_setup_failure_does_not_start_ssh(monkeypatch):
         pass
 
 
+@pytest.mark.parametrize("operation", ["--generate-csr", "--retrieve-csr"])
+def test_explicit_csr_snapshot_setup_failure_is_cli_error(
+    monkeypatch, capsys, operation
+):
+    def fail_setup(*args, **kwargs):
+        raise OSError("synthetic temp directory failure\nunsafe")
+
+    def unexpected_connection(**kwargs):
+        pytest.fail("SSH connection or device mutation started after snapshot failure")
+
+    monkeypatch.setattr(checker.tempfile, "mkdtemp", fail_setup)
+    monkeypatch.setattr(checker, "ConnectHandler", unexpected_connection)
+    monkeypatch.setattr(
+        checker, "get_switch_credentials", lambda *args: ("username", "password")
+    )
+    args = SimpleNamespace(
+        config=Path("config.toml"),
+        renew=False,
+        install_certificate=False,
+        sign_csr=False,
+        generate_csr=operation == "--generate-csr",
+        retrieve_csr=operation == "--retrieve-csr",
+        certificate_name="webcert2027",
+        csr_output=None,
+    )
+
+    result = checker.run_explicit_operation(
+        args,
+        make_config()["switches"],
+        make_csr_settings(),
+        None,
+        None,
+        None,
+    )
+
+    output = capsys.readouterr()
+    assert result == checker.EXIT_ERROR
+    assert output.out == ""
+    assert output.err == "Error: synthetic temp directory failure\\nunsafe\n"
+    assert "pending CSR" not in output.err
+    assert "ambiguous" not in output.err
+
+
 def test_ssh_snapshot_cleanup_preserves_primary_error(monkeypatch):
     switch = make_config()["switches"][0]
     original_rmtree = checker.shutil.rmtree

@@ -2846,7 +2846,7 @@ def run_explicit_operation(
 
             return EXIT_OK
 
-        except ValueError as error:
+        except (ValueError, OSError) as error:
             print_terminal(f"Error: {error}", file=sys.stderr)
             return EXIT_ERROR
 
