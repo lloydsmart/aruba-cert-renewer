@@ -693,10 +693,12 @@ def read_password_file(configured_path, config_file):
         ) from None
 
 
-def get_switch_credentials(switch, config_file):
+def get_switch_credentials(switch, config_file, *, allow_prompt=True):
     display_name = sanitize_terminal_text(switch["name"])
     username = switch.get("username") or os.environ.get("ARUBA_SSH_USERNAME")
     if not username:
+        if not allow_prompt:
+            raise ValueError("SSH username is required in non-interactive mode")
         username = input(f"SSH username for {display_name}: ")
     username = validate_ssh_username(username)
 
@@ -705,6 +707,8 @@ def get_switch_credentials(switch, config_file):
     else:
         password = os.environ.get("ARUBA_SSH_PASSWORD")
         if not password:
+            if not allow_prompt:
+                raise ValueError("SSH password is required in non-interactive mode")
             password = getpass.getpass(f"SSH password for {display_name}: ")
 
     if not password:
@@ -3325,11 +3329,16 @@ def _json_explicit(item, args, switch, username, password, settings):
             item.outcome = Outcome.SUCCESS_PREPARED
             item.message = "CSR generated and written to the requested file."
         elif operation == "retrieve_csr":
-            item.stage = Stage.CSR_RETRIEVAL
+            _json_progress(item, "csr_retrieval_started")
             csr = retrieve_csr(
-                switch, username, password, args.certificate_name, settings["csr"]
+                switch,
+                username,
+                password,
+                args.certificate_name,
+                settings["csr"],
+                progress=lambda event: _json_progress(item, event),
             )
-            item.milestones["csr"] = Milestone.CONFIRMED
+            _json_progress(item, "csr_retrieved")
             write_or_print_csr(csr, args.csr_output)
             item.outcome = Outcome.SUCCESS_NO_CHANGE
             item.message = "Pending CSR retrieved and written to the requested file."
@@ -3498,7 +3507,9 @@ def _run_json(args, run):
         item = SwitchResult(target=switch["name"])
         run.results.append(item)
         try:
-            username, password = get_switch_credentials(switch, args.config)
+            username, password = get_switch_credentials(
+                switch, args.config, allow_prompt=False
+            )
         except Exception:
             item.stage = Stage.CONFIGURATION
             item.reason_code = Reason.CONFIG_INVALID

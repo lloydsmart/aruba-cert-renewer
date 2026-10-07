@@ -11,6 +11,10 @@ can occur before a result is produced.
 The validated public CSR goes only to that file. Explicit signed-certificate file
 output remains available. Existing files are never overwritten.
 
+JSON mode never prompts for switch credentials. Each switch needs a configured
+username or `ARUBA_SSH_USERNAME`, and a configured password file or
+`ARUBA_SSH_PASSWORD`. Missing credentials fail that switch before network access.
+
 ## Fields
 
 Every top-level object has these required fields:

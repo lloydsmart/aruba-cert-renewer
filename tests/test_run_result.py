@@ -24,6 +24,8 @@ from run_result import (
     SwitchResult,
 )
 
+REAL_GET_SWITCH_CREDENTIALS = checker.get_switch_credentials
+
 
 @pytest.fixture
 def json_environment(monkeypatch):
@@ -44,7 +46,9 @@ def json_environment(monkeypatch):
     )
     monkeypatch.setattr(checker, "get_verification_ca_file", lambda *args: object())
     monkeypatch.setattr(
-        checker, "get_switch_credentials", lambda *args: ("synthetic", "synthetic")
+        checker,
+        "get_switch_credentials",
+        lambda *args, **kwargs: ("synthetic", "synthetic"),
     )
 
     @contextmanager
@@ -422,6 +426,96 @@ def test_json_csr_conflict_precedes_contact(monkeypatch, capsys, json_environmen
         assert result["reason_code"] == "config_invalid"
 
 
+@pytest.mark.parametrize("missing", ["username", "password"])
+def test_json_missing_switch_credentials_never_prompt_or_connect(
+    monkeypatch, capsys, json_environment, missing
+):
+    switch = json_environment[0]
+    if missing == "password":
+        switch["username"] = "synthetic-user"
+    monkeypatch.setattr(checker, "get_switch_credentials", REAL_GET_SWITCH_CREDENTIALS)
+    monkeypatch.delenv("ARUBA_SSH_USERNAME", raising=False)
+    monkeypatch.delenv("ARUBA_SSH_PASSWORD", raising=False)
+    monkeypatch.setattr("builtins.input", lambda *args: pytest.fail("input called"))
+    monkeypatch.setattr(
+        checker.getpass, "getpass", lambda *args: pytest.fail("getpass called")
+    )
+    monkeypatch.setattr(checker, "check_switch", lambda *args: pytest.fail("network"))
+
+    code, result, _ = invoke(monkeypatch, capsys, "--switch", "SWITCH-A")
+    item = result["results"][0]
+    assert code == 2
+    assert item["stage"] == "configuration"
+    assert item["outcome"] == "failure_pre_attempt"
+    assert item["reason_code"] == "config_invalid"
+    assert item["change"] == "none"
+    assert item["manual_recovery_required"] is False
+
+
+@pytest.mark.parametrize("source", ["file", "environment"])
+def test_json_accepts_noninteractive_switch_credentials(
+    monkeypatch, capsys, tmp_path, json_environment, source
+):
+    switch = json_environment[0]
+    monkeypatch.setattr(checker, "get_switch_credentials", REAL_GET_SWITCH_CREDENTIALS)
+    monkeypatch.delenv("ARUBA_SSH_USERNAME", raising=False)
+    monkeypatch.delenv("ARUBA_SSH_PASSWORD", raising=False)
+    monkeypatch.setattr("builtins.input", lambda *args: pytest.fail("input called"))
+    monkeypatch.setattr(
+        checker.getpass, "getpass", lambda *args: pytest.fail("getpass called")
+    )
+    if source == "file":
+        secret = tmp_path / "switch.secret"
+        secret.write_text("synthetic-file-password\n")
+        secret.chmod(0o600)
+        switch.update(username="synthetic-file-user", password_file=str(secret))
+        expected = ("synthetic-file-user", "synthetic-file-password")
+    else:
+        monkeypatch.setenv("ARUBA_SSH_USERNAME", "synthetic-env-user")
+        monkeypatch.setenv("ARUBA_SSH_PASSWORD", "synthetic-env-password")
+        expected = ("synthetic-env-user", "synthetic-env-password")
+
+    def check_switch(switch, username, password, warning_days):
+        assert (username, password) == expected
+        return "ok"
+
+    monkeypatch.setattr(checker, "check_switch", check_switch)
+    code, result, output = invoke(monkeypatch, capsys, "--switch", "SWITCH-A")
+    assert code == 0
+    assert result["results"][0]["outcome"] == "success_no_change"
+    assert all(value not in output for value in expected)
+
+
+def test_json_missing_credentials_only_fail_affected_switch(
+    monkeypatch, capsys, tmp_path, json_environment
+):
+    secret = tmp_path / "switch.secret"
+    secret.write_text("synthetic-password\n")
+    secret.chmod(0o600)
+    json_environment[1].update(username="synthetic-user", password_file=str(secret))
+    monkeypatch.setattr(checker, "get_switch_credentials", REAL_GET_SWITCH_CREDENTIALS)
+    monkeypatch.delenv("ARUBA_SSH_USERNAME", raising=False)
+    monkeypatch.delenv("ARUBA_SSH_PASSWORD", raising=False)
+    monkeypatch.setattr("builtins.input", lambda *args: pytest.fail("input called"))
+    monkeypatch.setattr(
+        checker.getpass, "getpass", lambda *args: pytest.fail("getpass called")
+    )
+    checked = []
+
+    def check_switch(switch, username, password, warning_days):
+        checked.append(switch["name"])
+        return "ok"
+
+    monkeypatch.setattr(checker, "check_switch", check_switch)
+    code, result, _ = invoke(monkeypatch, capsys)
+    assert code == 2
+    assert checked == ["SWITCH-B"]
+    assert [item["outcome"] for item in result["results"]] == [
+        "failure_pre_attempt",
+        "success_no_change",
+    ]
+
+
 def test_json_csr_file_and_output_purity(
     monkeypatch, capsys, tmp_path, json_environment
 ):
@@ -452,7 +546,7 @@ def test_json_retrieved_csr_uses_only_requested_file(
     monkeypatch, capsys, tmp_path, json_environment
 ):
     csr = "-----BEGIN CERTIFICATE REQUEST-----\nPUBLIC\n"
-    monkeypatch.setattr(checker, "retrieve_csr", lambda *args: csr)
+    monkeypatch.setattr(checker, "retrieve_csr", lambda *args, **kwargs: csr)
     path = tmp_path / "retrieved.pem"
     code, result, output = invoke(
         monkeypatch,
@@ -470,6 +564,99 @@ def test_json_retrieved_csr_uses_only_requested_file(
     assert result["results"][0]["milestones"]["csr"] == "confirmed"
     assert path.read_text() == csr
     assert "PUBLIC" not in output
+
+
+@pytest.mark.parametrize(
+    ("phase", "expected_csr", "recovery", "expected_code"),
+    [
+        ("no_pending", "failed", False, 2),
+        ("malformed", "failed", True, 2),
+        ("read_failure", "failed", True, 2),
+        ("success", "confirmed", False, 0),
+        ("write_failure", "confirmed", True, 2),
+    ],
+)
+def test_json_retrieve_csr_preserves_pending_evidence(
+    monkeypatch,
+    capsys,
+    tmp_path,
+    json_environment,
+    phase,
+    expected_csr,
+    recovery,
+    expected_code,
+):
+    csr = "-----BEGIN CERTIFICATE REQUEST-----\nU1lOVEhFVElD\n-----END CERTIFICATE REQUEST-----\n"
+    commands = []
+
+    @contextmanager
+    def connection(*args):
+        yield object()
+
+    def send_command(connection, command, limit, **kwargs):
+        commands.append(command)
+        if command == "show crypto pki local-certificate summary":
+            expiration = "2028/09/27" if phase == "no_pending" else "CSR"
+            return f"webcert2027 Web {expiration} webprofile2026\n"
+        if phase == "read_failure":
+            raise OSError("synthetic SSH read failure")
+        if phase == "malformed":
+            return "malformed CSR detail"
+        return csr
+
+    monkeypatch.setattr(checker, "validate_csr_settings", lambda settings: settings)
+    monkeypatch.setattr(checker, "validate_csr_pem", lambda *args: object())
+    monkeypatch.setattr(checker, "ssh_connection", connection)
+    monkeypatch.setattr(checker, "_send_command", send_command)
+    monkeypatch.setattr(
+        checker, "OPNsenseClient", lambda *args: pytest.fail("signer contacted")
+    )
+    monkeypatch.setattr(
+        checker, "install_pending_certificate", lambda *args: pytest.fail("install")
+    )
+    output_path = tmp_path / "retrieved.pem"
+    if phase == "write_failure":
+        original_write = checker.write_or_print_csr
+
+        def output_race(csr_pem, path):
+            output_path.write_text("existing")
+            return original_write(csr_pem, path)
+
+        monkeypatch.setattr(checker, "write_or_print_csr", output_race)
+
+    code, result, _ = invoke(
+        monkeypatch,
+        capsys,
+        "--retrieve-csr",
+        "--switch",
+        "SWITCH-A",
+        "--certificate-name",
+        "webcert2027",
+        "--csr-output",
+        str(output_path),
+    )
+    item = result["results"][0]
+    assert code == expected_code
+    assert item["outcome"] == (
+        "success_no_change" if phase == "success" else "failure_pre_attempt"
+    )
+    assert item["stage"] == ("completed" if phase == "success" else "csr_retrieval")
+    assert item["reason_code"] == (None if phase == "success" else "csr_failed")
+    assert item["change"] == "none"
+    assert item["milestones"]["csr"] == expected_csr
+    assert item["milestones"]["issuance"] == "not_attempted"
+    assert item["manual_recovery_required"] is recovery
+    assert commands == ["show crypto pki local-certificate summary"] + (
+        []
+        if phase == "no_pending"
+        else ["show crypto pki local-certificate webcert2027"]
+    )
+    if phase == "success":
+        assert output_path.read_text() == csr
+    elif phase == "write_failure":
+        assert output_path.read_text() == "existing"
+    else:
+        assert not output_path.exists()
 
 
 @pytest.mark.parametrize(

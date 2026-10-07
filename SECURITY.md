@@ -51,7 +51,8 @@ JSON diagnostics use fixed messages and omit credentials, raw exception text,
 protocol responses, CSRs, PEM certificates, and private material. They may
 include configured switch display names and fingerprint/expiry metadata from
 validated public certificates. CSR-producing commands require an explicit
-output file in JSON mode. Handled failures emit one result on stdout; CLI
+output file in JSON mode. Missing switch credentials fail without prompts or
+network contact. Handled failures emit one result on stdout; CLI
 parsing errors and abrupt process death may not. See the
 [run-result contract](docs/run-result.md).
 
