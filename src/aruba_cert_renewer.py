@@ -18,7 +18,7 @@ import tempfile
 import time
 import tomllib
 import warnings
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from datetime import UTC, date, datetime, timedelta
@@ -49,9 +49,23 @@ from bounded_netmiko import (
     FRAMING_BYTES,
     BoundedArubaConnection,
 )
-from lifecycle_lock import LifecycleLockError, LifecycleLockReleaseError, lifecycle_lock
+from lifecycle_lock import (
+    LifecycleLockBusy,
+    LifecycleLockError,
+    LifecycleLockReleaseError,
+    lifecycle_lock,
+)
 from opnsense_client import MAX_DESCRIPTION_CHARS, OPNsenseClient, validate_base_url
 from output_policy import SanitizingFormatter, sanitize_terminal_text
+from run_result import (
+    Change,
+    Milestone,
+    Outcome,
+    Reason,
+    RunResult,
+    Stage,
+    SwitchResult,
+)
 from secure_file import open_secure_file
 from tls_policy import create_client_tls_context
 
@@ -181,6 +195,13 @@ def parse_args():
     )
 
     parser.add_argument(
+        "--output",
+        choices=("human", "json"),
+        default="human",
+        help="Output format (default: human)",
+    )
+
+    parser.add_argument(
         "--generate-csr",
         action="store_true",
         help="Generate and retrieve a CSR for one explicitly selected switch",
@@ -267,6 +288,12 @@ def validate_cli_args(args):
         install_certificate,
     ]
     operations = [*staged_operations, renew, renew_due]
+    if (
+        getattr(args, "output", "human") == "json"
+        and (args.generate_csr or args.retrieve_csr)
+        and not args.csr_output
+    ):
+        raise ValueError("--output json requires --csr-output for CSR output")
     if sum(operations) > 1:
         raise ValueError(
             "--generate-csr, --retrieve-csr, --sign-csr, "
@@ -1562,23 +1589,35 @@ def sign_pending_csr(
     opnsense_settings,
     *,
     minimum_remaining_days=None,
+    progress=None,
 ):
     identities = validate_switch_signing_identity(switch)
     description = build_opnsense_certificate_description(
         certificate_name, identities["common_name"]
     )
+    if progress:
+        progress("csr_retrieval_started")
+    retrieval_kwargs = {"progress": progress} if progress else {}
     csr_pem = retrieve_csr(
         switch,
         username,
         password,
         certificate_name,
         csr_settings,
+        **retrieval_kwargs,
     )
     csr = validate_csr_pem(csr_pem, switch, csr_settings)
+    if progress:
+        progress("csr_retrieved")
     canonical_csr_pem = csr.public_bytes(serialization.Encoding.PEM).decode("ascii")
 
+    if progress:
+        progress("signing_preparation")
     client = OPNsenseClient(opnsense_settings["base_url"])
     caref = client.resolve_ca(opnsense_settings["ca"])
+    request_kwargs = (
+        {"on_dispatch": lambda: progress("issuance_dispatched")} if progress else {}
+    )
     certificate_uuid = client.sign_csr(
         canonical_csr_pem,
         caref=caref,
@@ -1587,8 +1626,13 @@ def sign_pending_csr(
         dns_names=identities["dns_names"],
         ip_addresses=identities["ip_addresses"],
         description=description,
+        **request_kwargs,
     )
+    if progress:
+        progress("issuance_confirmed")
     certificate_pem = client.get_certificate(certificate_uuid)
+    if progress:
+        progress("certificate_retrieved")
     validate_issued_certificate(
         certificate_pem,
         csr,
@@ -1598,6 +1642,8 @@ def sign_pending_csr(
         require_fresh_issuance=True,
         minimum_remaining_days=minimum_remaining_days,
     )
+    if progress:
+        progress("issued_validated")
     return certificate_pem
 
 
@@ -1740,6 +1786,10 @@ class RenewalPreflightError(ValueError):
     """A read-only renewal preflight failure."""
 
 
+class PendingCSRPreflightError(RenewalPreflightError):
+    """A pending CSR blocks automatic renewal without a new mutation."""
+
+
 class CSRGenerationPreAttemptError(ValueError):
     """A renewal failure before CSR creation was attempted."""
 
@@ -1772,7 +1822,7 @@ def renewal_preflight(switch, username, password, *, now=None):
         ]
         if pending:
             names = ", ".join(certificate["name"] for certificate in pending)
-            raise RenewalPreflightError(
+            raise PendingCSRPreflightError(
                 f"A pending Web CSR already exists ({names}). Use the explicit "
                 "staged commands to inspect or recover it; --renew will not "
                 "resume, replace, or clear it"
@@ -1809,6 +1859,7 @@ def renew_certificate(
     *,
     now=None,
     minimum_remaining_days=None,
+    progress=None,
 ):
     """Compose the proven staged functions into one explicit renewal."""
     require_verification_ca_snapshot(verification_ca_snapshot)
@@ -1818,6 +1869,8 @@ def renew_certificate(
         password,
         now=now,
     )
+    if progress:
+        progress("preflight_confirmed")
     certificate_name = preflight["new_certificate_name"]
 
     print_terminal(
@@ -1839,6 +1892,8 @@ def renew_certificate(
         raise CSRGenerationPreAttemptError(str(error)) from error
 
     print_terminal("CSR generated and validated.")
+    if progress:
+        progress("csr_confirmed")
     print_terminal("Signing CSR with OPNsense...")
 
     try:
@@ -1850,6 +1905,7 @@ def renew_certificate(
             csr_settings,
             opnsense_settings,
             minimum_remaining_days=minimum_remaining_days,
+            **({"progress": progress} if progress else {}),
         )
     except (ValueError, OSError) as error:
         raise CSRSigningError(
@@ -1882,6 +1938,8 @@ def renew_certificate(
         ) from error
 
     print_terminal("Certificate installed and Aruba state verified.")
+    if progress:
+        progress("installation_confirmed", certificate)
     print_terminal("Verifying live HTTPS...")
 
     try:
@@ -1894,6 +1952,8 @@ def renew_certificate(
         raise LiveHTTPSVerificationError(str(error)) from error
 
     print_terminal("Live HTTPS certificate chain and hostname verified.")
+    if progress:
+        progress("live_tls_confirmed")
     print_terminal("Live HTTPS certificate matches the installed certificate.")
     print_terminal("Renewal completed successfully.")
     print_terminal(f"Active Web certificate: {certificate_name}")
@@ -2032,6 +2092,8 @@ def retrieve_csr(
     password,
     certificate_name,
     csr_settings,
+    *,
+    progress=None,
 ):
     certificate_name = validate_cli_identifier(
         certificate_name,
@@ -2062,6 +2124,9 @@ def retrieve_csr(
                     f"Certificate {certificate_name} is installed; expected a "
                     "pending CSR"
                 )
+
+            if progress:
+                progress("pending_csr_observed")
 
             return retrieve_and_validate_csr(
                 connection,
@@ -2290,6 +2355,7 @@ def install_pending_certificate(
     *,
     digest,
     minimum_remaining_days=None,
+    progress=None,
 ):
     require_verification_ca_snapshot(verification_ca_snapshot)
     certificate_name = validate_cli_identifier(
@@ -2312,6 +2378,9 @@ def install_pending_certificate(
                 summary_output,
                 certificate_name,
             )
+            if progress:
+                progress("pending_csr_observed")
+                progress("csr_retrieval_started")
             csr_pem = retrieve_and_validate_csr(
                 connection,
                 switch,
@@ -2319,6 +2388,9 @@ def install_pending_certificate(
                 csr_settings,
             )
             csr = validate_csr_pem(csr_pem, switch, csr_settings)
+            if progress:
+                progress("csr_retrieved")
+                progress("issued_validation_started")
             certificate = validate_issued_certificate(
                 certificate_pem,
                 csr,
@@ -2335,6 +2407,9 @@ def install_pending_certificate(
             _require_current_certificate_validity(
                 certificate, datetime.now(UTC), minimum_remaining_days
             )
+            if progress:
+                progress("issued_validated")
+                progress("installation_prepared")
 
             install_signed_certificate(
                 connection,
@@ -3065,8 +3140,468 @@ def run_explicit_operation(
             return EXIT_ERROR
 
 
+def _json_operation(args):
+    for selected, name in (
+        (args.renew_due, "renew_due"),
+        (args.renew, "renew_now"),
+        (args.generate_csr, "generate_csr"),
+        (args.retrieve_csr, "retrieve_csr"),
+        (args.sign_csr, "sign_csr"),
+        (args.install_certificate, "install"),
+    ):
+        if selected:
+            return name
+    return "inspect"
+
+
+def _json_certificate(certificate):
+    return {
+        "fingerprint_sha256": certificate.fingerprint(hashes.SHA256()).hex(),
+        "expiry_date": certificate.not_valid_after_utc.date().isoformat(),
+    }
+
+
+def _json_progress(item, event, certificate=None):
+    if event == "preflight_confirmed":
+        item.stage = Stage.PREFLIGHT
+    elif event == "pending_csr_observed":
+        item.pending_csr_observed = True
+    elif event == "csr_retrieval_started":
+        item.stage = Stage.CSR_RETRIEVAL
+        if item.milestones["csr"] == Milestone.NOT_ATTEMPTED:
+            item.milestones["csr"] = Milestone.FAILED
+    elif event == "csr_retrieved":
+        item.milestones["csr"] = Milestone.CONFIRMED
+    elif event == "signing_preparation":
+        item.stage = Stage.SIGNING
+    elif event == "csr_confirmed":
+        item.stage = Stage.CSR_GENERATION
+        item.milestones["csr"] = Milestone.CONFIRMED
+        item.change = Change.CONFIRMED
+    elif event == "issuance_dispatched":
+        item.stage = Stage.SIGNING
+        item.milestones["issuance"] = Milestone.UNCERTAIN
+        item.change = Change.POSSIBLE
+    elif event == "issuance_confirmed":
+        item.milestones["issuance"] = Milestone.CONFIRMED
+        item.change = Change.CONFIRMED
+    elif event in {
+        "certificate_retrieved",
+        "issued_validation_started",
+        "issued_validated",
+    }:
+        item.stage = Stage.ISSUED_VALIDATION
+    elif event == "installation_prepared":
+        item.stage = Stage.INSTALLATION
+    elif event == "installation_confirmed":
+        item.stage = Stage.ACTIVATION
+        item.milestones["installation"] = Milestone.CONFIRMED
+        item.milestones["activation"] = Milestone.CONFIRMED
+        item.change = Change.CONFIRMED
+        item.certificate = _json_certificate(certificate)
+    elif event == "live_tls_confirmed":
+        item.stage = Stage.LIVE_VERIFICATION
+        item.milestones["live_tls"] = Milestone.CONFIRMED
+
+
+def _json_failure_outcome(item):
+    if item.change == Change.POSSIBLE or any(
+        item.milestones[name] == Milestone.UNCERTAIN
+        for name in ("csr", "issuance", "installation")
+    ):
+        return Outcome.FAILURE_AMBIGUOUS
+    if item.change == Change.CONFIRMED or any(
+        item.milestones[name] == Milestone.CONFIRMED
+        for name in ("issuance", "installation", "activation")
+    ):
+        return Outcome.FAILURE_PARTIAL
+    return Outcome.FAILURE_PRE_ATTEMPT
+
+
+def _json_failure(item, error):
+    item.manual_recovery_required = False
+    if isinstance(error, PendingCSRPreflightError):
+        item.outcome, item.stage = Outcome.FAILURE_PRE_ATTEMPT, Stage.PREFLIGHT
+        item.reason_code = Reason.PENDING_STATE
+        item.message = "A pending CSR requires manual investigation."
+        item.manual_recovery_required = True
+    elif isinstance(error, RenewalPreflightError):
+        item.outcome, item.stage = Outcome.FAILURE_PRE_ATTEMPT, Stage.PREFLIGHT
+        item.reason_code = Reason.INSPECTION_FAILED
+        item.message = "Renewal preflight failed."
+    elif isinstance(error, CSRGenerationPreAttemptError):
+        item.outcome, item.stage = Outcome.FAILURE_PRE_ATTEMPT, Stage.CSR_GENERATION
+        item.reason_code = Reason.CSR_FAILED
+        item.message = "CSR creation was not attempted."
+    elif isinstance(error, CSRGenerationError):
+        item.outcome, item.stage = Outcome.FAILURE_AMBIGUOUS, Stage.CSR_GENERATION
+        item.reason_code = Reason.CSR_FAILED
+        item.message = "CSR creation was attempted; inspect switch state."
+        item.milestones["csr"] = Milestone.UNCERTAIN
+        item.change = Change.POSSIBLE
+        item.manual_recovery_required = True
+    elif isinstance(error, CSRSigningError):
+        item.outcome = _json_failure_outcome(item)
+        item.reason_code = (
+            Reason.VALIDATION_FAILED
+            if item.stage == Stage.ISSUED_VALIDATION
+            else Reason.CSR_FAILED
+            if item.stage == Stage.CSR_RETRIEVAL
+            else Reason.SIGNING_FAILED
+        )
+        item.message = "Signing or issued-certificate validation failed; inspect state."
+        item.manual_recovery_required = (
+            item.outcome != Outcome.FAILURE_PRE_ATTEMPT
+            or item.milestones["csr"] == Milestone.CONFIRMED
+            or item.pending_csr_observed
+        )
+    elif isinstance(error, CertificatePreInstallationError):
+        item.outcome, item.stage = _json_failure_outcome(item), Stage.INSTALLATION
+        item.reason_code = Reason.VALIDATION_FAILED
+        item.message = "Installation did not begin; inspect pending state."
+        item.manual_recovery_required = True
+    elif isinstance(error, CertificateInstallationAttemptError):
+        item.outcome, item.stage = Outcome.FAILURE_AMBIGUOUS, Stage.INSTALLATION
+        item.reason_code = Reason.INSTALLATION_FAILED
+        item.message = "Installation was attempted; inspect switch state."
+        item.milestones["installation"] = Milestone.UNCERTAIN
+        item.change = Change.POSSIBLE
+        item.manual_recovery_required = True
+    elif isinstance(error, LiveHTTPSVerificationError):
+        item.outcome, item.stage = _json_failure_outcome(item), Stage.LIVE_VERIFICATION
+        item.reason_code = Reason.VERIFICATION_FAILED
+        item.message = "Installed state was confirmed; live HTTPS failed."
+        item.milestones["live_tls"] = Milestone.FAILED
+        item.manual_recovery_required = True
+    else:
+        item.outcome = _json_failure_outcome(item)
+        item.reason_code = Reason.UNEXPECTED_FAILURE
+        item.message = "Operation failed; inspect state before retrying."
+        item.manual_recovery_required = (
+            item.outcome != Outcome.FAILURE_PRE_ATTEMPT
+            or item.milestones["csr"] == Milestone.CONFIRMED
+            or item.pending_csr_observed
+        )
+
+
+def _json_renew(item, switch, username, password, settings, *, warning_days=None):
+    item.stage = Stage.PREFLIGHT
+    try:
+        renew_certificate(
+            switch,
+            username,
+            password,
+            settings["csr"],
+            settings["opnsense"],
+            settings["ca"],
+            minimum_remaining_days=warning_days,
+            progress=lambda event, certificate=None: _json_progress(
+                item, event, certificate
+            ),
+        )
+    except RENEWAL_FAILURE_TYPES as error:
+        _json_failure(item, error)
+    except Exception as error:
+        _json_failure(item, error)
+    else:
+        item.outcome = Outcome.SUCCESS_CHANGED
+        item.stage = Stage.COMPLETED
+        item.message = "Certificate renewal verified by live HTTPS."
+
+
+def _json_explicit(item, args, switch, username, password, settings):
+    operation = _json_operation(args)
+    if operation == "renew_now":
+        _json_renew(item, switch, username, password, settings)
+        return
+    try:
+        if operation == "generate_csr":
+            item.stage = Stage.CSR_GENERATION
+            csr = generate_csr(
+                switch, username, password, args.certificate_name, settings["csr"]
+            )
+            _json_progress(item, "csr_confirmed")
+            write_or_print_csr(csr, args.csr_output)
+            item.outcome = Outcome.SUCCESS_PREPARED
+            item.message = "CSR generated and written to the requested file."
+        elif operation == "retrieve_csr":
+            item.stage = Stage.CSR_RETRIEVAL
+            csr = retrieve_csr(
+                switch, username, password, args.certificate_name, settings["csr"]
+            )
+            item.milestones["csr"] = Milestone.CONFIRMED
+            write_or_print_csr(csr, args.csr_output)
+            item.outcome = Outcome.SUCCESS_NO_CHANGE
+            item.message = "Pending CSR retrieved and written to the requested file."
+        elif operation == "sign_csr":
+            item.stage = Stage.SIGNING
+            certificate_pem = sign_pending_csr(
+                switch,
+                username,
+                password,
+                args.certificate_name,
+                settings["csr"],
+                settings["opnsense"],
+                progress=lambda event, certificate=None: _json_progress(item, event),
+            )
+            item.milestones["csr"] = Milestone.CONFIRMED
+            certificate = x509.load_pem_x509_certificate(
+                certificate_pem.encode("ascii")
+            )
+            item.certificate = _json_certificate(certificate)
+            try:
+                write_certificate(certificate_pem, args.certificate_output)
+            except OSError:
+                item.outcome = Outcome.FAILURE_PARTIAL
+                item.stage = Stage.FINALIZATION
+                item.reason_code = Reason.RECOVERY_REQUIRED
+                item.message = (
+                    "Issued certificate could not be written to the requested file."
+                )
+                item.manual_recovery_required = True
+                return
+            item.outcome = Outcome.SUCCESS_PREPARED
+            item.message = (
+                "Issued certificate validated and written to the requested file."
+            )
+        else:
+            item.stage = Stage.INSTALLATION
+            certificate = install_pending_certificate(
+                switch,
+                username,
+                password,
+                args.certificate_name,
+                settings["certificate_pem"],
+                settings["csr"],
+                settings["opnsense"]["lifetime_days"],
+                settings["ca"],
+                digest=settings["opnsense"]["digest"],
+                progress=lambda event, certificate=None: _json_progress(
+                    item, event, certificate
+                ),
+            )
+            _json_progress(item, "installation_confirmed", certificate)
+            item.stage = Stage.LIVE_VERIFICATION
+            try:
+                verify_live_https_certificate(switch, settings["ca"], certificate)
+            except (ValueError, OSError, ssl.SSLError) as error:
+                raise LiveHTTPSVerificationError(
+                    "Live HTTPS verification failed"
+                ) from error
+            _json_progress(item, "live_tls_confirmed")
+            item.outcome = Outcome.SUCCESS_CHANGED
+            item.message = "Certificate installation verified by live HTTPS."
+        item.stage = Stage.COMPLETED
+    except CSRGenerationError as error:
+        _json_failure(item, error)
+    except CertificateInstallationAttemptError as error:
+        _json_failure(item, error)
+    except LiveHTTPSVerificationError as error:
+        _json_failure(item, error)
+    except (ValueError, OSError):
+        if (
+            operation == "generate_csr"
+            and item.milestones["csr"] == Milestone.CONFIRMED
+        ):
+            item.outcome = Outcome.FAILURE_PARTIAL
+            item.reason_code = Reason.CSR_FAILED
+            item.message = "CSR exists but could not be written to the requested file."
+            item.manual_recovery_required = True
+        elif operation == "sign_csr":
+            _json_failure(item, CSRSigningError(""))
+        else:
+            item.outcome = _json_failure_outcome(item)
+            item.reason_code = (
+                Reason.VALIDATION_FAILED
+                if operation == "install"
+                else Reason.CSR_FAILED
+            )
+            if item.outcome == Outcome.FAILURE_PRE_ATTEMPT:
+                item.message = "Operation failed before a new certificate state change."
+                item.manual_recovery_required = (
+                    item.milestones["csr"] == Milestone.CONFIRMED
+                    or item.pending_csr_observed
+                )
+            else:
+                item.message = "Operation failed after a state change; inspect switch."
+                item.manual_recovery_required = True
+
+
+def _json_process_target(
+    item, args, run, switch, username, password, warning_days, settings
+):
+    if run.operation in {"inspect", "renew_due"}:
+        item.stage = Stage.INSPECTION
+        status = check_switch(switch, username, password, warning_days)
+        if status == "error":
+            item.reason_code = Reason.INSPECTION_FAILED
+            item.message = "Switch certificate inspection failed."
+        elif status in {"renewal_due", "expired"}:
+            item.renewal_due = True
+            if run.operation == "inspect":
+                item.outcome = Outcome.ATTENTION_DUE
+                item.stage = Stage.DECISION
+                item.message = "Certificate renewal attention is due."
+            else:
+                _json_renew(
+                    item,
+                    switch,
+                    username,
+                    password,
+                    settings,
+                    warning_days=warning_days,
+                )
+        elif status == "ok":
+            item.renewal_due = False
+            item.outcome = Outcome.SUCCESS_NO_CHANGE
+            item.stage = Stage.COMPLETED
+            item.message = "Certificate is healthy; no renewal required."
+        else:
+            item.reason_code = Reason.INSPECTION_FAILED
+            item.message = "Switch certificate inspection returned an unknown status."
+    else:
+        _json_explicit(item, args, switch, username, password, settings)
+
+
+def _run_json(args, run):
+    run.stage = Stage.CONFIGURATION
+    try:
+        validate_cli_args(args)
+        config = load_config(args.config)
+        warning_days, switches = validate_config(config, args.config)
+        switches = select_switches(switches, args.switch_name)
+        settings = {"csr": None, "opnsense": None, "ca": None, "certificate_pem": None}
+        if run.operation != "inspect":
+            settings["csr"] = get_csr_settings(config)
+        if run.operation in {"renew_due", "renew_now", "sign_csr", "install"}:
+            settings["opnsense"] = get_opnsense_settings(config)
+            if run.operation == "renew_due":
+                validate_automatic_renewal_window(warning_days, settings["opnsense"])
+            for switch in switches if run.operation == "renew_due" else switches[:1]:
+                validate_switch_signing_identity(switch)
+        if run.operation in {"renew_due", "renew_now", "install"}:
+            settings["ca"] = get_verification_ca_file(config, args.config)
+        if run.operation == "install":
+            settings["certificate_pem"] = read_certificate_input(args.certificate_input)
+    except ValueError:
+        run.outcome = Outcome.FAILURE_PRE_ATTEMPT
+        run.reason_code = Reason.CONFIG_INVALID
+        run.message = "Configuration or command validation failed."
+        return EXIT_ERROR
+    except Exception:
+        run.outcome = Outcome.FAILURE_PRE_ATTEMPT
+        run.reason_code = Reason.UNEXPECTED_FAILURE
+        run.message = "Startup failed."
+        return EXIT_ERROR
+
+    for switch in switches:
+        item = SwitchResult(target=switch["name"])
+        run.results.append(item)
+        try:
+            username, password = get_switch_credentials(switch, args.config)
+        except Exception:
+            item.stage = Stage.CONFIGURATION
+            item.reason_code = Reason.CONFIG_INVALID
+            item.message = "Switch credentials could not be loaded."
+            continue
+
+        try:
+            if run.operation in {
+                "renew_due",
+                "renew_now",
+                "generate_csr",
+                "sign_csr",
+                "install",
+            }:
+                with lifecycle_lock(switch["host"]):
+                    _json_process_target(
+                        item,
+                        args,
+                        run,
+                        switch,
+                        username,
+                        password,
+                        warning_days,
+                        settings,
+                    )
+            else:
+                _json_process_target(
+                    item, args, run, switch, username, password, warning_days, settings
+                )
+        except LifecycleLockReleaseError:
+            if (
+                item.outcome
+                in {
+                    Outcome.FAILURE_PRE_ATTEMPT,
+                    Outcome.FAILURE_PARTIAL,
+                    Outcome.FAILURE_AMBIGUOUS,
+                }
+                and item.reason_code is not None
+            ):
+                item.message = (
+                    "Operation failed and lock release failed; inspect state."
+                )
+            else:
+                item.stage = Stage.LOCK
+                item.reason_code = Reason.LOCK_FAILED
+                item.message = (
+                    "Lifecycle lock release failed; inspect state before retrying."
+                )
+                item.outcome = _json_failure_outcome(item)
+            item.manual_recovery_required = True
+        except LifecycleLockError as error:
+            item.outcome = Outcome.FAILURE_PRE_ATTEMPT
+            item.stage = Stage.LOCK
+            item.reason_code = (
+                Reason.LOCK_BUSY
+                if isinstance(error, LifecycleLockBusy)
+                else Reason.LOCK_FAILED
+            )
+            item.message = "Lifecycle lock is busy or unavailable."
+        except Exception as error:
+            _json_failure(item, error)
+        finally:
+            username = password = None
+
+    if any(
+        item.outcome
+        in {
+            Outcome.FAILURE_PRE_ATTEMPT,
+            Outcome.FAILURE_PARTIAL,
+            Outcome.FAILURE_AMBIGUOUS,
+        }
+        for item in run.results
+    ):
+        return EXIT_ERROR
+    if run.operation == "inspect" and any(
+        item.outcome == Outcome.ATTENTION_DUE for item in run.results
+    ):
+        return EXIT_WARNING
+    return EXIT_OK
+
+
+def json_main(args):
+    run = RunResult(operation=_json_operation(args))
+    previous_disable = logging.root.manager.disable
+    try:
+        with (
+            open(os.devnull, "w", encoding="utf-8") as discard,
+            redirect_stdout(discard),
+            redirect_stderr(discard),
+        ):
+            logging.disable(logging.CRITICAL)
+            exit_code = _run_json(args, run)
+    finally:
+        logging.disable(previous_disable)
+    run.finish()
+    print(run.to_json())
+    return exit_code
+
+
 def main():
     args = parse_args()
+    if args.output == "json":
+        return json_main(args)
     configure_logging(args.debug)
     csr_settings = opnsense_settings = verification_ca_snapshot = certificate_pem = None
 

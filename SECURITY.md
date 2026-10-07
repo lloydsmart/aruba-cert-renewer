@@ -45,6 +45,16 @@ device-level safety checks.
 
 ## Local Renewal Lifecycle Lock
 
+Opt-in `--output json` reports the same lifecycle safety state through schema
+version 1. It does not change locking, renewal, or recovery actions. Routine
+JSON diagnostics use fixed messages and omit credentials, raw exception text,
+protocol responses, CSRs, PEM certificates, and private material. They may
+include configured switch display names and fingerprint/expiry metadata from
+validated public certificates. CSR-producing commands require an explicit
+output file in JSON mode. Handled failures emit one result on stdout; CLI
+parsing errors and abrupt process death may not. See the
+[run-result contract](docs/run-result.md).
+
 `--renew-due` acquires a host-visible, per-switch Linux `flock` before the due
 check and holds it through issuance, installation, and live HTTPS verification.
 Forced `--renew` holds the same lock for its complete renewal. Staged CSR
