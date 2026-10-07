@@ -693,7 +693,9 @@ Aruba SSH credentials are resolved independently for every switch. A configured
 `switches.username` takes precedence over `ARUBA_SSH_USERNAME`, followed by an
 interactive prompt. A configured `switches.password_file` takes precedence over
 `ARUBA_SSH_PASSWORD`, followed by a non-echoing interactive prompt. The
-environment variables therefore remain convenient global fallbacks:
+prompts apply only to the default human mode; JSON mode reports a per-switch
+configuration failure when either credential is unavailable. The environment
+variables therefore remain convenient global fallbacks:
 
 ```text
 ARUBA_SSH_USERNAME
@@ -772,6 +774,16 @@ python src/aruba_cert_renewer.py
 
 Use `--switch NAME` for one switch, `--config FILE` for another configuration
 file, and `--debug` for detailed Netmiko connection logging.
+
+Use `--output json` for one structured schema-version-1 result on stdout.
+The default remains human-readable. The result records per-switch outcomes,
+milestones, recovery needs, and validated public certificate metadata when
+available; exit codes remain `0`, `1`, and `2` as described below. JSON mode
+requires `--csr-output FILE` with `--generate-csr` or `--retrieve-csr` so the
+CSR does not share stdout with the result. Debug logging is suppressed in JSON
+mode. JSON mode never prompts for switch credentials. See the
+[run-result contract](docs/run-result.md) for fields, examples,
+aggregation, redaction, and failure boundaries.
 
 Monitoring and `--renew-due` output records the local, timezone-aware start and
 completion times of the actual check. Retained one-shot container logs therefore
