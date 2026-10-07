@@ -127,12 +127,14 @@ class RejectRedirectHandler(HTTPRedirectHandler):
         return None
 
 
-def _open_url(request, *, timeout, ssl_context):
+def _open_url(request, *, timeout, ssl_context, on_dispatch=None):
     opener = build_opener(
         ProxyHandler({}),
         RejectRedirectHandler(),
         HTTPSHandler(context=ssl_context),
     )
+    if on_dispatch is not None:
+        on_dispatch()
     return opener.open(request, timeout=timeout)
 
 
@@ -301,7 +303,7 @@ class OPNsenseClient:
         credentials = f"{api_key}:{api_secret}".encode()
         return "Basic " + base64.b64encode(credentials).decode("ascii")
 
-    def _request_json(self, method, path, payload=None):
+    def _request_json(self, method, path, payload=None, *, on_dispatch=None):
         headers = {
             "Accept": "application/json",
             "Authorization": self._authorization,
@@ -324,10 +326,14 @@ class OPNsenseClient:
         )
 
         try:
+            request_kwargs = (
+                {"on_dispatch": on_dispatch} if on_dispatch is not None else {}
+            )
             with _open_url(
                 request,
                 timeout=self.timeout,
                 ssl_context=self._ssl_context,
+                **request_kwargs,
             ) as response:
                 response_data = response.read(MAX_RESPONSE_BYTES + 1)
 
@@ -402,6 +408,7 @@ class OPNsenseClient:
         dns_names,
         ip_addresses,
         description,
+        on_dispatch=None,
     ):
         if not isinstance(csr_pem, str):
             raise OPNsenseAPIError("CSR PEM must be text")
@@ -431,6 +438,7 @@ class OPNsenseClient:
             raise OPNsenseAPIError("OPNsense lifetime must be between 1 and 3650 days")
         description = _validate_safe_text(description, "Certificate description")
         dns_names, ip_addresses = _validate_sans(dns_names, ip_addresses)
+        request_kwargs = {"on_dispatch": on_dispatch} if on_dispatch is not None else {}
         response = self._request_json(
             "POST",
             CERT_ADD_PATH,
@@ -448,6 +456,7 @@ class OPNsenseClient:
                     "descr": description,
                 }
             },
+            **request_kwargs,
         )
 
         if response.get("result") != "saved":
