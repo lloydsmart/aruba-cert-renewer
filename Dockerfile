@@ -11,6 +11,7 @@ RUN apt-get update \
         openssl=3.5.7-1~deb13u3 \
         openssl-provider-legacy=3.5.7-1~deb13u3 \
         perl-base=5.40.1-6+deb13u1 \
+        zlib1g=1:1.3.dfsg+really1.3.1-1+deb13u1 \
     && rm -rf /var/lib/apt/lists/*
 
 ARG UNRAID_ICON_REF=main
