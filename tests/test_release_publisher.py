@@ -1718,3 +1718,72 @@ def test_latest_is_a_final_exact_digest_copy_after_both_attestations() -> None:
     assert "--prefer-index=false" in latest_step
     assert "latest_digest" in latest_step
     assert "consumer" not in publish.lower()
+
+
+def test_stable_promotion_copies_only_the_signed_digest(tmp_path: Path) -> None:
+    image = "ghcr.io/lloydsmart/aruba-cert-renewer"
+    source = f"{image}:sha-{SOURCE}"
+    digest = registry_digest()
+    environment, state_path, _, _ = registry_environment(tmp_path, {source: digest})
+    environment["PROMOTION_DIGEST"] = digest
+    result = run_step("Promote immutable release aliases", environment, Path("/tmp"))
+    assert result.returncode == 0, result.stderr
+    assert json.loads(state_path.read_text())["aliases"][f"{image}:v1.2.3"] == digest
+    assert "push " not in (tmp_path / "docker-trace").read_text()
+
+
+@pytest.mark.parametrize("source_present", [True, False])
+def test_stable_promotion_rejects_missing_or_changed_source_before_mutation(
+    tmp_path: Path, source_present: bool
+) -> None:
+    image = "ghcr.io/lloydsmart/aruba-cert-renewer"
+    source = f"{image}:sha-{SOURCE}"
+    aliases = {source: registry_digest()} if source_present else {}
+    environment, state_path, _, _ = registry_environment(tmp_path, aliases)
+    environment["PROMOTION_DIGEST"] = "sha256:" + "f" * 64
+    result = run_step("Promote immutable release aliases", environment, Path("/tmp"))
+    assert result.returncode != 0
+    assert json.loads(state_path.read_text())["aliases"] == aliases
+    trace = (tmp_path / "docker-trace").read_text()
+    assert "push " not in trace and "imagetools create" not in trace
+
+
+@pytest.mark.parametrize("fail_at", [1, 2])
+def test_failed_rc_attestation_prevents_pulling_or_running_candidate(
+    tmp_path: Path, fail_at: int
+) -> None:
+    commands = tmp_path / "bin"
+    commands.mkdir()
+    trace = tmp_path / "trace"
+    gh = commands / "gh"
+    gh.write_text(
+        '#!/bin/bash\nset -eu\necho "$*" >>"$TRACE"\n'
+        'count=$(wc -l <"$TRACE")\n[[ "$count" -ne "$FAIL_AT" ]]\n'
+    )
+    docker = commands / "docker"
+    docker.write_text('#!/bin/bash\necho "DOCKER $*" >>"$TRACE"\n')
+    gh.chmod(0o755)
+    docker.chmod(0o755)
+    environment = {
+        **os.environ,
+        "PATH": str(commands) + os.pathsep + os.environ["PATH"],
+        "TRACE": str(trace),
+        "FAIL_AT": str(fail_at),
+        "PROMOTION_SOURCE": "v1.2.3-rc.1",
+        "PROMOTION_DIGEST": "sha256:" + "a" * 64,
+        "GITHUB_REPOSITORY": "lloydsmart/aruba-cert-renewer",
+        "GITHUB_SHA": SOURCE,
+        "CANDIDATE_IMAGE": BUILDER_CANDIDATE_IMAGE,
+    }
+    result = run_step(
+        "Verify and pull the exact promoted candidate", environment, tmp_path
+    )
+    assert result.returncode != 0
+    calls = trace.read_text()
+    assert "DOCKER" not in calls
+    assert f"--source-digest {SOURCE}" in calls
+    assert "--source-ref refs/tags/v1.2.3-rc.1" in calls
+    assert (
+        "--signer-workflow lloydsmart/aruba-cert-renewer/.github/workflows/publish-container.yml"
+        in calls
+    )

@@ -34,8 +34,46 @@ semantic versions or claim that the highest version wins.
 
 ## Qualification and authorization
 
+### Promote a qualified release candidate
+
+Stable releases reuse an already published and live-tested RC image. Create the
+stable signed tag at exactly the same source commit as that RC, and include
+these two lines in the signed annotation (using the actual RC and OCI digest):
+
+```text
+Promotion-Source: v0.4.0-rc.3
+Promotion-Digest: sha256:<64-lowercase-hex-digest>
+```
+
+The RC must be a published prerelease of the same version. The authorization
+job verifies both signed tags using the approved key and requires identical
+source commits. Stable tags without this signed instruction fail closed.
+Prerelease tags cannot carry promotion instructions.
+
+Before pulling or running the selected image, the verifier independently checks
+both its provenance and SPDX attestations against this repository, the release
+workflow, the exact source commit and the selected RC tag. It then smoke-tests
+and scans that exact image without rebuilding it. All source qualification checks
+run again. The publisher requires the existing source alias to equal the signed
+digest, copies that manifest to the stable version, uploads fresh attestations,
+and updates `latest` last. Missing or conflicting state fails without replacing
+an immutable alias. Live-test evidence remains an operator responsibility;
+signing the stable annotation records the operator's promotion decision.
+
+### Archive representation
+
+Docker exports may contain an OCI manifest with uncompressed layers, whose
+manifest digest differs from the compressed registry representation. Before
+SBOM generation, the builder validates the export's bounded inventory, config,
+layer descriptors, blob hashes and ordered uncompressed layer hashes. It then
+normalizes that export to a classic single-image Docker archive while preserving
+the exact config and layer content. The normalized archive is independently
+revalidated and is the only input to Syft and the publisher. The publisher's
+existing archive, config and registry rootfs checks remain mandatory. An export
+manifest digest is never substituted for the registry manifest digest.
+
 Every release invokes the existing reusable Actions lint, Markdown lint, Ruff,
-full Python 3.12/3.14 suite, lock freshness, dependency audit, full-history secret
+full Python 3.12/3.14/3.15 suite, lock freshness, dependency audit, full-history secret
 scan, Hadolint and Compose checks. Their checkouts explicitly use the immutable
 event commit. No documentation filter or earlier green commit can replace these
 checks. Every workflow must succeed and emit its internal `passed=true` receipt.
@@ -54,8 +92,9 @@ of keys from signatures are disabled. The public key and fingerprint policy
 must be updated through review for rotation or new public revocation information.
 Private signing material must never enter the repository or Actions.
 
-Only after qualification and authorization does the read-only builder build
-and smoke-test one image, scan it and generate its SBOM. The existing immutable
+Only after qualification and authorization does the read-only builder build a
+prerelease image (or verify and reuse the promoted image), smoke-test it, scan
+it and generate its SBOM. The existing immutable
 source icon reference is preserved. The independent container-lint workflow
 does not build a second candidate. The builder creates a bounded, canonical
 candidate manifest for an exact three-file handoff: the image archive, SPDX JSON

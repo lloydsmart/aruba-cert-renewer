@@ -152,7 +152,7 @@ Do not overwrite existing CSR or certificate output files.
 
 The application targets Python 3.12 or later.
 
-The full pytest suite runs in CI on Python 3.12 and Python 3.14. Python 3.14
+The full pytest suite runs in CI on Python 3.12, Python 3.14 and Python 3.15. Python 3.15
 represents the production application runtime family, while dependency lock
 generation remains intentionally fixed to Python 3.12.
 

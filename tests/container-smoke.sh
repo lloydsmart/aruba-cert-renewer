@@ -12,10 +12,17 @@ cleanup() {
 }
 trap cleanup EXIT
 
-docker build \
-    --build-arg "UNRAID_ICON_REF=$unraid_icon_ref" \
-    --tag "$image" \
-    "$repository_root"
+if [[ ${ARUBA_CERT_RENEWER_TEST_EXISTING:-false} == true ]]; then
+    docker image inspect "$image" >/dev/null
+elif [[ ${ARUBA_CERT_RENEWER_TEST_EXISTING:-false} == false ]]; then
+    docker build \
+        --build-arg "UNRAID_ICON_REF=$unraid_icon_ref" \
+        --tag "$image" \
+        "$repository_root"
+else
+    printf '%s\n' 'Invalid existing-image test mode.' >&2
+    exit 1
+fi
 
 docker run --rm \
     --network none \

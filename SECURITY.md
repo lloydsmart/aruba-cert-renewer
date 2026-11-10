@@ -27,6 +27,19 @@ Security reports will be reviewed and addressed as appropriate.
 
 ## Container Runtime
 
+Stable publication requires an approved signed tag that names an RC tag and
+exact registry digest. The RC must resolve to the same source commit and carry
+verified provenance and SPDX attestations from the repository release workflow.
+Source qualification, container smoke tests and vulnerability scans run again
+against the reused image. Promotion does not rebuild or replace immutable tags;
+`latest` changes only after fresh attestations succeed. Live qualification is
+an operator responsibility before signing the stable promotion instruction.
+
+Docker archive normalization authenticates source config and layer hashes,
+preserves exact image content, and independently validates the normalized
+classic archive. It does not treat an uncompressed export manifest as a registry
+manifest or relax the publisher's archive and registry identity checks.
+
 Production deployments should retain the container's non-root UID/GID
 `10001:10001`, read-only root filesystem, and tmpfs-only writable `/tmp`.
 Drop all Linux capabilities and enable `no-new-privileges`. Do not use
