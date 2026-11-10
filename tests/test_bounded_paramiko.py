@@ -1,4 +1,4 @@
-"""Paramiko 4.0.0 pre-authentication text boundary tests."""
+"""Paramiko 5.0.0 pre-authentication text boundary tests."""
 
 import hashlib
 import inspect
@@ -78,7 +78,7 @@ def packetizer(data=b"", **kwargs):
 
 def test_dependency_contract_and_chain():
     assert_paramiko_contract()
-    assert paramiko.__version__ == "4.0.0"
+    assert paramiko.__version__ == "5.0.0"
     assert netmiko.__version__ == "4.8.0"
     assert issubclass(BoundedPacketizer, Packetizer)
     assert issubclass(BoundedArubaConnection, netmiko.hp.hp_procurve.HPProcurveSSH)
@@ -93,14 +93,27 @@ def test_dependency_contract_and_chain():
     )
 
 
-def test_dependency_drift_fails_before_network(monkeypatch):
-    monkeypatch.setattr(bounded_paramiko, "version", lambda name: "4.9.0")
+@pytest.mark.parametrize(
+    ("package", "unsupported"),
+    [("paramiko", "4.0.0"), ("paramiko", "5.0.1"), ("netmiko", "4.9.0")],
+)
+def test_dependency_drift_fails_before_network(monkeypatch, package, unsupported):
+    real_version = bounded_paramiko.version
+    monkeypatch.setattr(
+        bounded_paramiko,
+        "version",
+        lambda name: unsupported if name == package else real_version(name),
+    )
     with pytest.raises(RuntimeError, match="review the bounded Paramiko transport"):
         assert_paramiko_contract()
 
 
-def test_packet_parser_source_drift_fails_before_network(monkeypatch):
-    monkeypatch.setattr(bounded_paramiko, "_READ_MESSAGE_SHA256", "0" * 64)
+@pytest.mark.parametrize(
+    "fingerprint",
+    ["_READ_MESSAGE_SHA256", "_READ_ALL_SHA256", "_SET_INBOUND_CIPHER_SHA256"],
+)
+def test_packet_parser_source_drift_fails_before_network(monkeypatch, fingerprint):
+    monkeypatch.setattr(bounded_paramiko, fingerprint, "0" * 64)
     with pytest.raises(RuntimeError, match="review the bounded Paramiko transport"):
         assert_paramiko_contract()
 
@@ -510,9 +523,7 @@ def test_paramiko_still_rejects_incompatible_protocol_version():
 def test_transport_installs_packetizer_and_preserves_disabled_algorithms():
     sock = FakeSocket()
     policy = {"ciphers": ["aes128-cbc"]}
-    transport = bounded_paramiko._transport_factory(
-        sock, gss_kex=False, gss_deleg_creds=True, disabled_algorithms=policy
-    )
+    transport = bounded_paramiko._transport_factory(sock, disabled_algorithms=policy)
     assert type(transport) is Transport
     assert type(transport.packetizer) is BoundedPacketizer
     assert transport.disabled_algorithms is policy
@@ -610,11 +621,24 @@ def test_binary_overflow_through_client_and_netmiko_before_shell(tmp_path, monke
 
 
 class SyntheticServer(paramiko.ServerInterface):
+    def __init__(self, observed, auth):
+        self.observed = observed
+        self.auth = auth
+
     def check_auth_password(self, username, password):
-        return paramiko.AUTH_SUCCESSFUL
+        self.observed.append("auth-password")
+        return (
+            paramiko.AUTH_SUCCESSFUL
+            if self.auth == "password"
+            else paramiko.AUTH_FAILED
+        )
+
+    def check_auth_none(self, username):
+        self.observed.append("auth-none")
+        return paramiko.AUTH_SUCCESSFUL if self.auth == "none" else paramiko.AUTH_FAILED
 
     def get_allowed_auths(self, username):
-        return "password"
+        return self.auth
 
     def check_channel_request(self, kind, channel_id):
         return (
@@ -630,7 +654,7 @@ class SyntheticServer(paramiko.ServerInterface):
         return True
 
 
-def start_server(key, prelude=b""):
+def start_server(key, prelude=b"", auth="password"):
     client_sock, server_sock = socket.socketpair()
     observed = []
     done = threading.Event()
@@ -642,7 +666,7 @@ def start_server(key, prelude=b""):
                 server_sock.sendall(prelude)
             transport = Transport(server_sock)
             transport.add_server_key(key)
-            transport.start_server(server=SyntheticServer())
+            transport.start_server(server=SyntheticServer(observed, auth))
             channel = transport.accept(3)
             if channel is not None:
                 observed.append("shell")
@@ -659,8 +683,9 @@ def start_server(key, prelude=b""):
     return client_sock, thread, observed, done
 
 
+@pytest.mark.parametrize("auth", ["password", "none"])
 @pytest.mark.parametrize("trust", ["expected", "wrong", "unknown"])
-def test_real_transport_host_key_and_shell_path(tmp_path, monkeypatch, trust):
+def test_real_transport_host_key_and_shell_path(tmp_path, monkeypatch, trust, auth):
     from netmiko.hp.hp_procurve import HPProcurveSSH
 
     key = paramiko.RSAKey.generate(2048)
@@ -673,27 +698,37 @@ def test_real_transport_host_key_and_shell_path(tmp_path, monkeypatch, trust):
         )
     else:
         known_hosts.write_text("")
-    client_sock, thread, observed, done = start_server(key, b"information\r\n")
+    client_sock, thread, observed, done = start_server(key, b"information\r\n", auth)
     monkeypatch.setattr(HPProcurveSSH, "session_preparation", lambda self: None)
+    from aruba_cert_renewer import SSH_DISABLED_ALGORITHMS
+
+    policy = {name: list(values) for name, values in SSH_DISABLED_ALGORITHMS.items()}
+    password = "synthetic" if auth == "password" else ""
     try:
         if trust == "expected":
             with BoundedArubaConnection(
                 device_type="aruba_osswitch",
                 host="switch.example",
                 username="synthetic",
-                password="synthetic",
+                password=password,
                 sock=client_sock,
                 alt_host_keys=True,
                 alt_key_file=str(known_hosts),
                 system_host_keys=False,
                 ssh_strict=True,
-                disabled_algorithms={"ciphers": ["aes128-cbc"]},
+                disabled_algorithms=policy,
             ) as conn:
                 transport = conn.remote_conn_pre.get_transport()
                 assert type(transport) is Transport
                 assert type(transport.packetizer) is BoundedPacketizer
                 assert transport.packetizer.pre_identification_lines == 1
-                assert transport.disabled_algorithms == {"ciphers": ["aes128-cbc"]}
+                assert transport.disabled_algorithms == policy
+                assert transport.host_key_type in ("rsa-sha2-256", "rsa-sha2-512")
+                assert (
+                    transport.local_compression
+                    == transport.remote_compression
+                    == "none"
+                )
                 assert transport.sock is client_sock
                 assert isinstance(conn.remote_conn_pre._policy, paramiko.RejectPolicy)
                 assert not conn.system_host_keys
@@ -704,12 +739,13 @@ def test_real_transport_host_key_and_shell_path(tmp_path, monkeypatch, trust):
                     device_type="aruba_osswitch",
                     host="switch.example",
                     username="synthetic",
-                    password="synthetic",
+                    password=password,
                     sock=client_sock,
                     alt_host_keys=True,
                     alt_key_file=str(known_hosts),
                     system_host_keys=False,
                     ssh_strict=True,
+                    disabled_algorithms=policy,
                 )
             if trust == "wrong":
                 assert isinstance(error.value.__context__, paramiko.BadHostKeyException)
@@ -721,6 +757,32 @@ def test_real_transport_host_key_and_shell_path(tmp_path, monkeypatch, trust):
         thread.join(timeout=3)
     assert not thread.is_alive()
     if trust == "expected":
-        assert observed == ["shell"]
+        assert observed == [f"auth-{auth}", "shell"]
     else:
-        assert "shell" not in observed
+        assert not any(item.startswith("auth-") or item == "shell" for item in observed)
+
+
+@pytest.mark.parametrize("keyword", ["gss_auth", "gss_kex", "gss_deleg_creds"])
+def test_removed_gss_arguments_fail_before_socket_use(keyword):
+    sock = FakeSocket()
+    with pytest.raises(TypeError, match="unexpected keyword"):
+        BoundedSSHClient().connect("switch.example", sock=sock, **{keyword: True})
+    assert not sock.requests
+    assert not sock.sends
+
+
+def test_rsa_sha1_signatures_are_rejected():
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import padding
+
+    key = paramiko.RSAKey.generate(2048)
+    payload = b"synthetic SSH signature test"
+    with pytest.raises(KeyError):
+        key.sign_ssh_data(payload, algorithm="ssh-rsa")
+
+    legacy = paramiko.Message()
+    legacy.add_string("ssh-rsa")
+    legacy.add_string(key.private_key.sign(payload, padding.PKCS1v15(), hashes.SHA1()))
+    assert not key.verify_ssh_sig(payload, paramiko.Message(legacy.asbytes()))
+    modern = key.sign_ssh_data(payload, algorithm="rsa-sha2-256")
+    assert key.verify_ssh_sig(payload, paramiko.Message(modern.asbytes()))

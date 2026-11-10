@@ -17,10 +17,10 @@ MAX_SSH_BANNER_LINE_BYTES = 255
 MAX_SSH_PRE_IDENTIFICATION_LINES = 99
 MAX_SSH_PREAUTH_TEXT_BYTES = 25_500
 MAX_SSH_PACKET_LENGTH = 256 * 1024  # SSH uint32 packet_length field, excluding MAC
-_TEXT_READ_CHUNK_BYTES = 128  # Paramiko 4.0.0 Packetizer._read_timeout()
+_TEXT_READ_CHUNK_BYTES = 128  # Paramiko 5.0.0 Packetizer._read_timeout()
 _ERROR = "SSH banner resource limit exceeded"
 _BINARY_ERROR = "SSH binary packet resource limit exceeded"
-# Exact Paramiko 4.0.0 read_message() reviewed for its three body-read formulas.
+# Exact Paramiko 5.0.0 read_message() reviewed for its three body-read formulas.
 _READ_MESSAGE_SHA256 = (
     "d5d2c6765cab09ef3037d96dfce77bb42698a829605ea3e18ec7cfdb84b31b33"
 )
@@ -41,7 +41,7 @@ class SSHBinaryPacketLimitError(ValueError):
 def assert_paramiko_contract():
     """Reject dependency drift before a socket is opened."""
     message = "SSH transport changed; review the bounded Paramiko transport before use"
-    if version("paramiko") != "4.0.0" or version("netmiko") != "4.8.0":
+    if version("paramiko") != "5.0.0" or version("netmiko") != "4.8.0":
         raise RuntimeError(message)
     try:
         connect = inspect.getsource(SSHClient.connect)
@@ -63,8 +63,11 @@ def assert_paramiko_contract():
         and "packetizer_class" in inspect.signature(Transport.__init__).parameters
         and "transport_factory = Transport" in connect
         and "t = self._transport = transport_factory(" in connect
-        and "gss_kex=gss_kex" in connect
-        and "gss_deleg_creds=gss_deleg_creds" in connect
+        and not any(
+            name.startswith("gss_")
+            for method in (SSHClient.connect, Transport.__init__)
+            for name in inspect.signature(method).parameters
+        )
         and "disabled_algorithms=disabled_algorithms" in connect
         and "self._system_host_keys.get(server_hostkey_name)" in connect
         and "self._host_keys.get(server_hostkey_name)" in connect
@@ -267,11 +270,9 @@ class BoundedPacketizer(Packetizer):
         return decoded
 
 
-def _transport_factory(sock, *, gss_kex, gss_deleg_creds, disabled_algorithms):
+def _transport_factory(sock, *, disabled_algorithms):
     return Transport(
         sock,
-        gss_kex=gss_kex,
-        gss_deleg_creds=gss_deleg_creds,
         disabled_algorithms=disabled_algorithms,
         packetizer_class=BoundedPacketizer,
     )
