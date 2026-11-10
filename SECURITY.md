@@ -357,8 +357,8 @@ Unfixed inherited vulnerabilities remain visible for impact review. A newly
 available fix makes an inherited finding block automatically. The
 [common image policy](docs/container-image-policy.md) defines matching,
 fail-closed inputs, and explicit review with a maximum 90-day exception lifetime.
-The initial `.security/container-exceptions.json` registry is empty. Existing
-pip-audit risk acceptance does not grant a container exception.
+The initial `.security/container-exceptions.json` registry is empty.
+Dependency advisory exceptions do not grant container exceptions.
 
 Secret and dependency scans run for every pull request and push to `main`, as
 well as weekly. Container CI smoke-tests one image and then scans that same
@@ -368,11 +368,11 @@ job, before artifact handoff, registry login, or publication. Scanner
 executables are immutable and version-pinned, while their vulnerability
 databases and resulting findings intentionally evolve.
 
-The existing scanner exception remains the exact pip-audit advisory
-`PYSEC-2026-2858`, originally accepted for `paramiko 4.0.0` in the runtime
-lock. Its aliases are `CVE-2026-44405` and `GHSA-r374-rxx8-8654`. It concerns
-RSA/SHA-1 signing and verification and was a genuine finding, not a false
-positive.
+There are no active pip-audit advisory suppressions. The former exception for
+`PYSEC-2026-2858` (aliases `CVE-2026-44405` and `GHSA-r374-rxx8-8654`)
+covered RSA/SHA-1 signing and verification in Paramiko 4.0.0. It was a genuine
+finding, not a false positive, and has been removed following the upgrade to
+Paramiko 5.0.0. All four dependency locks are audited without advisory ignores.
 
 The runtime lock now selects Paramiko 5.0.0, which removes that affected
 behaviour. Netmiko 4.8.0's normal dependency requirement is
@@ -388,11 +388,11 @@ parser drift still fails closed before a connection is opened.
 Synthetic SSH tests cover password and no-auth connections, RSA-SHA2 host-key
 signatures, rejection of unknown or changed host keys before authentication,
 and rejection of RSA/SHA-1 signing and verification. These tests do not
-establish live Aruba firmware compatibility. The existing scanner suppression
-is unchanged by this compatibility update; removing it and closing issue #25
-remain separate review actions, supported by an unsuppressed audit and
-deployment validation. This does not extend the original acceptance to a new
-finding or permit SHA-1 SSH fallback.
+establish live Aruba firmware compatibility. Dependency audits without
+suppressions and the full Python, container and security CI suite pass for the
+Paramiko 5 compatibility update. This remediation addresses issue #25; it does
+not permit SHA-1 SSH fallback. Live deployment verification remains an
+operational check, not an advisory suppression.
 
 Any future exception must identify the exact finding, include a reviewable
 rationale, and remain as narrow as the scanner permits; scanner failure must

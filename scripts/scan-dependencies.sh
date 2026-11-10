@@ -35,16 +35,10 @@ locks=(
 scan_status=0
 for lock in "${locks[@]}"; do
     printf 'Auditing %s\n' "$lock"
-    ignore_options=()
-    if [[ "$lock" == 'requirements.txt' ]]; then
-        # Documented temporary accepted risk; this is not a false positive.
-        ignore_options=(--ignore-vuln PYSEC-2026-2858)
-    fi
     if ! python -m pip_audit \
         --require-hashes \
         --disable-pip \
         --progress-spinner off \
-        "${ignore_options[@]}" \
         -r "$lock"; then
         scan_status=1
     fi

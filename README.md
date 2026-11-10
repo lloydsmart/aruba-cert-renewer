@@ -213,9 +213,10 @@ upgrade only when their other identity and advisory fields match unambiguously.
 The report retains both versions; downgrades, new CVEs, and ambiguous matches
 still block. The current Perl update therefore retains the visible, unfixed
 `CVE-2026-9538` without misclassifying that pre-existing finding as newly added.
-The separate pip-audit accepted risk is documented in `SECURITY.md`. GitHub native secret scanning and push
-protection are complementary repository settings that maintainers should verify
-or enable separately where supported.
+All four dependency locks are audited without advisory suppressions; the former
+Paramiko exception and its remediation are documented in `SECURITY.md`. GitHub
+native secret scanning and push protection are complementary repository settings
+that maintainers should verify or enable separately where supported.
 
 ## Optional Local Commit Guard
 
