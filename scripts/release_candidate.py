@@ -65,6 +65,10 @@ GZIP_LAYER_MEDIA_TYPES = {
     "application/vnd.oci.image.layer.v1.tar+gzip",
     "application/vnd.docker.image.rootfs.diff.tar.gzip",
 }
+RAW_LAYER_MEDIA_TYPES = {
+    "application/vnd.oci.image.layer.v1.tar",
+    "application/vnd.docker.image.rootfs.diff.tar",
+}
 
 
 class CandidateError(ValueError):
@@ -516,7 +520,7 @@ def _preflight_archive(path: Path) -> None:
             ) from exc
 
 
-def inspect_archive(path: Path) -> dict[str, object]:
+def inspect_archive(path: Path, *, allow_raw_oci: bool = False) -> dict[str, object]:
     """Validate one Docker archive and derive scanner-native image identities."""
     _preflight_archive(path)
     with ExitStack() as stack:
@@ -678,7 +682,11 @@ def inspect_archive(path: Path) -> dict[str, object]:
                 zip(layers, layer_paths, strict=True)
             ):
                 if (
-                    layer.get("mediaType") not in GZIP_LAYER_MEDIA_TYPES
+                    layer.get("mediaType")
+                    not in (
+                        GZIP_LAYER_MEDIA_TYPES
+                        | (RAW_LAYER_MEDIA_TYPES if allow_raw_oci else set())
+                    )
                     or layer.get("digest") != _digest_from_path(layer_path)
                     or type(layer.get("size")) is not int
                     or layer.get("size")
@@ -757,6 +765,13 @@ def inspect_archive(path: Path) -> dict[str, object]:
                     UNCOMPRESSED_LAYERS_MAX_BYTES - total_uncompressed,
                     f"candidate archive layer {position}",
                 )
+                if is_oci and (
+                    actual_diff_id != _digest_from_path(name)
+                    or uncompressed_size != member.size
+                ):
+                    raise CandidateError(
+                        f"candidate archive layer {position} digest is invalid"
+                    )
             total_uncompressed += uncompressed_size
             if actual_diff_id != expected_diff_id:
                 raise CandidateError(

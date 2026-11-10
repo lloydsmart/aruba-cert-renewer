@@ -14,6 +14,12 @@ ArubaOS-Switch devices such as the Aruba 2930M.
 
 ## Current Status
 
+Stable releases promote the exact tested RC image without rebuilding it. The
+signed stable tag binds the RC tag and registry digest; fresh qualification,
+attestation verification, smoke tests and security scans run before promotion.
+See [Releasing](docs/releasing.md) for the signed annotation and archive format.
+The full test matrix covers Python 3.12, 3.14 and the container's Python 3.15 runtime.
+
 Implemented:
 
 - SSH connectivity to ArubaOS-Switch using Netmiko

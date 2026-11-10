@@ -73,6 +73,8 @@ jobs:
       source_sha: ${{ steps.tag.outputs.source_sha }}
       tag_object_sha: ${{ steps.tag.outputs.tag_object_sha }}
       release_tag: ${{ steps.tag.outputs.release_tag }}
+      promotion_source: ${{ steps.promotion.outputs.promotion_source }}
+      promotion_digest: ${{ steps.promotion.outputs.promotion_digest }}
 
     steps:
       - name: Checkout immutable authorization controls
@@ -114,11 +116,39 @@ jobs:
             printf 'release_tag=%s\n' "$RELEASE_TAG"
           } >>"$GITHUB_OUTPUT"
 
+      - name: Authenticate signed promotion instruction
+        id: promotion
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          python3 -I scripts/release_promotion.py "$RELEASE_TAG" \
+            "$RUNNER_TEMP/signed-tag" >"$RUNNER_TEMP/promotion"
+          promotion_source=$(sed -n 's/^promotion_source=//p' "$RUNNER_TEMP/promotion")
+          if [[ -n "$promotion_source" ]]; then
+            gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$promotion_source" >"$RUNNER_TEMP/rc-ref.json"
+            rc_object=$(python3 -I scripts/validate_release_tag.py ref "$promotion_source" "$RUNNER_TEMP/rc-ref.json")
+            gh api "repos/$GITHUB_REPOSITORY/git/tags/$rc_object" >"$RUNNER_TEMP/rc-tag.json"
+            rc_source=$(python3 -I scripts/validate_release_tag.py tag "$promotion_source" "$rc_object" "$RUNNER_TEMP/rc-tag.json")
+            [[ "$rc_source" == "$GITHUB_SHA" ]]
+            git --no-replace-objects cat-file tag "$rc_object" >"$RUNNER_TEMP/rc-signed-tag"
+            python3 -I scripts/verify_release_signature.py \
+              "$promotion_source" "$rc_object" "$rc_source" "$RUNNER_TEMP/rc-signed-tag"
+            gh api "repos/$GITHUB_REPOSITORY/releases/tags/$promotion_source" >"$RUNNER_TEMP/rc-release.json"
+            jq -e --arg tag "$promotion_source" \
+              '.tag_name == $tag and .prerelease == true and .draft == false' "$RUNNER_TEMP/rc-release.json" >/dev/null
+          fi
+          cat "$RUNNER_TEMP/promotion" >>"$GITHUB_OUTPUT"
+
   verify:
     name: Build and verify release container
     needs: [authorize, qualification]
     timeout-minutes: 60
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      attestations: read
     outputs:
       artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
       artifact_id: ${{ steps.upload.outputs.artifact-id }}
@@ -208,9 +238,29 @@ jobs:
           docker pull "${upstreams[0]}"
           printf 'CONTAINER_UPSTREAM=%s\n' "${upstreams[0]}" >>"$GITHUB_ENV"
 
+      - name: Verify and pull the exact promoted candidate
+        if: ${{ needs.authorize.outputs.promotion_source != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PROMOTION_SOURCE: ${{ needs.authorize.outputs.promotion_source }}
+          PROMOTION_DIGEST: ${{ needs.authorize.outputs.promotion_digest }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/lloydsmart/aruba-cert-renewer@$PROMOTION_DIGEST"
+          for predicate in 'https://slsa.dev/provenance/v1' 'https://spdx.dev/Document'; do
+            gh attestation verify "oci://$image" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/publish-container.yml" \
+              --source-digest "$GITHUB_SHA" --source-ref "refs/tags/$PROMOTION_SOURCE" \
+              --predicate-type "$predicate" --deny-self-hosted-runners
+          done
+          docker pull "$image"
+          docker tag "$image" "$CANDIDATE_IMAGE"
+
       - name: Build and smoke-test release candidate
         env:
           ARUBA_CERT_RENEWER_ICON_REF: ${{ steps.commit.outputs.sha }}
+          ARUBA_CERT_RENEWER_TEST_EXISTING: ${{ needs.authorize.outputs.promotion_source != '' }}
         run: tests/container-smoke.sh "$CANDIDATE_IMAGE"
 
       - name: Scan release candidate for vulnerabilities
@@ -223,8 +273,10 @@ jobs:
           handoff_directory="$RUNNER_TEMP/release-candidate"
           mkdir -- "$handoff_directory"
           docker image save \
-            --output "$handoff_directory/release-candidate.tar" \
+            --output "$RUNNER_TEMP/docker-save.tar" \
             "$CANDIDATE_IMAGE"
+          python3 scripts/normalize_release_archive.py \
+            "$RUNNER_TEMP/docker-save.tar" "$handoff_directory/release-candidate.tar"
           printf '%s\n' \
             'source:' \
             '  name: aruba-cert-renewer' \
@@ -302,6 +354,7 @@ jobs:
       AUTHORIZED_SOURCE: ${{ needs.authorize.outputs.source_sha }}
       AUTHORIZED_TAG: ${{ needs.authorize.outputs.release_tag }}
       AUTHORIZED_TAG_OBJECT: ${{ needs.authorize.outputs.tag_object_sha }}
+      PROMOTION_DIGEST: ${{ needs.authorize.outputs.promotion_digest }}
       QUALIFIED: ${{ needs.qualification.outputs.passed }}
       QUALIFIED_SHA: ${{ needs.qualification.outputs.source_sha }}
       CANDIDATE_ARTIFACT_DIGEST: ${{ needs.verify.outputs.artifact_digest }}
@@ -1513,6 +1566,15 @@ jobs:
 
           read -r version_state version_digest < <(inspect_alias "$version_ref")
           read -r source_state source_digest < <(inspect_alias "$source_ref")
+
+          if [[ -n "${PROMOTION_DIGEST:-}" ]]; then
+            [[ "$PROMOTION_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+            if [[ "$source_state" != present || "$source_digest" != "$PROMOTION_DIGEST" ||
+                  ( "$version_state" == present && "$version_digest" != "$PROMOTION_DIGEST" ) ]]; then
+              printf '%s\n' 'Promotion must preserve the signed candidate digest. No aliases were changed.' >&2
+              exit 1
+            fi
+          fi
 
           if [[ "$version_state" == present && "$source_state" == present ]]; then
             if [[ "$version_digest" != "$source_digest" ]]; then

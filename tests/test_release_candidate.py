@@ -131,11 +131,14 @@ def write_oci_archive(
     compressed_layer: bytes | None = None,
     duplicate_index: bool = False,
     reference: str | list[str] = BUILDER_CANDIDATE_IMAGE,
+    raw_layer: bool = False,
 ) -> None:
     repo_tags = [reference] if isinstance(reference, str) else reference
     compressed = (
         gzip.compress(marker, mtime=0) if compressed_layer is None else compressed_layer
     )
+    if raw_layer:
+        compressed = marker
     diff_id = "sha256:" + hashlib.sha256(marker).hexdigest()
     layer_digest = "sha256:" + hashlib.sha256(compressed).hexdigest()
     config = json.dumps(
@@ -154,7 +157,8 @@ def write_oci_archive(
             },
             "layers": [
                 {
-                    "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar"
+                    + ("" if raw_layer else "+gzip"),
                     "digest": layer_digest,
                     "size": len(compressed),
                 }
