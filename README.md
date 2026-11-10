@@ -93,6 +93,12 @@ supported; only their legacy SHA-1 signature algorithm is prohibited. DSA and
 Aruba-specific X.509 SSH algorithms are not required or enabled by the
 application.
 
+The reviewed SSH dependency pair is Paramiko 5.0.0 with Netmiko 4.8.0.
+Paramiko 5 removes GSSAPI and RSA/SHA-1 support; the application does not enable
+a legacy fallback. Local synthetic SSH tests cover password and no-auth
+connections with strict host-key verification. Live verification on the
+supported Aruba firmware is still required before deploying this upgrade.
+
 Some legacy ArubaOS-S WC.16.11 firmware emits RSA/SHA-1 PKCS#10 CSR
 self-signatures. SHA-1 is accepted only inside CSR proof-of-possession
 verification and should be removed when supported devices no longer require

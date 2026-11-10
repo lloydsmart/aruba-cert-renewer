@@ -169,7 +169,7 @@ not an RFC or Aruba vendor maximum. Read-only production measurements found
 zero preceding lines and a 24-byte identification line, 24 textual bytes total,
 on each of two switches. No Netmiko session log is configured.
 
-For pinned Paramiko 4.0.0, every inbound SSH transport packet declaring a
+For pinned Paramiko 5.0.0, every inbound SSH transport packet declaring a
 `packet_length` field greater than 262,144 is rejected before a body recv or
 allocation proportional to that declaration. The field excludes its own four
 bytes and the MAC; bounded MAC or AEAD tag overhead is permitted. This 256 KiB
@@ -368,22 +368,31 @@ job, before artifact handoff, registry login, or publication. Scanner
 executables are immutable and version-pinned, while their vulnerability
 databases and resulting findings intentionally evolve.
 
-The only current scanner exception is the exact pip-audit advisory
-`PYSEC-2026-2858` for `paramiko 4.0.0` in the runtime lock. Its aliases are
-`CVE-2026-44405` and `GHSA-r374-rxx8-8654`; its current severity is Low, with a
-CVSS score of 3.4. The issue concerns Paramiko allowing RSA/SHA-1 signing and
-verification. This is a genuine finding, not a false positive, and the
-repository does not claim that it is currently mitigated.
+The existing scanner exception remains the exact pip-audit advisory
+`PYSEC-2026-2858`, originally accepted for `paramiko 4.0.0` in the runtime
+lock. Its aliases are `CVE-2026-44405` and `GHSA-r374-rxx8-8654`. It concerns
+RSA/SHA-1 signing and verification and was a genuine finding, not a false
+positive.
 
-Paramiko 5 removes the affected SHA-1 behaviour, but Netmiko 4.8.0 currently
-requires Paramiko `>=3.5.0,<5.0` because Paramiko 5 caused significant upstream
-compatibility breakage. Forcing an unsupported major version solely to make the
-scanner green is not acceptable. `PYSEC-2026-2858` is therefore an explicit,
-temporary accepted risk. Issue #10 owns review of the actual SSH algorithms
-required for supported ArubaOS-Switch devices and is the appropriate place to
-determine whether SHA-1 SSH support can be disabled safely; this policy does not
-claim that Aruba compatibility currently requires SHA-1. Remove the exception
-as soon as a supported dependency or protocol-policy remediation is available.
+The runtime lock now selects Paramiko 5.0.0, which removes that affected
+behaviour. Netmiko 4.8.0's normal dependency requirement is
+`paramiko>=3.5.1`; its optional `par4` extra adds the upper bound below 5,
+and this project does not request that extra. The bounded transport is reviewed
+for exactly Paramiko 5.0.0 and Netmiko 4.8.0. It uses Paramiko 5's transport
+factory signature without the removed GSSAPI arguments and preserves strict
+host-key checks, disabled algorithms, and all existing resource ceilings.
+The three fingerprinted packet-reader methods are unchanged from the reviewed
+Paramiko 4.0.0 implementations; their fingerprints are retained. Dependency or
+parser drift still fails closed before a connection is opened.
+
+Synthetic SSH tests cover password and no-auth connections, RSA-SHA2 host-key
+signatures, rejection of unknown or changed host keys before authentication,
+and rejection of RSA/SHA-1 signing and verification. These tests do not
+establish live Aruba firmware compatibility. The existing scanner suppression
+is unchanged by this compatibility update; removing it and closing issue #25
+remain separate review actions, supported by an unsuppressed audit and
+deployment validation. This does not extend the original acceptance to a new
+finding or permit SHA-1 SSH fallback.
 
 Any future exception must identify the exact finding, include a reviewable
 rationale, and remain as narrow as the scanner permits; scanner failure must
