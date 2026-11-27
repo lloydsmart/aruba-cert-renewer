@@ -21,15 +21,7 @@ if [[ "$python_version" != "3.12" ]]; then
     exit 1
 fi
 
-pip_version=$(python -c 'import importlib.metadata as metadata; print(metadata.version("pip"))' 2>/dev/null || true)
-pip_tools_version=$(python -c 'import importlib.metadata as metadata; print(metadata.version("pip-tools"))' 2>/dev/null || true)
-if [[ "$pip_version" != "26.3" || "$pip_tools_version" != "7.6.2" ]]; then
-    printf '%s\n' 'Lock generation requires pip 26.3 and pip-tools 7.6.2.' >&2
-    printf 'Found pip %s and pip-tools %s.\n' \
-        "${pip_version:-not installed}" \
-        "${pip_tools_version:-not installed}" >&2
-    exit 1
-fi
+python scripts/check_lock_tools.py
 
 upgrade_option=--no-upgrade
 if [[ $# -eq 1 ]]; then
